@@ -1,0 +1,22 @@
+[package]
+name = "goodbyedpi-daemon"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+goodbyedpi-proto = { path = "../proto" }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+log = { workspace = true }
+env_logger = { workspace = true }
+libbpf-rs = "0.23"
+libbpf-sys = "1.4"
+nix = { version = "0.29", features = ["net", "user"] }
+tokio = { version = "1.41", features = ["full"] }
+bytes = "1.8"
+clap = { version = "4.5", features = ["derive"] }
+serde = { version = "1.0", features = ["derive"] }
+libc = "0.2"
+
+[build-dependencies]
+libbpf-rs = "0.23"

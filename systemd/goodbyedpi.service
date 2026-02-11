@@ -1,0 +1,23 @@
+; [Unit]
+; Description=GoodByeDPI eBPF Daemon
+; After=network.target
+;
+; [Service]
+; Type=simple
+; ExecStart=/usr/local/bin/goodbyedpi-daemon -i %I -c "${GDPI_OPTS:-s1 -o1 -Ar}"
+; Restart=on-failure
+; RestartSec=5
+;
+; # Security hardening
+; NoNewPrivileges=true
+; PrivateTmp=true
+; ProtectSystem=strict
+; ProtectHome=true
+; ReadWritePaths=/sys/fs/bpf
+;
+; # Required capabilities for eBPF and raw sockets
+; AmbientCapabilities=CAP_BPF CAP_NET_ADMIN CAP_NET_RAW
+; CapabilityBoundingSet=CAP_BPF CAP_NET_ADMIN CAP_NET_RAW
+;
+; [Install]
+; WantedBy=multi-user.target

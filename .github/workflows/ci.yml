@@ -1,0 +1,228 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Check Rust code formatting
+  rustfmt:
+    name: Rustfmt Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      
+      - name: Run rustfmt
+        run: cargo fmt --all -- --check
+
+  # Run clippy lints
+  clippy:
+    name: Clippy Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            clang \
+            llvm \
+            libbpf-dev \
+            libelf-dev \
+            zlib1g-dev \
+            make
+      
+      - name: Cache cargo dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+      
+      - name: Run clippy
+        run: cargo clippy --all-features -- -D warnings
+
+  # Build Rust code
+  build-rust:
+    name: Build Rust Code
+    runs-on: ubuntu-latest
+    needs: [rustfmt, clippy]
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            clang \
+            llvm \
+            libbpf-dev \
+            libelf-dev \
+            zlib1g-dev \
+            make
+      
+      - name: Cache cargo dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+      
+      - name: Build daemon
+        run: cargo build -p goodbyedpi-daemon --release
+      
+      - name: Build CLI
+        run: cargo build -p goodbyedpi --release
+      
+      - name: Build proto library
+        run: cargo build -p goodbyedpi-proto --release
+
+  # Compile eBPF object
+  build-ebpf:
+    name: Build eBPF Object
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            clang \
+            llvm \
+            libbpf-dev \
+            libelf-dev \
+            zlib1g-dev \
+            make \
+            linux-headers-generic \
+            linux-tools-common \
+            linux-tools-generic
+      
+      - name: Check bpftool availability
+        run: |
+          # Try to find bpftool
+          if command -v bpftool &> /dev/null; then
+            echo "bpftool found:"
+            bpftool --version
+          else
+            echo "bpftool not in PATH, checking common locations..."
+            for path in /usr/sbin/bpftool /usr/local/sbin/bpftool /sbin/bpftool; do
+              if [ -f "$path" ]; then
+                echo "Found bpftool at $path"
+                $path --version
+                break
+              fi
+            done
+          fi
+      
+      - name: Compile eBPF code
+        run: |
+          cd ebpf/src
+          make clean
+          make all
+      
+      - name: Upload eBPF object
+        uses: actions/upload-artifact@v4
+        with:
+          name: ebpf-object
+          path: ebpf/src/goodbyedpi.bpf.o
+          if-no-files-found: error
+
+  # Run Rust tests
+  test:
+    name: Run Tests
+    runs-on: ubuntu-latest
+    needs: build-rust
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            clang \
+            llvm \
+            libbpf-dev \
+            libelf-dev \
+            zlib1g-dev \
+            make
+      
+      - name: Cache cargo dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+      
+      - name: Run tests
+        run: cargo test --all -- --nocapture
+
+  # Check documentation
+  doc:
+    name: Documentation Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            clang \
+            llvm \
+            libbpf-dev \
+            libelf-dev \
+            zlib1g-dev \
+            make
+      
+      - name: Check documentation
+        run: cargo doc --no-deps --all-features
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+
+  # Security audit
+  audit:
+    name: Security Audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      
+      - name: Install cargo-audit
+        run: cargo install cargo-audit
+      
+      - name: Run audit
+        run: cargo audit
