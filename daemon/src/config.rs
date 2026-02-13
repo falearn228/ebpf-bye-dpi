@@ -12,6 +12,7 @@ pub struct DpiConfig {
     pub auto_ssl: bool,
     pub ip_fragment: bool,     /* Enable IP fragmentation for QUIC/UDP */
     pub frag_size: u16,        /* Fragment size (0 = default 8 bytes) */
+    pub use_disorder: bool,    /* Enable packet disorder technique */
 }
 
 impl DpiConfig {
@@ -26,6 +27,7 @@ impl DpiConfig {
             auto_ssl: false,
             ip_fragment: false,
             frag_size: 0,
+            use_disorder: false,
         };
 
         let tokens = s.split_whitespace();
@@ -120,10 +122,14 @@ impl DpiConfig {
                         config.frag_size = size.clamp(8, 1500);
                     }
                 }
+                "d" | "-d" => {
+                    /* Packet disorder - enable sending packets out of order */
+                    config.use_disorder = true;
+                }
                 _ => return Err(anyhow!(
                     "Unknown option '{}' in token '{}'. \
-                     Valid options: s (split), o (oob), f (fake), r (tlsrec), g (fragment), -A (auto). \
-                     Example: 's1 -o1 -Ar -f-1 -r1+s -g8'",
+                     Valid options: s (split), o (oob), f (fake), r (tlsrec), g (fragment), d (disorder), -A (auto). \
+                     Example: 's1 -o1 -Ar -f-1 -r1+s -g8 -d'",
                     prefix, token
                 )),
             }
@@ -398,5 +404,40 @@ mod tests {
         assert_eq!(proto.ip_fragment, 1);
         assert_eq!(proto.frag_size, 8);
         assert!(proto.auto_rst);
+    }
+
+    #[test]
+    fn test_parse_disorder_short_form() {
+        let cfg = DpiConfig::parse("d").unwrap();
+        assert!(cfg.use_disorder);
+    }
+
+    #[test]
+    fn test_parse_disorder_long_form() {
+        let cfg = DpiConfig::parse("-d").unwrap();
+        assert!(cfg.use_disorder);
+    }
+
+    #[test]
+    fn test_parse_disorder_with_other_options() {
+        let cfg = DpiConfig::parse("s1 -o1 -d -Ar").unwrap();
+        assert_eq!(cfg.split_pos, Some(1));
+        assert_eq!(cfg.oob_positions, vec![1]);
+        assert!(cfg.use_disorder);
+        assert!(cfg.auto_rst);
+    }
+
+    #[test]
+    fn test_disorder_default_disabled() {
+        let cfg = DpiConfig::parse("s1 -o1").unwrap();
+        assert!(!cfg.use_disorder);
+    }
+
+    #[test]
+    fn test_clone_config_with_disorder() {
+        let cfg = DpiConfig::parse("s1 -d -Ar").unwrap();
+        let cloned = cfg.clone();
+        assert_eq!(cloned.use_disorder, cfg.use_disorder);
+        assert!(cloned.use_disorder);
     }
 }

@@ -4,13 +4,18 @@ use log::info;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
+mod auto_logic;
 mod bpf;
 mod config;
 mod injector;
+mod ringbuf;
 mod state;
 mod tc;
 
+use auto_logic::AutoLogic;
+use bpf::BpfManager;
 use config::DpiConfig;
+use ringbuf::EventProcessor;
 
 #[derive(Parser, Debug)]
 #[command(name = "goodbyedpi-daemon")]
@@ -47,11 +52,30 @@ async fn main() -> Result<()> {
             "Failed to parse DPI configuration: '{}'",
             args.config
         ))?;
+    
+    // Check if any auto-logic is enabled
+    let auto_rst = parsed_config.auto_rst;
+    let auto_redirect = parsed_config.auto_redirect;
+    let auto_ssl = parsed_config.auto_ssl;
+    
     let config = Arc::new(RwLock::new(parsed_config));
     info!("Parsed config: {:?}", config.read().await);
 
+    // Create auto-logic state machine if any auto mode is enabled
+    let auto_logic: Option<Arc<AutoLogic>> = if auto_rst || auto_redirect || auto_ssl {
+        let al = AutoLogic::new(auto_rst, auto_redirect, auto_ssl);
+        info!(
+            "Auto-logic enabled: RST={}, Redirect={}, SSL={}",
+            auto_rst, auto_redirect, auto_ssl
+        );
+        Some(Arc::new(al))
+    } else {
+        info!("Auto-logic disabled (use -Ar, -At, -As to enable)");
+        None
+    };
+
     // Load and attach eBPF programs
-    let mut skel = bpf::load_and_attach(&args.interface, config.clone()).await
+    let mut bpf_manager = BpfManager::load_and_attach(&args.interface, config.clone()).await
         .with_context(|| format!(
             "Failed to load and attach eBPF programs to interface '{}'",
             args.interface
@@ -59,6 +83,28 @@ async fn main() -> Result<()> {
     
     info!("eBPF programs loaded and attached successfully on {}", args.interface);
 
+    // Create event processor with auto-logic if enabled
+    let event_processor = if let Some(ref al) = auto_logic {
+        EventProcessor::with_auto_logic(al.clone())
+            .context("Failed to create event processor with auto-logic")?
+    } else {
+        EventProcessor::new()
+            .context("Failed to create event processor")?
+    };
+    
+    info!("Event processor started");
+
+    // Get event receiver from bpf_manager
+    let event_rx = bpf_manager.take_event_receiver()
+        .context("Event receiver not available")?;
+
+    // Spawn event processing task
+    let config_clone = config.clone();
+    let mut event_handle = tokio::spawn(async move {
+        event_processor.run(event_rx, config_clone).await;
+    });
+
+    // Main loop
     let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(5));
     
     // Handle Ctrl+C and SIGTERM
@@ -69,7 +115,23 @@ async fn main() -> Result<()> {
         tokio::select! {
             _ = interval.tick() => {
                 // Cleanup expired connections
-                skel.cleanup_connections().await?;
+                if let Err(e) = bpf_manager.cleanup_connections().await {
+                    log::warn!("Connection cleanup error: {}", e);
+                }
+                
+                // Cleanup auto-logic states if enabled
+                if let Some(ref al) = auto_logic {
+                    let cleaned = al.cleanup().await;
+                    if cleaned > 0 {
+                        log::debug!("Auto-logic cleaned up {} expired states", cleaned);
+                    }
+                    
+                    // Log stats periodically
+                    let stats = al.get_stats().await;
+                    if stats.total_connections > 0 {
+                        log::debug!("Auto-logic stats: {}", stats);
+                    }
+                }
             }
             _ = tokio::signal::ctrl_c() => {
                 info!("Received Ctrl+C, shutting down...");
@@ -79,12 +141,16 @@ async fn main() -> Result<()> {
                 info!("Received SIGTERM, shutting down...");
                 break;
             }
+            _ = &mut event_handle => {
+                log::error!("Event processing task exited unexpectedly");
+                break;
+            }
         }
     }
 
-    // Explicit cleanup before exit
+    // Cleanup
     info!("Cleaning up...");
-    drop(skel);
+    drop(bpf_manager);
     
     // Additional cleanup to ensure TC filters are removed
     if let Err(e) = tc::full_cleanup(&args.interface) {

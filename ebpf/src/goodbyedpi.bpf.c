@@ -55,6 +55,9 @@ struct config {
 /* Default fragment size for QUIC */
 #define DEFAULT_QUIC_FRAG_SIZE 8
 
+/* Maximum payload size to send via ring buffer */
+#define MAX_PAYLOAD_SIZE 64
+
 /* GSO (Generic Segmentation Offload) bypass */
 #define TCP_GSO_OFF 0x10000
 
@@ -87,9 +90,12 @@ struct event {
     __u32 seq;
     __u32 ack;
     __u8 flags;
-    __u8 payload_len;
+    __u8 payload_len;  /* Actual payload length (may be larger than MAX_PAYLOAD_SIZE) */
     __u8 is_ipv6;      /* 0 = IPv4, 1 = IPv6 */
+    __u8 sni_offset;   /* SNI hostname offset in payload (for TLS Client Hello) */
+    __u8 sni_length;   /* SNI hostname length (for TLS Client Hello) */
     __u8 reserved;     /* Padding for alignment */
+    __u8 payload[MAX_PAYLOAD_SIZE];  /* First MAX_PAYLOAD_SIZE bytes of packet payload */
 };
 
 enum {
@@ -97,7 +103,11 @@ enum {
     EVENT_RST_DETECTED,
     EVENT_REDIRECT_DETECTED,
     EVENT_SSL_ERROR_DETECTED,
-    EVENT_DISORDER_TRIGGERED,  /* New: Packet disorder triggered */
+    EVENT_DISORDER_TRIGGERED,  /* Packet disorder triggered */
+    EVENT_SPLIT_TRIGGERED,     /* TCP split triggered - userspace sends two packets */
+    EVENT_TLSREC_TRIGGERED,    /* TLS record split triggered - split at SNI boundary */
+    EVENT_QUIC_FRAGMENT_TRIGGERED, /* QUIC/UDP IP fragmentation triggered */
+    EVENT_OOB_TRIGGERED,       /* OOB (Out-of-Band) triggered - URG flag injection */
 };
 
 enum {
@@ -213,6 +223,21 @@ static __always_inline void update_stats_error(struct stats *s)
 {
     if (s)
         __sync_fetch_and_add(&s->errors, 1);
+}
+
+/* Helper to copy payload data into event structure */
+static __always_inline void copy_payload_to_event(struct event *e, void *payload, __u32 payload_len)
+{
+    /* Determine how many bytes to copy (min of actual length and MAX_PAYLOAD_SIZE) */
+    __u32 copy_len = payload_len < MAX_PAYLOAD_SIZE ? payload_len : MAX_PAYLOAD_SIZE;
+    
+    /* Initialize payload buffer to zero */
+    __builtin_memset(e->payload, 0, MAX_PAYLOAD_SIZE);
+    
+    /* Safely copy payload data */
+    if (payload && copy_len > 0) {
+        bpf_probe_read_kernel(e->payload, copy_len, payload);
+    }
 }
 
 /* Parse IPv4 TCP packet */
@@ -340,6 +365,10 @@ static __always_inline int parse_ipv4_udp(struct __sk_buff *skb,
 
     /* Parse UDP */
     struct udphdr *udp = (void *)ip + ip_header_len;
+
+    /* BPF verifier needs explicit bounds check here */
+    if ((void *)udp + sizeof(struct udphdr) > data_end)
+        return -1;
 
     /* Validate UDP length */
     __u16 udp_len = bpf_ntohs(udp->len);
@@ -470,15 +499,224 @@ static __always_inline int is_quic_initial(void *payload, __u32 payload_len)
     return 1;
 }
 
-/* Find SNI offset in TLS Client Hello */
-static __always_inline int find_sni_offset(void *payload, __u32 payload_len)
+/* TLS Constants */
+#define TLS_HANDSHAKE           0x16
+#define TLS_CLIENT_HELLO        0x01
+#define TLS_SNI_EXTENSION       0x0000
+
+/* Maximum iterations for loops (BPF verifier requirement) */
+#define MAX_EXTENSIONS_ITER     32
+#define MAX_SNI_LEN             253
+
+/*
+ * Parse TLS Client Hello and find SNI extension offset.
+ *
+ * TLS Record Layer (5 bytes):
+ *   - content_type (1 byte): 0x16 = Handshake
+ *   - version (2 bytes): TLS version
+ *   - length (2 bytes): length of handshake data
+ *
+ * Handshake Layer:
+ *   - type (1 byte): 0x01 = Client Hello
+ *   - length (3 bytes): length of Client Hello
+ *
+ * Client Hello:
+ *   - version (2 bytes)
+ *   - random (32 bytes)
+ *   - session_id_len (1 byte) + session_id (variable)
+ *   - cipher_suites_len (2 bytes) + cipher_suites (variable)
+ *   - compression_len (1 byte) + compression (variable)
+ *   - extensions_len (2 bytes) + extensions (variable)
+ *
+ * Extension format:
+ *   - type (2 bytes): 0x0000 = SNI
+ *   - length (2 bytes)
+ *   - data (variable)
+ *
+ * SNI extension data:
+ *   - list_length (2 bytes)
+ *   - name_type (1 byte): 0x00 = hostname
+ *   - name_length (2 bytes)
+ *   - name (variable)
+ *
+ * Returns: offset from payload start to SNI hostname, or negative on error
+ */
+static __always_inline int parse_tls_client_hello_sni(void *payload, __u32 payload_len,
+                                                       __u32 *sni_offset, __u32 *sni_length)
 {
+    __u8 *data = payload;
+    
+    /* Need at least TLS record header + handshake header + client hello header */
     if (payload_len < 43)
         return -1;
 
-    /* SNI typically starts around byte 43-46 in TLS 1.2/1.3 Client Hello */
-    /* This is a simplified check - real SNI parsing is more complex */
-    return 43;
+    /* Read TLS Record Layer */
+    __u8 content_type;
+    __u16 tls_version;
+    __u16 record_len;
+    
+    if (bpf_probe_read_kernel(&content_type, 1, data) < 0)
+        return -1;
+    if (bpf_probe_read_kernel(&tls_version, 2, data + 1) < 0)
+        return -1;
+    if (bpf_probe_read_kernel(&record_len, 2, data + 3) < 0)
+        return -1;
+    
+    tls_version = bpf_ntohs(tls_version);
+    record_len = bpf_ntohs(record_len);
+    
+    /* Verify TLS Handshake */
+    if (content_type != TLS_HANDSHAKE)
+        return -1;
+    
+    /* Check record length is reasonable */
+    if (record_len < 42 || record_len > 16384)
+        return -1;
+    
+    /* Read Handshake Layer */
+    __u8 handshake_type;
+    __u32 handshake_len = 0;
+    
+    if (bpf_probe_read_kernel(&handshake_type, 1, data + 5) < 0)
+        return -1;
+    
+    /* Handshake length is 3 bytes (24-bit) */
+    __u8 len_bytes[3];
+    if (bpf_probe_read_kernel(len_bytes, 3, data + 6) < 0)
+        return -1;
+    handshake_len = (len_bytes[0] << 16) | (len_bytes[1] << 8) | len_bytes[2];
+    
+    /* Verify Client Hello */
+    if (handshake_type != TLS_CLIENT_HELLO)
+        return -1;
+    
+    /* Start parsing Client Hello at offset 9 (after record header + handshake header) */
+    __u32 offset = 9;
+    
+    /* Skip client version (2 bytes) */
+    offset += 2;
+    
+    /* Skip random (32 bytes) */
+    offset += 32;
+    
+    /* Skip session ID */
+    if (offset + 1 > payload_len)
+        return -1;
+    __u8 session_id_len;
+    if (bpf_probe_read_kernel(&session_id_len, 1, data + offset) < 0)
+        return -1;
+    offset += 1 + session_id_len;
+    
+    /* Skip cipher suites */
+    if (offset + 2 > payload_len)
+        return -1;
+    __u16 cipher_suites_len;
+    if (bpf_probe_read_kernel(&cipher_suites_len, 2, data + offset) < 0)
+        return -1;
+    cipher_suites_len = bpf_ntohs(cipher_suites_len);
+    offset += 2 + cipher_suites_len;
+    
+    /* Skip compression methods */
+    if (offset + 1 > payload_len)
+        return -1;
+    __u8 compression_len;
+    if (bpf_probe_read_kernel(&compression_len, 1, data + offset) < 0)
+        return -1;
+    offset += 1 + compression_len;
+    
+    /* Now we're at extensions */
+    if (offset + 2 > payload_len)
+        return -1;
+    
+    __u16 extensions_len;
+    if (bpf_probe_read_kernel(&extensions_len, 2, data + offset) < 0)
+        return -1;
+    extensions_len = bpf_ntohs(extensions_len);
+    offset += 2;
+    
+    /* Parse extensions to find SNI */
+    __u32 extensions_end = offset + extensions_len;
+    if (extensions_end > payload_len)
+        extensions_end = payload_len;
+    
+    /* Loop through extensions (bounded for BPF verifier) */
+    #pragma unroll
+    for (int i = 0; i < MAX_EXTENSIONS_ITER; i++) {
+        if (offset + 4 > extensions_end)
+            break;
+        
+        __u16 ext_type;
+        __u16 ext_len;
+        
+        if (bpf_probe_read_kernel(&ext_type, 2, data + offset) < 0)
+            break;
+        if (bpf_probe_read_kernel(&ext_len, 2, data + offset + 2) < 0)
+            break;
+        
+        ext_type = bpf_ntohs(ext_type);
+        ext_len = bpf_ntohs(ext_len);
+        
+        /* Found SNI extension (type 0x0000) */
+        if (ext_type == TLS_SNI_EXTENSION) {
+            __u32 sni_data_offset = offset + 4;  /* Start of extension data */
+            
+            if (sni_data_offset + 2 > extensions_end)
+                break;
+            
+            /* SNI list length (2 bytes) */
+            __u16 sni_list_len;
+            if (bpf_probe_read_kernel(&sni_list_len, 2, data + sni_data_offset) < 0)
+                break;
+            sni_list_len = bpf_ntohs(sni_list_len);
+            
+            /* SNI entry: name_type (1) + name_length (2) + name */
+            __u32 sni_entry_offset = sni_data_offset + 2;
+            
+            if (sni_entry_offset + 3 > extensions_end)
+                break;
+            
+            __u8 name_type;
+            __u16 name_len;
+            
+            if (bpf_probe_read_kernel(&name_type, 1, data + sni_entry_offset) < 0)
+                break;
+            if (bpf_probe_read_kernel(&name_len, 2, data + sni_entry_offset + 1) < 0)
+                break;
+            name_len = bpf_ntohs(name_len);
+            
+            /* name_type 0x00 = hostname */
+            if (name_type == 0x00 && name_len > 0 && name_len <= MAX_SNI_LEN) {
+                __u32 hostname_offset = sni_entry_offset + 3;
+                
+                if (hostname_offset + name_len <= extensions_end) {
+                    *sni_offset = hostname_offset;
+                    *sni_length = name_len;
+                    bpf_dbg_printk("[GoodByeDPI] SNI found at offset=%u, len=%u\n",
+                                   hostname_offset, name_len);
+                    return 0;  /* Success */
+                }
+            }
+            
+            break;  /* Found SNI extension, done */
+        }
+        
+        /* Move to next extension */
+        offset += 4 + ext_len;
+    }
+    
+    return -1;  /* SNI not found */
+}
+
+/* Legacy function for compatibility - now uses real parser */
+static __always_inline int find_sni_offset(void *payload, __u32 payload_len)
+{
+    __u32 sni_offset = 0;
+    __u32 sni_length = 0;
+    
+    if (parse_tls_client_hello_sni(payload, payload_len, &sni_offset, &sni_length) == 0) {
+        return (__s32)sni_offset;
+    }
+    return -1;
 }
 
 /* Helper to safely read packet data */
@@ -546,17 +784,17 @@ static __always_inline int process_tcp(struct __sk_buff *skb, struct config *cfg
 
     /* Apply DPI bypass techniques based on stage */
     
-    /* Technique 1: Split the request */
+    /* Technique 1: Real TCP Split - drop original packet and send two parts from userspace */
     if (cfg->split_pos > 0 && state->stage == STAGE_INIT) {
         if ((__u32)cfg->split_pos < payload_len) {
-            bpf_dbg_printk("[GoodByeDPI] SPLIT triggered at pos=%d\n", cfg->split_pos);
+            bpf_dbg_printk("[GoodByeDPI] REAL SPLIT triggered at pos=%d, dropping packet\n", cfg->split_pos);
             state->stage = STAGE_SPLIT;
             update_stats_modified(stats);
             
-            /* Send event to userspace to inject fake/second part */
+            /* Send event to userspace to inject both split parts */
             struct event *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
             if (e) {
-                e->type = EVENT_FAKE_TRIGGERED;
+                e->type = EVENT_SPLIT_TRIGGERED;
                 /* Copy IP addresses - full IPv6 support */
                 e->src_ip[0] = key->src_ip[0];
                 e->src_ip[1] = key->src_ip[1];
@@ -570,57 +808,86 @@ static __always_inline int process_tcp(struct __sk_buff *skb, struct config *cfg
                 e->dst_port = key->dst_port;
                 e->seq = bpf_ntohl(tcp->seq);
                 e->ack = bpf_ntohl(tcp->ack_seq);
-                e->flags = tcp->fin | (tcp->syn << 1) | (tcp->rst << 2) | (tcp->psh << 3);
+                /* Store split position in flags field (lower byte) and TCP flags (upper byte) */
+                e->flags = (tcp->fin | (tcp->syn << 1) | (tcp->rst << 2) | (tcp->psh << 3)) & 0x0F;
+                e->reserved = (__u8)((cfg->split_pos > 255) ? 255 : cfg->split_pos);  /* Split position */
                 e->payload_len = payload_len > 255 ? 255 : payload_len;
                 e->is_ipv6 = is_ipv6;
-                e->reserved = 0;
+                e->sni_offset = 0;
+                e->sni_length = 0;
+                /* Copy payload data */
+                copy_payload_to_event(e, payload, payload_len);
                 bpf_ringbuf_submit(e, 0);
                 update_stats_event(stats);
-                bpf_dbg_printk("[GoodByeDPI] Event sent to userspace (ipv6=%d)\n", is_ipv6);
+                bpf_dbg_printk("[GoodByeDPI] SPLIT event sent to userspace (ipv6=%d, split_pos=%d)\n", is_ipv6, cfg->split_pos);
             }
+            
+            /* Update state and DROP the original packet - userspace will send split parts */
+            bpf_map_update_elem(&conn_map, key, state, BPF_EXIST);
+            return TC_ACT_SHOT;  /* Drop packet - userspace handles the split */
         }
     }
 
     /* Technique 2: OOB (Out of Band) - Set URG flag and urgent pointer */
+    /* We drop the original packet and inject modified version from userspace */
     if (cfg->oob_pos > 0 && state->stage <= STAGE_SPLIT) {
         bpf_dbg_printk("[GoodByeDPI] OOB triggered at pos=%d\n", cfg->oob_pos);
         
         /* Only apply if payload is large enough */
         if ((__u32)cfg->oob_pos < payload_len) {
-            /* Modify TCP header in place - set URG flag and urgent pointer */
-            __u8 tcp_flags = tcp->urg | TCP_FLAG_URG;  /* Set URG bit */
-            __u16 urg_ptr = bpf_htons((__u16)cfg->oob_pos);
+            /* Send event to userspace to inject OOB packet with URG flag */
+            struct event *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
+            if (e) {
+                e->type = EVENT_OOB_TRIGGERED;
+                /* Copy IP addresses - full IPv6 support */
+                e->src_ip[0] = key->src_ip[0];
+                e->src_ip[1] = key->src_ip[1];
+                e->src_ip[2] = key->src_ip[2];
+                e->src_ip[3] = key->src_ip[3];
+                e->dst_ip[0] = key->dst_ip[0];
+                e->dst_ip[1] = key->dst_ip[1];
+                e->dst_ip[2] = key->dst_ip[2];
+                e->dst_ip[3] = key->dst_ip[3];
+                e->src_port = key->src_port;
+                e->dst_port = key->dst_port;
+                e->seq = bpf_ntohl(tcp->seq);
+                e->ack = bpf_ntohl(tcp->ack_seq);
+                /* Store original TCP flags and OOB position */
+                e->flags = (tcp->fin | (tcp->syn << 1) | (tcp->rst << 2) | 
+                           (tcp->psh << 3) | (tcp->ack << 4) | TCP_FLAG_URG) & 0x3F;
+                e->reserved = (__u8)((cfg->oob_pos > 255) ? 255 : cfg->oob_pos);  /* OOB position */
+                e->payload_len = payload_len > 255 ? 255 : payload_len;
+                e->is_ipv6 = is_ipv6;
+                e->sni_offset = 0;
+                e->sni_length = 0;
+                /* Copy payload data */
+                copy_payload_to_event(e, payload, payload_len);
+                bpf_ringbuf_submit(e, 0);
+                update_stats_event(stats);
+                state->stage = STAGE_OOB;
+                state->flags |= 0x01;  /* Mark OOB applied */
+                update_stats_modified(stats);
+                bpf_dbg_printk("[GoodByeDPI] OOB event sent to userspace (URG at pos=%d, ipv6=%d)\n",
+                               cfg->oob_pos, is_ipv6);
+            }
             
-            /* Update TCP flags using bpf_skb_store_bytes */
-            /* TCP flags are at offset 13 from start of TCP header */
-            /* URG pointer is at offset 18-19 */
-            
-            /* We can't directly modify tcp->urg in TC, so we use skb modification */
-            /* For TC egress, we can use bpf_skb_store_bytes if we have the offset */
-            
-            /* Note: Direct packet modification in TC requires careful bounds checking */
-            /* For this implementation, we mark the connection state and let userspace handle 
-             * the actual packet modification via packet injection */
-            
-            state->flags |= 0x01;  /* Mark OOB applied */
-            update_stats_modified(stats);
-            bpf_dbg_printk("[GoodByeDPI] OOB marked (URG at pos=%d)\n", cfg->oob_pos);
+            /* Drop the original packet - userspace will send modified version with URG flag */
+            bpf_map_update_elem(&conn_map, key, state, BPF_EXIST);
+            return TC_ACT_SHOT;
         }
         
         state->stage = STAGE_OOB;
     }
     
-    /* Technique 4: Disorder - Reorder packets by modifying sequence numbers */
-    /* This makes DPI think packets are out of order, potentially bypassing detection */
-    if (state->stage == STAGE_OOB || state->stage == STAGE_SPLIT) {
-        /* Randomly swap sequence numbers for some packets to create disorder */
-        /* In practice, this would require more complex logic with packet buffering */
-        /* For now, we mark the intent and let userspace handle complex reordering */
+    /* Technique 3: Fake Packet Injection - send fake packet before real data */
+    /* This confuses DPI by sending a fake packet with different sequence number */
+    if (cfg->fake_offset != 0 && state->stage <= STAGE_OOB) {
+        bpf_dbg_printk("[GoodByeDPI] FAKE packet triggered, offset=%d\n", cfg->fake_offset);
         
-        /* Send event to userspace to trigger disorder logic */
+        /* Send event to userspace to inject fake packet */
         struct event *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
         if (e) {
-            e->type = EVENT_FAKE_TRIGGERED;  /* Reuse fake trigger with disorder flag */
+            e->type = EVENT_FAKE_TRIGGERED;
             /* Copy IP addresses - full IPv6 support */
             e->src_ip[0] = key->src_ip[0];
             e->src_ip[1] = key->src_ip[1];
@@ -634,30 +901,106 @@ static __always_inline int process_tcp(struct __sk_buff *skb, struct config *cfg
             e->dst_port = key->dst_port;
             e->seq = bpf_ntohl(tcp->seq);
             e->ack = bpf_ntohl(tcp->ack_seq);
-            e->flags = 0xFE;  /* Special flag for DISORDER */
+            /* Store fake_offset in reserved field for userspace */
+            /* flags byte 0 = TCP flags, bytes 1-2 reserved for future */
+            e->flags = (tcp->fin | (tcp->syn << 1) | (tcp->rst << 2) | (tcp->psh << 3)) & 0x0F;
+            e->reserved = 0;  /* Will be handled by userspace based on config */
+            e->payload_len = payload_len > 255 ? 255 : payload_len;
             e->is_ipv6 = is_ipv6;
+            e->sni_offset = 0;
+            e->sni_length = 0;
+            /* Copy payload data for potential fake packet content */
+            copy_payload_to_event(e, payload, payload_len);
+            bpf_ringbuf_submit(e, 0);
+            update_stats_event(stats);
+            state->stage = STAGE_FAKE_SENT;
+            update_stats_modified(stats);
+            bpf_dbg_printk("[GoodByeDPI] FAKE event sent to userspace (offset=%d, ipv6=%d)\n",
+                           cfg->fake_offset, is_ipv6);
+        }
+    }
+    
+    /* Technique 4: Disorder - Reorder packets by modifying sequence numbers */
+    /* This makes DPI think packets are out of order, potentially bypassing detection */
+    /* Userspace will send second part of payload first, then first part */
+    if (state->stage == STAGE_OOB || state->stage == STAGE_SPLIT) {
+        /* Send event to userspace to trigger disorder logic */
+        struct event *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
+        if (e) {
+            e->type = EVENT_DISORDER_TRIGGERED;  /* Dedicated disorder event */
+            /* Copy IP addresses - full IPv6 support */
+            e->src_ip[0] = key->src_ip[0];
+            e->src_ip[1] = key->src_ip[1];
+            e->src_ip[2] = key->src_ip[2];
+            e->src_ip[3] = key->src_ip[3];
+            e->dst_ip[0] = key->dst_ip[0];
+            e->dst_ip[1] = key->dst_ip[1];
+            e->dst_ip[2] = key->dst_ip[2];
+            e->dst_ip[3] = key->dst_ip[3];
+            e->src_port = key->src_port;
+            e->dst_port = key->dst_port;
+            e->seq = bpf_ntohl(tcp->seq);
+            e->ack = bpf_ntohl(tcp->ack_seq);
+            /* Store original TCP flags */
+            e->flags = (tcp->fin | (tcp->syn << 1) | (tcp->rst << 2) | (tcp->psh << 3)) & 0x0F;
+            e->payload_len = payload_len > 255 ? 255 : payload_len;
+            e->is_ipv6 = is_ipv6;
+            e->sni_offset = 0;
+            e->sni_length = 0;
+            /* Store split position hint in reserved (0 = let userspace decide) */
             e->reserved = 0;
+            /* Copy payload data */
+            copy_payload_to_event(e, payload, payload_len);
             bpf_ringbuf_submit(e, 0);
             update_stats_event(stats);
             state->stage = STAGE_DISORDER;
             update_stats_modified(stats);
-            bpf_dbg_printk("[GoodByeDPI] DISORDER triggered\n");
+            bpf_dbg_printk("[GoodByeDPI] DISORDER triggered, payload_len=%u\n", payload_len);
         }
+        
+        /* Drop the original packet - userspace will send disordered packets */
+        bpf_map_update_elem(&conn_map, key, state, BPF_EXIST);
+        return TC_ACT_SHOT;
     }
 
-    /* Technique 3: TLS Record Split */
-    if (cfg->tlsrec_pos >= 0 && is_tls) {
-        int sni_offset = find_sni_offset(payload, payload_len);
-        if (sni_offset > 0 && (__u32)cfg->tlsrec_pos < payload_len) {
-            int split_at = cfg->tlsrec_pos;
-            if (split_at > 0 && (__u32)split_at < payload_len) {
-                bpf_dbg_printk("[GoodByeDPI] TLSREC split at pos=%d\n", split_at);
+    /* Technique 5: TLS Record Split - Split TLS record at SNI boundary */
+    /* This splits the TLS record itself (not TCP), making DPI see incomplete Client Hello */
+    if (cfg->tlsrec_pos >= 0 && is_tls && state->stage == STAGE_INIT) {
+        __u32 sni_off = 0;
+        __u32 sni_len = 0;
+        
+        /* Parse TLS Client Hello to find SNI */
+        if (parse_tls_client_hello_sni(payload, payload_len, &sni_off, &sni_len) == 0) {
+            /* Calculate split position based on config:
+             * - tlsrec_pos = 0: split at SNI start
+             * - tlsrec_pos > 0: split at SNI start + tlsrec_pos (inside SNI)
+             * - tlsrec_pos < 0: split at SNI end + tlsrec_pos (before SNI end)
+             */
+            __u32 split_at;
+            if (cfg->tlsrec_pos == 0) {
+                split_at = sni_off;
+            } else if (cfg->tlsrec_pos > 0) {
+                split_at = sni_off + cfg->tlsrec_pos;
+                if (split_at > sni_off + sni_len)
+                    split_at = sni_off + sni_len;
+            } else {
+                /* Negative offset from SNI end */
+                __s32 neg_offset = -cfg->tlsrec_pos;
+                if (neg_offset > (__s32)sni_len)
+                    neg_offset = sni_len;
+                split_at = sni_off + sni_len - neg_offset;
+            }
+            
+            /* Ensure split position is valid */
+            if (split_at > 0 && split_at < payload_len) {
+                bpf_dbg_printk("[GoodByeDPI] TLSREC split at pos=%u (SNI at %u, len=%u)\n",
+                               split_at, sni_off, sni_len);
                 state->stage = STAGE_TLSREC;
                 update_stats_modified(stats);
                 
                 struct event *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
                 if (e) {
-                    e->type = EVENT_FAKE_TRIGGERED;
+                    e->type = EVENT_TLSREC_TRIGGERED;
                     /* Copy IP addresses - full IPv6 support */
                     e->src_ip[0] = key->src_ip[0];
                     e->src_ip[1] = key->src_ip[1];
@@ -669,11 +1012,22 @@ static __always_inline int process_tcp(struct __sk_buff *skb, struct config *cfg
                     e->dst_ip[3] = key->dst_ip[3];
                     e->src_port = key->src_port;
                     e->dst_port = key->dst_port;
-                    e->flags = 0xFF; /* Special flag for TLS split */
+                    e->seq = bpf_ntohl(tcp->seq);
+                    e->ack = bpf_ntohl(tcp->ack_seq);
+                    e->flags = (tcp->fin | (tcp->syn << 1) | (tcp->rst << 2) | (tcp->psh << 3)) & 0x0F;
+                    e->payload_len = payload_len > 255 ? 255 : payload_len;
                     e->is_ipv6 = is_ipv6;
-                    e->reserved = 0;
+                    /* Store SNI offset and length for userspace */
+                    e->sni_offset = sni_off > 255 ? 255 : sni_off;
+                    e->sni_length = sni_len > 255 ? 255 : sni_len;
+                    /* Store split position in reserved field */
+                    e->reserved = split_at > 255 ? 255 : split_at;
+                    /* Copy payload data */
+                    copy_payload_to_event(e, payload, payload_len);
                     bpf_ringbuf_submit(e, 0);
                     update_stats_event(stats);
+                    bpf_dbg_printk("[GoodByeDPI] TLSREC event sent (split=%u, sni=%u:%u)\n",
+                                   split_at, sni_off, sni_len);
                 }
             }
         }
@@ -719,7 +1073,7 @@ static __always_inline int process_udp(struct __sk_buff *skb, struct config *cfg
         /* Send event to trigger IP fragmentation in userspace */
         struct event *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
         if (e) {
-            e->type = EVENT_FAKE_TRIGGERED;
+            e->type = EVENT_QUIC_FRAGMENT_TRIGGERED;
             e->src_ip[0] = key->src_ip[0];
             e->src_ip[1] = key->src_ip[1];
             e->src_ip[2] = key->src_ip[2];
@@ -730,10 +1084,14 @@ static __always_inline int process_udp(struct __sk_buff *skb, struct config *cfg
             e->dst_ip[3] = key->dst_ip[3];
             e->src_port = key->src_port;
             e->dst_port = key->dst_port;
-            e->flags = 0xFD;  /* Special flag for QUIC fragmentation */
-            e->payload_len = frag_size > 255 ? 255 : (__u8)frag_size;
+            e->flags = 0;  /* No special flags needed - event type identifies this */
+            e->payload_len = payload_len > 255 ? 255 : payload_len;
             e->is_ipv6 = is_ipv6;
-            e->reserved = 0;
+            e->sni_offset = 0;
+            e->sni_length = 0;
+            e->reserved = frag_size > 255 ? 255 : (__u8)frag_size;
+            /* Copy payload data */
+            copy_payload_to_event(e, payload, payload_len);
             bpf_ringbuf_submit(e, 0);
             update_stats_event(stats);
             bpf_dbg_printk("[GoodByeDPI] QUIC fragment triggered (size=%u)\n", frag_size);
@@ -943,15 +1301,23 @@ int dpi_ingress(struct __sk_buff *skb)
             e->dst_ip[3] = key.dst_ip[3];
             e->src_port = key.src_port;
             e->dst_port = key.dst_port;
+            e->seq = bpf_ntohl(tcp->seq);
+            e->ack = bpf_ntohl(tcp->ack_seq);
+            e->flags = TCP_FLAG_RST;
+            e->payload_len = 0;  /* RST packets typically have no payload */
             e->is_ipv6 = key.is_ipv6;
+            e->sni_offset = 0;
+            e->sni_length = 0;
             e->reserved = 0;
+            /* Initialize payload to zero for RST */
+            __builtin_memset(e->payload, 0, MAX_PAYLOAD_SIZE);
             bpf_ringbuf_submit(e, 0);
         }
     }
 
     /* Detect HTTP Redirect (302/301) for auto-logic */
     if (cfg->auto_redirect) {
-        __u8 buf[12];
+        __u8 buf[MAX_PAYLOAD_SIZE];
         if (skb_read_bytes(skb, payload_offset, buf, sizeof(buf)) == 0) {
             if (buf[0] == 'H' && buf[1] == 'T' && buf[2] == 'T' && buf[3] == 'P') {
                 /* Check for 302 or 301 */
@@ -971,8 +1337,17 @@ int dpi_ingress(struct __sk_buff *skb)
                         ev->dst_ip[3] = key.src_ip[3];
                         ev->src_port = key.dst_port;
                         ev->dst_port = key.src_port;
+                        ev->seq = bpf_ntohl(tcp->seq);
+                        ev->ack = bpf_ntohl(tcp->ack_seq);
+                        ev->flags = 0;
+                        ev->payload_len = MAX_PAYLOAD_SIZE;
                         ev->is_ipv6 = key.is_ipv6;
+                        ev->sni_offset = 0;
+                        ev->sni_length = 0;
                         ev->reserved = 0;
+                        /* Copy HTTP response payload */
+                        __builtin_memset(ev->payload, 0, MAX_PAYLOAD_SIZE);
+                        __builtin_memcpy(ev->payload, buf, MAX_PAYLOAD_SIZE);
                         bpf_ringbuf_submit(ev, 0);
                     }
                 }
@@ -982,7 +1357,7 @@ int dpi_ingress(struct __sk_buff *skb)
 
     /* Detect SSL/TLS errors (alert level fatal) */
     if (cfg->auto_ssl) {
-        __u8 buf[6];
+        __u8 buf[MAX_PAYLOAD_SIZE];
         if (skb_read_bytes(skb, payload_offset, buf, sizeof(buf)) == 0) {
             /* TLS alert: content type 0x15, alert level 0x02 = fatal */
             if (buf[0] == 0x15 && buf[5] == 0x02) {
@@ -1001,8 +1376,17 @@ int dpi_ingress(struct __sk_buff *skb)
                     ev->dst_ip[3] = key.src_ip[3];
                     ev->src_port = key.dst_port;
                     ev->dst_port = key.src_port;
+                    ev->seq = bpf_ntohl(tcp->seq);
+                    ev->ack = bpf_ntohl(tcp->ack_seq);
+                    ev->flags = 0;
+                    ev->payload_len = MAX_PAYLOAD_SIZE;
                     ev->is_ipv6 = key.is_ipv6;
+                    ev->sni_offset = 0;
+                    ev->sni_length = 0;
                     ev->reserved = 0;
+                    /* Copy TLS alert payload */
+                    __builtin_memset(ev->payload, 0, MAX_PAYLOAD_SIZE);
+                    __builtin_memcpy(ev->payload, buf, MAX_PAYLOAD_SIZE);
                     bpf_ringbuf_submit(ev, 0);
                 }
             }

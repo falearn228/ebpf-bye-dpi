@@ -7,41 +7,45 @@
 ```
 ┌─────────────────────────────────────────────────────────┐
 │                    USERSPACE (Rust)                     │
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐ │
-│  │ Auto-Logic   │  │ Raw Socket   │  │ Config       │ │
-│  │ -Ar -At -As  │  │ Injector     │  │ Parser       │ │
-│  │ State machine│  │ (fake, OOB)  │  │ "s1 -o1..."  │ │
-│  └──────┬───────┘  └──────┬───────┘  └──────────────┘ │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐  │
+│  │ Event        │  │ Raw Socket   │  │ Config       │  │
+│  │ Processor    │  │ Injector     │  │ Parser       │  │
+│  │ - Auto-logic │  │ (fake, OOB)  │  │ "s1 -o1..."  │  │
+│  │ - Ring buf   │  │              │  │              │  │
+│  └──────┬───────┘  └──────┬───────┘  └──────────────┘  │
 └─────────┼─────────────────┼───────────────────────────┘
-          │ ring buffer     │ bpf() load
+          │ mpsc channel    │ libbpf-rs
 ┌─────────▼─────────────────▼───────────────────────────┐
 │                    eBPF KERNEL                          │
-│  ┌─────────────┐    ┌───────────────┐    ┌──────────┐ │
-│  │  TC Egress  │    │   TC (mod)    │    │  TC      │ │
-│  │  Detection  │───▶│  - split      │    │  Ingress │ │
-│  │  - fake trig│    │  - tlsrec     │    │  (auto)  │ │
-│  │  - events   │    │  - disorder   │    │          │ │
-│  └─────────────┘    │  - OOB mark   │    └──────────┘ │
-│                     └───────────────┘                  │
+│  ┌─────────────┐    ┌───────────────┐    ┌──────────┐  │
+│  │  TC Egress  │    │   TC Hook     │    │  TC      │  │
+│  │  Detection  │───▶│  (libbpf-rs)  │    │  Ingress │  │
+│  │  - Events   │    │  - attach     │    │  (auto)  │  │
+│  │  - Ring buf │    │  - cleanup    │    └──────────┘  │
+│  └─────────────┘    └───────────────┘                  │
 │  ┌─────────────────────────────────────────────────┐  │
-│  │ BPF Maps: conn_map, sni_cache, auto_state        │  │
+│  │ BPF Maps: conn_map, events (ringbuf), config_map │  │
 │  └─────────────────────────────────────────────────┘  │
 └─────────────────────────────────────────────────────────┘
 ```
 
 ## Методы обхода DPI
 
-| Аргумент | Значение          | Что делает                                            |
-| -------- | ----------------- | ----------------------------------------------------- |
-| `s1`     | `--split 1`       | Разбить TCP запрос на позиции 1                       |
-| `-o1`    | `--oob 1`         | OOB (out-of-band) данные на позиции 1                 |
-| `-Ar`    | `--auto rst`      | Автоматика при таймауте/RST                           |
-| `-At`    | `--auto redirect` | Автоматика при HTTP redirect                          |
-| `-f-1`   | `--fake -1`       | Фейк-пакет, offset = -1 (от конца пакета)             |
-| `-r1+s`  | `--tlsrec 1+s`    | TLS record split на позиции 1+SNI offset              |
-| `-As`    | `--auto ssl`      | Автоматика при SSL ошибке                             |
-| `-g8`    | `--frag 8`        | IP фрагментация QUIC/UDP пакетов (8 байт фрагменты)   |
-| `-g16`   | `--frag 16`       | IP фрагментация QUIC/UDP пакетов (16 байт фрагменты)  |
+| Аргумент | Значение          | Статус     | Описание                                           |
+|----------|------------------|------------|----------------------------------------------------|
+| `s1`     | `--split 1`       | ✅ Ready   | TCP split detection → event → userspace injection |
+| `-o1`    | `--oob 1`         | ✅ Ready   | OOB (URG flag) injection via raw socket           |
+| `-Ar`    | `--auto rst`      | ✅ Ready   | Auto-detect RST, retry with new strategy          |
+| `-At`    | `--auto redirect` | ✅ Ready   | Auto-detect HTTP 301/302 redirect                 |
+| `-f-1`   | `--fake -1`       | ✅ Ready   | Fake packet injection via raw socket              |
+| `-r1+s`  | `--tlsrec 1+s`    | ✅ Ready   | TLS record split injection with proper headers    |
+| `-As`    | `--auto ssl`      | ✅ Ready   | Auto-detect SSL fatal alerts                      |
+| `-g8`    | `--frag 8`        | ✅ Ready   | QUIC/UDP IP fragmentation via raw socket          |
+| `-g16`   | `--frag 16`       | ✅ Ready   | QUIC/UDP IP fragmentation via raw socket          |
+
+**Legend:**
+- ✅ Ready - Полностью реализовано
+- ⚠️ Partial - Detection работает, injection требует доработки
 
 ## Требования
 
@@ -70,6 +74,9 @@ cargo build --release
 # Базовый режим с разбиением и OOB
 sudo ./target/release/goodbyedpi-daemon -i eth0 -c "s1 -o1"
 
+# С инжекцией фейк-пакетов
+sudo ./target/release/goodbyedpi-daemon -i eth0 -c "s1 -o1 -f-1"
+
 # Расширенный режим с авто-логикой
 sudo ./target/release/goodbyedpi-daemon -i eth0 -c "s1 -o1 -Ar -f-1 -r1+s -At -As"
 
@@ -93,26 +100,78 @@ goodbyedpi --status
 goodbyedpi --stop
 ```
 
+## Как это работает
+
+### 1. Загрузка eBPF (libbpf-rs)
+
+```rust
+// Dedicated BPF thread
+std::thread::spawn(|| {
+    let mut obj = ObjectBuilder::default()
+        .open_file("goodbyedpi.bpf.o")?
+        .load()?;
+    
+    // Attach TC programs
+    TcHook::new(prog_fd)
+        .attach_point(TC_EGRESS)
+        .attach()?;
+    
+    // Start ring buffer polling
+    RingBufferBuilder::new()
+        .add(events_map, callback)
+        .build()?
+        .poll()?;
+});
+```
+
+### 2. Обработка событий (Ring Buffer)
+
+eBPF программы отправляют события через ring buffer:
+- **FAKE_TRIGGERED** - Требуется инжекция пакета
+- **RST_DETECTED** - Получен RST (auto-logic)
+- **REDIRECT_DETECTED** - HTTP 301/302 (auto-logic)
+- **SSL_ERROR_DETECTED** - SSL alert (auto-logic)
+- **DISORDER_TRIGGERED** - Packet disorder
+
+Userspace получает события через `tokio::sync::mpsc` канал и обрабатывает в async контексте.
+
+### 3. Инжекция пакетов (Raw Socket)
+
+```rust
+// Создание raw socket
+let injector = RawInjector::new()?; // Requires CAP_NET_RAW
+
+// Инжекция fake RST
+injector.inject_fake_packet(
+    src_ip, dst_ip, src_port, dst_port,
+    seq, ack, 0x04, // RST flag
+    None,
+)?;
+```
+
 ## Структура проекта
 
 ```
 .
-├── ebpf/               # eBPF программы (C + libbpf)
+├── ebpf/                    # eBPF программы (C + libbpf)
 │   └── src/
-│       ├── goodbyedpi.bpf.c   # Основной eBPF код
+│       ├── goodbyedpi.bpf.c   # Основной eBPF код (TC egress/ingress)
 │       └── Makefile
-├── daemon/             # Rust daemon (userspace)
+├── daemon/                  # Rust daemon (userspace)
 │   └── src/
-│       ├── main.rs     # Точка входа
-│       ├── bpf.rs      # BPF загрузка и управление
-│       ├── config.rs   # Парсер конфига
-│       ├── injector.rs # Raw socket injector
-│       ├── state.rs    # Управление состоянием
-│       └── tc.rs       # TC helper функции
-├── cli/                # CLI утилита
+│       ├── main.rs          # Точка входа, async tokio runtime
+│       ├── bpf.rs           # BPF lifecycle (libbpf-rs) + ring buffer
+│       ├── config.rs        # Парсер конфигурации DPI
+│       ├── injector.rs      # Raw socket инжектор пакетов
+│       ├── ringbuf.rs       # Обработчик событий ring buffer
+│       ├── state.rs         # Управление состоянием соединений
+│       └── tc.rs            # TC cleanup функции
+├── cli/                     # CLI утилита
 │   └── src/main.rs
-└── proto/              # Общие структуры
-    └── src/lib.rs
+├── proto/                   # Общие структуры
+│   └── src/lib.rs           # Config, Event, ConnKey, ConnState
+└── systemd/                 # Файлы systemd
+    └── goodbyedpi.service
 ```
 
 ## Диагностика и устранение неполадок
@@ -160,29 +219,39 @@ sudo cat /sys/kernel/debug/tracing/trace_pipe
 ls -la /sys/fs/bpf/goodbyedpi/
 ```
 
-## Как это работает
+## Требования к окружению
 
-### 1. Обнаружение (TC Egress)
+- **ОС:** Linux kernel 5.8+
+- **Привилегии:** root или capabilities (CAP_BPF, CAP_NET_ADMIN, CAP_NET_RAW)
+- **BTF:** Ядро должно быть скомпилировано с CONFIG_DEBUG_INFO_BTF
+- **BPF fs:** Должен быть смонтирован /sys/fs/bpf
 
-eBPF программа прикрепляется к egress трафику. Она анализирует пакеты:
-- HTTP запросы (GET, POST, и т.д.)
-- TLS Client Hello
-- QUIC Initial packets (UDP 443)
-- Определяет SNI (Server Name Indication)
+## Безопасность
 
-### 2. Модификация
+- Код требует root-привилегий для загрузки eBPF программ
+- Используются capabilities: CAP_BPF, CAP_NET_ADMIN, CAP_NET_RAW
+- В systemd service включены hardening опции
+- eBPF программы используют verifier для безопасности
 
-При обнаружении подходящего пакета применяются техники:
-- **Split**: Разбиение пакета на части с разными TCP-сегментами
-- **OOB**: Установка URG флага и urgent pointer
-- **Fake**: Отправка фейкового пакета перед реальным
-- **TLSrec**: Разбиение TLS-записи внутри TCP-сегмента
-- **IP Frag**: Фрагментация QUIC/UDP пакетов для обхода DPI
+## Лицензия
 
-### 3. Авто-логика (TC Ingress)
+GPL-2.0
 
-При получении ответов:
-- **RST**: Переподключение с другой стратегией
-- **HTTP 302/301**: Повтор запроса с изменениями
-- **SSL ошибки**: Смена TLS-фингерпринта
-
+## Split packets 
+┌─────────────┐     ┌─────────────┐     ┌─────────────┐
+│  Приложение │────▶│   eBPF TC   │────▶│  Userspace  │
+│  (браузер)  │     │  (egress)   │     │   daemon    │
+└─────────────┘     └─────────────┘     └─────────────┘
+       │                   │                   │
+       │  TCP пакет        │                   │
+       │  (HTTP/TLS)       │                   │
+       ├──────────────────▶│                   │
+       │                   │                   │
+       │                   │ DROP (TC_ACT_SHOT)│
+       │                   │──── событие ─────▶│
+       │                   │  SPLIT_TRIGGERED  │
+       │                   │                   │
+       │                   │   ┌───────────────┤
+       │                   │   │ Пакет 1       │ (байты 0..split_pos)
+       │                   │   │ Пакет 2       │ (байты split_pos..end)
+       │                   │   └───────────────┤

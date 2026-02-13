@@ -15,22 +15,28 @@ GoodByeDPI eBPF — это реализация обхода DPI (Deep Packet In
 ```
 ┌─────────────────────────────────────────────────────────┐
 │                    USERSPACE (Rust)                     │
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐  │
-│  │ Auto-Logic   │  │ Raw Socket   │  │ Config       │  │
-│  │ -Ar -At -As  │  │ Injector     │  │ Parser       │  │
-│  │ State machine│  │ (fake, OOB)  │  │ "s1 -o1..."  │  │
-│  └──────┬───────┘  └──────┬───────┘  └──────────────┘  │
-└─────────┼─────────────────┼───────────────────────────┘
-          │ ring buffer     │ bpf() load
-┌─────────▼─────────────────▼───────────────────────────┐
+│  ┌──────────────┐  ┌──────────────────────────────┐  │
+│  │ Auto-Logic   │  │ Raw Socket Injector          │  │
+│  │ -Ar -At -As  │  │  - TCP fake/split/OOB        │  │
+│  │ State machine│  │  - UDP fragment (IP_HDRINCL) │  │
+│  └──────┬───────┘  └──────────┬───────────────────┘  │
+│         │                     │                       │
+│  ┌──────▼───────┐  ┌───────────▼──────────┐         │
+│  │ Config       │  │ Event Processor      │         │
+│  │ Parser       │  │ - FAKE/SPLIT/TLSREC  │         │
+│  │ "s1 -o1..."  │  │ - QUIC_FRAGMENT      │         │
+│  └──────────────┘  └───────────┬──────────┘         │
+└────────────────────────────────┼──────────────────────┘
+                                 │ ring buffer
+┌────────────────────────────────▼──────────────────────┐
 │                    eBPF KERNEL                          │
 │  ┌─────────────┐    ┌───────────────┐    ┌──────────┐  │
 │  │  TC Egress  │    │   TC (mod)    │    │  TC      │  │
 │  │  Detection  │───▶│  - split      │    │  Ingress │  │
 │  │  - fake trig│    │  - tlsrec     │    │  (auto)  │  │
-│  │  - events   │    │  - disorder   │    └──────────┘  │
-│  └─────────────┘    │  - OOB mark   │                  │
-│                     └───────────────┘                  │
+│  │  - QUIC frag│    │  - disorder   │    └──────────┘  │
+│  │  - events   │    │  - OOB mark   │                  │
+│  └─────────────┘    └───────────────┘                  │
 │  ┌─────────────────────────────────────────────────┐  │
 │  │ BPF Maps: conn_map, sni_cache, auto_state        │  │
 │  └─────────────────────────────────────────────────┘  │
@@ -106,6 +112,67 @@ GoodByeDPI eBPF — это реализация обхода DPI (Deep Packet In
 | `-As`    | `--auto ssl`      | Автоматика при SSL ошибке                             |
 | `-g8`    | `--frag 8`        | IP фрагментация QUIC/UDP пакетов (8 байт фрагменты)   |
 | `-g16`   | `--frag 16`       | IP фрагментация QUIC/UDP пакетов (16 байт фрагменты)  |
+| `-d`     | `--disorder`      | Отправка пакетов в неправильном порядке (disorder)    |
+
+### IP Fragmentation для QUIC/UDP (Phase 3)
+
+Реализована фрагментация UDP/QUIC пакетов на уровне IP для обхода DPI:
+
+**Как работает:**
+1. eBPF детектирует QUIC Initial пакеты (UDP порт 443)
+2. Отправляет событие `QUIC_FRAGMENT_TRIGGERED` в userspace
+3. Userspace разбивает UDP payload на фрагменты по 8 байт (или указанный размер)
+4. Каждый фрагмент отправляется как отдельный IP-пакет с:
+   - IP MF (More Fragments) флагом на всех фрагментах кроме последнего
+   - IP Fragment Offset в 8-байтных единицах
+   - Собственным IP заголовком (IP_HDRINCL)
+
+**Зачем:**
+- DPI системы часто не могут корректно реассемблировать фрагментированные пакеты
+- YouTube и другие сервисы используют QUIC (HTTP/3) поверх UDP
+- Фрагментация на уровне IP прозрачна для приложений
+
+**Использование:**
+```bash
+# Базовый режим (8-байтные фрагменты)
+sudo ./target/release/goodbyedpi-daemon -i eth0 -c "s1 -o1 -g8"
+
+# YouTube/QUIC режим с авто-логикой
+sudo ./target/release/goodbyedpi-daemon -i eth0 -c "s1 -o1 -g8 -Ar -At -As"
+
+# Кастомный размер фрагментов (например, 16 байт)
+sudo ./target/release/goodbyedpi-daemon -i eth0 -c "s1 -g16"
+```
+
+### Packet Disorder (нарушение порядка пакетов)
+
+Техника отправки TCP пакетов в неправильном порядке для обхода DPI:
+
+**Как работает:**
+1. eBPF детектирует HTTP/HTTPS пакеты
+2. При включённом disorder (`-d`), eBPF отправляет событие в userspace
+3. Userspace разбивает payload на две части
+4. Сначала отправляется вторая часть (с более высоким sequence number)
+5. Затем отправляется первая часть (с базовым sequence number)
+6. DPI система видит out-of-order пакеты и может не обработать их корректно
+7. TCP стек получателя корректно переупорядочивает пакеты
+
+**Зачем:**
+- DPI системы часто не умеют корректно обрабатывать out-of-order пакеты
+- Нарушение порядка запутывает эвристические анализаторы
+- Работает на уровне TCP, прозрачно для приложений
+
+**Использование:**
+```bash
+# Базовый режим disorder
+sudo ./target/release/goodbyedpi-daemon -i eth0 -c "s1 -d"
+
+# Комбинированный режим с split и disorder
+sudo ./target/release/goodbyedpi-daemon -i eth0 -c "s1 -o1 -d -Ar"
+
+# Расширенный режим со всеми техниками
+sudo ./target/release/goodbyedpi-daemon -i eth0 -c "s1 -o1 -d -f-1 -Ar -At -As"
+```
 
 ## Сборка
 
@@ -202,6 +269,9 @@ sudo ./target/release/goodbyedpi-daemon -i eth0 -c "s1 -o1" --debug
 
 # YouTube/QUIC режим
 sudo ./target/release/goodbyedpi-daemon -i eth0 -c "s1 -o1 -g8 -Ar -At -As"
+
+# Режим с packet disorder
+sudo ./target/release/goodbyedpi-daemon -i eth0 -c "s1 -o1 -d -Ar -At -As"
 ```
 
 ### CLI
@@ -271,6 +341,9 @@ sudo bpftool map dump pinned /sys/fs/bpf/goodbyedpi/stats_map
 - `3` = REDIRECT_DETECTED
 - `4` = SSL_ERROR_DETECTED
 - `5` = DISORDER_TRIGGERED
+- `6` = SPLIT_TRIGGERED
+- `7` = TLSREC_TRIGGERED
+- `8` = QUIC_FRAGMENT_TRIGGERED
 
 **Stages:**
 - `0` = INIT

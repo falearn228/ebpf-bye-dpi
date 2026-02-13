@@ -104,6 +104,14 @@ pub mod event_types {
     pub const SSL_ERROR_DETECTED: u32 = 4;
     /// Packet disorder was triggered
     pub const DISORDER_TRIGGERED: u32 = 5;
+    /// TCP split was triggered - userspace should send two packets
+    pub const SPLIT_TRIGGERED: u32 = 6;
+    /// TLS record split was triggered - split at SNI boundary
+    pub const TLSREC_TRIGGERED: u32 = 7;
+    /// QUIC/UDP IP fragmentation triggered
+    pub const QUIC_FRAGMENT_TRIGGERED: u32 = 8;
+    /// OOB (Out-of-Band) triggered - URG flag injection
+    pub const OOB_TRIGGERED: u32 = 9;
 }
 
 /// Connection processing stages
@@ -123,6 +131,9 @@ pub mod stages {
     /// Packet disorder has been triggered
     pub const DISORDER: u8 = 5;
 }
+
+/// Maximum payload size that can be sent via ring buffer
+pub const MAX_PAYLOAD_SIZE: usize = 64;
 
 /// Event from BPF ring buffer - supports both IPv4 and IPv6
 ///
@@ -145,19 +156,24 @@ pub mod stages {
 ///     flags: 0x18,  // PSH|ACK
 ///     payload_len: 100,
 ///     is_ipv6: 0,
+///     sni_offset: 0,
+///     sni_length: 0,
 ///     reserved: 0,
+///     payload: [0u8; 64],
 /// };
 /// ```
 #[repr(C)]
-#[derive(Default, Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 pub struct Event {
     /// Event type - one of `event_types::*`
-    /// 
+    ///
     /// Common values:
     /// - `1` = FAKE_TRIGGERED
     /// - `2` = RST_DETECTED
     /// - `3` = REDIRECT_DETECTED
     /// - `4` = SSL_ERROR_DETECTED
+    /// - `6` = SPLIT_TRIGGERED
+    /// - `7` = TLSREC_TRIGGERED
     pub event_type: u32,
     /// Source IP address
     /// - IPv4: only `[0]` is used (in network byte order)
@@ -177,12 +193,41 @@ pub struct Event {
     pub ack: u32,
     /// TCP flags (FIN, SYN, RST, PSH, ACK, URG)
     pub flags: u8,
-    /// Payload length (clamped to 255 if larger)
+    /// Payload length (actual length, may be larger than MAX_PAYLOAD_SIZE)
     pub payload_len: u8,
     /// IP version flag: `0` = IPv4, `1` = IPv6
     pub is_ipv6: u8,
-    /// Padding for alignment
+    /// SNI offset in payload (for TLS Client Hello)
+    /// Contains the offset of the SNI hostname within the payload
+    pub sni_offset: u8,
+    /// SNI length (for TLS Client Hello)
+    /// Contains the length of the SNI hostname
+    pub sni_length: u8,
+    /// Padding for alignment / reserved for future use
     pub reserved: u8,
+    /// Payload data (first MAX_PAYLOAD_SIZE bytes of actual payload)
+    pub payload: [u8; MAX_PAYLOAD_SIZE],
+}
+
+impl Default for Event {
+    fn default() -> Self {
+        Self {
+            event_type: 0,
+            src_ip: [0; 4],
+            dst_ip: [0; 4],
+            src_port: 0,
+            dst_port: 0,
+            seq: 0,
+            ack: 0,
+            flags: 0,
+            payload_len: 0,
+            is_ipv6: 0,
+            sni_offset: 0,
+            sni_length: 0,
+            reserved: 0,
+            payload: [0; MAX_PAYLOAD_SIZE],
+        }
+    }
 }
 
 impl Event {
@@ -290,3 +335,122 @@ pub const FLAG_OOB_APPLIED: u8 = 0x08;
 pub const IPPROTO_TCP: u8 = 6;
 /// Protocol number for UDP
 pub const IPPROTO_UDP: u8 = 17;
+
+/// Auto-logic strategy types for state machine
+pub mod strategy_types {
+    /// TCP split at specific position
+    pub const TCP_SPLIT: u8 = 1;
+    /// TLS record split
+    pub const TLS_RECORD_SPLIT: u8 = 2;
+    /// Out-of-order / Disorder
+    pub const DISORDER: u8 = 3;
+    /// Fake packet + split combination
+    pub const FAKE_WITH_SPLIT: u8 = 4;
+}
+
+/// Auto-logic state machine state
+#[repr(C)]
+#[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AutoLogicState {
+    /// Current strategy type (strategy_types::*)
+    pub strategy: u8,
+    /// Current split position index or parameter
+    pub param: u8,
+    /// Current attempt count for this strategy
+    pub attempts: u8,
+    /// Flags: bit 0 = has_fake, bit 1 = has_disorder, etc.
+    pub flags: u8,
+    /// Reserved for future use
+    pub reserved: [u8; 4],
+}
+
+impl AutoLogicState {
+    /// Create new initial state
+    pub fn new() -> Self {
+        Self {
+            strategy: strategy_types::TCP_SPLIT,
+            param: 0,
+            attempts: 0,
+            flags: 0,
+            reserved: [0; 4],
+        }
+    }
+
+    /// Check if fake is enabled
+    pub fn has_fake(&self) -> bool {
+        self.flags & 0x01 != 0
+    }
+
+    /// Enable fake flag
+    pub fn enable_fake(&mut self) {
+        self.flags |= 0x01;
+    }
+
+    /// Check if disorder is enabled
+    pub fn has_disorder(&self) -> bool {
+        self.flags & 0x02 != 0
+    }
+
+    /// Enable disorder flag
+    pub fn enable_disorder(&mut self) {
+        self.flags |= 0x02;
+    }
+
+    /// Move to next strategy on RST
+    pub fn next_strategy_on_rst(&mut self) {
+        self.attempts += 1;
+        match self.strategy {
+            strategy_types::TCP_SPLIT => {
+                // Try different split positions, then move to TLS
+                if self.attempts >= 3 {
+                    self.strategy = strategy_types::TLS_RECORD_SPLIT;
+                    self.attempts = 0;
+                }
+            }
+            strategy_types::TLS_RECORD_SPLIT => {
+                // Move to disorder
+                self.strategy = strategy_types::DISORDER;
+                self.attempts = 0;
+            }
+            strategy_types::DISORDER => {
+                // Cycle back to TCP split with increased param
+                self.strategy = strategy_types::TCP_SPLIT;
+                self.param = (self.param + 1) % 4;
+                self.attempts = 0;
+            }
+            strategy_types::FAKE_WITH_SPLIT => {
+                // Try different positions with fake
+                if self.attempts >= 3 {
+                    self.attempts = 0;
+                    self.param = (self.param + 1) % 4;
+                }
+            }
+            _ => {
+                self.strategy = strategy_types::TCP_SPLIT;
+            }
+        }
+    }
+
+    /// Strengthen bypass on Redirect (add fake)
+    pub fn strengthen_on_redirect(&mut self) {
+        if !self.has_fake() {
+            self.enable_fake();
+            self.strategy = strategy_types::FAKE_WITH_SPLIT;
+            self.attempts = 0;
+        } else if !self.has_disorder() {
+            // If already has fake, add disorder
+            self.enable_disorder();
+        }
+    }
+
+    /// Get current split position based on param
+    pub fn get_split_position(&self) -> usize {
+        // Try positions: 1, 2, 5, 10 based on param
+        match self.param % 4 {
+            0 => 1,
+            1 => 2,
+            2 => 5,
+            _ => 10,
+        }
+    }
+}

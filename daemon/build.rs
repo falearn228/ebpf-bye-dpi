@@ -68,7 +68,7 @@ fn main() {
         println!("cargo:warning=Generating BPF skeleton with bpftool...");
         
         let skeleton = Command::new("bpftool")
-            .args(["gen", "skeleton", bpf_obj_out.to_str().unwrap()])  // TODO: нужен ли тут & перед []
+            .args(["gen", "skeleton", bpf_obj_out.to_str().unwrap()])
             .output();
 
         match skeleton {

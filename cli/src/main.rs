@@ -54,7 +54,7 @@ async fn main() -> Result<()> {
         info!("Starting daemon with config: {}", args.config);
         // Execute daemon binary
         let output = Command::new("goodbyedpi-daemon")
-            .args(["-i", &args.interface, "-c", &args.config])   // TODO: нужен ли тут &
+            .args(["-i", &args.interface, "-c", &args.config])
             .spawn()?;
         info!("Daemon started with PID: {:?}", output.id());
     } else {

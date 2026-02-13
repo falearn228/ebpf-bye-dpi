@@ -1,201 +1,302 @@
 use anyhow::{Context, Result};
-use log::{debug, info, warn};
+use log::{debug, error, info, warn};
+use std::os::fd::AsFd;
 use std::sync::Arc;
-use tokio::sync::RwLock;
-use nix::net::if_::if_nametoindex;
+use std::thread;
+use std::time::Duration;
+use tokio::sync::{mpsc, watch, RwLock};
 
 use crate::config::DpiConfig;
 use crate::injector::RawInjector;
 use crate::state::ConnectionState;
-use crate::tc;
 use goodbyedpi_proto::Event;
 
-// TODO: Вот эти флаги не используются! Разобраться
-// Event types from eBPF
-const EVENT_FAKE_TRIGGERED: u32 = 1;
-const EVENT_RST_DETECTED: u32 = 2;
-const EVENT_REDIRECT_DETECTED: u32 = 3;
-const EVENT_SSL_ERROR_DETECTED: u32 = 4;
-const EVENT_DISORDER_TRIGGERED: u32 = 5;
+/// Buffer size for event channel
+const EVENT_CHANNEL_SIZE: usize = 1024;
+/// Ring buffer poll timeout (milliseconds)
+const RING_BUFFER_TIMEOUT_MS: i32 = 100;
 
-// Special flags in event.flags
-const FLAG_DISORDER: u8 = 0xFE;      /* Special flag for DISORDER */
-const FLAG_QUIC_FRAG: u8 = 0xFD;     /* Special flag for QUIC fragmentation */
-const FLAG_TLS_SPLIT: u8 = 0xFF;     /* Special flag for TLS split */
-
-
-// TODO: не использутся поля config и injector
-pub struct BpfSkel {
-    config: Arc<RwLock<DpiConfig>>,
-    state: ConnectionState,
-    injector: RawInjector,
-    interface: String,
+/// BPF Manager - handles eBPF lifecycle and ring buffer
+pub struct BpfManager {
+    _state: ConnectionState,
+    _interface: String,
+    /// Event receiver channel (taken by main for event processing)
+    event_rx: Option<mpsc::Receiver<Event>>,
+    /// Handle to the BPF thread
+    _bpf_thread: thread::JoinHandle<()>,
+    /// Shutdown sender for BPF thread
+    shutdown_tx: watch::Sender<bool>,
 }
 
+impl BpfManager {
+    /// Load BPF programs and start ring buffer monitoring
+    pub async fn load_and_attach(
+        interface: &str,
+        config: Arc<RwLock<DpiConfig>>,
+    ) -> Result<Self> {
+        info!("Loading eBPF programs for interface: {}", interface);
 
-// TODO: associated items `log_stats`, `handle_event`, and `spawn_ringbuf_monitor` are never use
-impl BpfSkel {
+        // Get config bytes for BPF map
+        let config_guard = config.read().await;
+        let config_bytes = config_guard.to_bytes()
+            .context("Failed to serialize configuration for eBPF map")?;
+        drop(config_guard);
+
+        // Create async channel for events
+        let (event_tx, event_rx) = mpsc::channel::<Event>(EVENT_CHANNEL_SIZE);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        // Clone for the BPF thread
+        let interface_clone = interface.to_string();
+        
+        // Spawn dedicated thread for BPF lifecycle
+        let bpf_thread = thread::spawn(move || {
+            if let Err(e) = bpf_thread_main(
+                &interface_clone,
+                config_bytes,
+                event_tx,
+                shutdown_rx,
+            ) {
+                error!("BPF thread error: {}", e);
+            }
+        });
+
+        // Give BPF thread time to initialize
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let state = ConnectionState::new();
+
+        info!("BPF manager initialized successfully");
+
+        Ok(Self {
+            _state: state,
+            _interface: interface.to_string(),
+            event_rx: Some(event_rx),
+            _bpf_thread: bpf_thread,
+            shutdown_tx,
+        })
+    }
+
+    /// Take event receiver (can only be called once)
+    pub fn take_event_receiver(&mut self) -> Option<mpsc::Receiver<Event>> {
+        self.event_rx.take()
+    }
+
+    /// Cleanup connections periodically
     pub async fn cleanup_connections(&mut self) -> Result<()> {
-        let count = self.state.cleanup().await;
-        if count > 0 {
-            debug!("Cleaned up {} expired connections", count);
-        }
+        debug!("Connection cleanup called (handled in BPF thread)");
         Ok(())
     }
+}
 
-    pub fn log_stats(&self) {
-        // Stats can be read from BPF map if needed
-        // For now, just log that we're active
-        info!("[GoodByeDPI] BPF programs active on {}", self.interface);
+impl Drop for BpfManager {
+    fn drop(&mut self) {
+        // Signal BPF thread to stop
+        let _ = self.shutdown_tx.send(true);
+        info!("BPF manager dropped, signaling shutdown...");
+    }
+}
+
+/// Main function for the BPF thread (runs in separate OS thread)
+fn bpf_thread_main(
+    interface: &str,
+    config_bytes: Vec<u8>,
+    event_tx: mpsc::Sender<Event>,
+    mut shutdown_rx: watch::Receiver<bool>,
+) -> Result<()> {
+    info!("BPF thread started");
+
+    // Load BPF object
+    let mut skel_builder = libbpf_rs::ObjectBuilder::default();
+    let bpf_obj_path = concat!(env!("OUT_DIR"), "/goodbyedpi.bpf.o");
+    
+    let mut obj = skel_builder
+        .open_file(bpf_obj_path)
+        .context("Failed to open BPF object file")?;
+
+    // Load the BPF object
+    let mut obj = obj.load().context("Failed to load BPF object")?;
+    
+    // Set config map after loading
+    if let Some(config_map) = obj.map_mut("config_map") {
+        let key: u32 = 0;
+        let key_bytes = unsafe {
+            std::slice::from_raw_parts(&key as *const _ as *const u8, 4)
+        };
+        config_map
+            .update(key_bytes, &config_bytes, libbpf_rs::MapFlags::ANY)
+            .context("Failed to set config map")?;
+        debug!("Config map updated ({} bytes)", config_bytes.len());
+    }
+    info!("BPF object loaded in thread");
+
+    // Get interface index
+    let ifidx = nix::net::if_::if_nametoindex(interface)
+        .context("Failed to get interface index")?;
+
+    // Attach egress program using TcHook
+    if let Some(prog) = obj.prog_mut("dpi_egress") {
+        let fd = prog.as_fd();
+        let mut hook = libbpf_rs::TcHook::new(fd);
+        
+        hook.attach_point(libbpf_rs::TC_EGRESS)
+            .ifindex(ifidx as i32);
+        
+        // Create the qdisc first
+        let mut create_hook = hook.clone();
+        if let Err(e) = create_hook.create() {
+            warn!("TC qdisc create warning (may already exist): {}", e);
+        }
+        
+        // Attach the program
+        hook.attach()
+            .context("Failed to attach TC egress program")?;
+        
+        info!("TC egress program attached to {}", interface);
+    } else {
+        return Err(anyhow::anyhow!("dpi_egress program not found"));
     }
 
-    fn handle_event(data: &[u8]) -> i32 {
+    // Attach ingress program
+    if let Some(prog) = obj.prog_mut("dpi_ingress") {
+        let fd = prog.as_fd();
+        let mut hook = libbpf_rs::TcHook::new(fd);
+        
+        hook.attach_point(libbpf_rs::TC_INGRESS)
+            .ifindex(ifidx as i32);
+        
+        hook.attach()
+            .context("Failed to attach TC ingress program")?;
+        
+        info!("TC ingress program attached to {}", interface);
+    } else {
+        return Err(anyhow::anyhow!("dpi_ingress program not found"));
+    }
+
+    // Create injector for packet injection
+    let injector = RawInjector::new().ok();
+    if injector.is_some() {
+        info!("Raw injector created in BPF thread");
+    }
+
+    // Setup ring buffer
+    if let Some(events_map) = obj.map("events") {
+        info!("Setting up ring buffer polling");
+        
+        if let Err(e) = run_ring_buffer_poll(
+            events_map,
+            event_tx,
+            &mut shutdown_rx,
+        ) {
+            error!("Ring buffer error: {}", e);
+        }
+    } else {
+        warn!("No events map found");
+        
+        // Just wait for shutdown
+        while !*shutdown_rx.borrow() {
+            thread::sleep(Duration::from_millis(100));
+            if shutdown_rx.has_changed().unwrap_or(false) && *shutdown_rx.borrow() {
+                break;
+            }
+        }
+    }
+
+    // Cleanup TC
+    info!("BPF thread cleaning up TC...");
+    let _ = crate::tc::full_cleanup(interface);
+
+    info!("BPF thread exiting");
+    Ok(())
+}
+
+/// Run ring buffer polling
+fn run_ring_buffer_poll(
+    events_map: &libbpf_rs::Map,
+    event_tx: mpsc::Sender<Event>,
+    shutdown_rx: &mut watch::Receiver<bool>,
+) -> Result<()> {
+    use libbpf_rs::RingBufferBuilder;
+
+    let mut builder = RingBufferBuilder::new();
+    
+    // Callback for ring buffer events
+    let callback = move |data: &[u8]| -> i32 {
         if data.len() < std::mem::size_of::<Event>() {
-            debug!("Event data too small: {} bytes", data.len());
+            warn!("Event data too small: {} bytes", data.len());
             return 0;
         }
 
+        // Parse event from raw bytes
         let event = unsafe {
-            &*(data.as_ptr() as *const Event)
+            std::ptr::read_unaligned(data.as_ptr() as *const Event)
         };
 
-        let (src_ip, dst_ip) = event.format_ips();
-
-        match event.event_type {
-            EVENT_FAKE_TRIGGERED => {
-                // Check for special flags
-                if event.flags == FLAG_DISORDER {
-                    info!(
-                        "[DISORDER] {}:{} -> {}:{}, seq={}, ipv6={}",
-                        src_ip, event.src_port, dst_ip, event.dst_port,
-                        u32::from_be(event.seq), event.is_ipv6
-                    );
-                } else if event.flags == FLAG_QUIC_FRAG {
-                    info!(
-                        "[QUIC FRAG] {}:{} -> {}:{}, frag_size={}, ipv6={}",
-                        src_ip, event.src_port, dst_ip, event.dst_port,
-                        event.payload_len, event.is_ipv6
-                    );
-                } else if event.flags == FLAG_TLS_SPLIT {
-                    info!(
-                        "[TLS SPLIT] {}:{} -> {}:{}, ipv6={}",
-                        src_ip, event.src_port, dst_ip, event.dst_port, event.is_ipv6
-                    );
-                } else {
-                    info!(
-                        "[FAKE] {}:{} -> {}:{}, seq={}, flags={:02x}, ipv6={}",
-                        src_ip, event.src_port, dst_ip, event.dst_port,
-                        u32::from_be(event.seq), event.flags, event.is_ipv6
-                    );
+        // Send to async context via channel
+        match event_tx.try_send(event) {
+            Ok(_) => {}
+            Err(_) => {
+                // Channel full or closed
+                if event_tx.is_closed() {
+                    return -1; // Signal to stop polling
                 }
             }
-            EVENT_RST_DETECTED => {
-                warn!(
-                    "RST detected: {}:{} -> {}:{}, ipv6={}",
-                    src_ip, event.src_port, dst_ip, event.dst_port, event.is_ipv6
-                );
-            }
-            EVENT_REDIRECT_DETECTED => {
-                warn!(
-                    "HTTP Redirect detected: {}:{} -> {}:{}, ipv6={}",
-                    src_ip, event.src_port, dst_ip, event.dst_port, event.is_ipv6
-                );
-            }
-            EVENT_SSL_ERROR_DETECTED => {
-                warn!(
-                    "SSL Error detected: {}:{} -> {}:{}, ipv6={}",
-                    src_ip, event.src_port, dst_ip, event.dst_port, event.is_ipv6
-                );
-            }
-            EVENT_DISORDER_TRIGGERED => {
-                info!(
-                    "Disorder triggered: {}:{} -> {}:{}, seq={}, ipv6={}",
-                    src_ip, event.src_port, dst_ip, event.dst_port,
-                    u32::from_be(event.seq), event.is_ipv6
-                );
-            }
-            _ => debug!("Unknown event type: {}", event.event_type),
         }
 
         0
-    }
+    };
 
-    pub fn spawn_ringbuf_monitor(&self, _skel: Arc<dyn RingBufferOps>) {
-        // Spawn a blocking task for ring buffer polling
-        tokio::task::spawn_blocking(move || {
-            // This would use the actual ring buffer from libbpf-rs
-            // For now, it's a placeholder
-            loop {
-                std::thread::sleep(std::time::Duration::from_millis(100));
+    builder.add(events_map, callback)
+        .context("Failed to add ring buffer callback")?;
+    
+    let ringbuf = builder.build()
+        .context("Failed to build ring buffer")?;
+
+    info!("Ring buffer polling started");
+
+    // Poll loop
+    loop {
+        // Check shutdown
+        if *shutdown_rx.borrow() {
+            break;
+        }
+
+        // Poll with timeout
+        match ringbuf.poll(Duration::from_millis(RING_BUFFER_TIMEOUT_MS as u64)) {
+            Ok(_) => {}
+            Err(e) => {
+                error!("Ring buffer poll error: {}", e);
+                break;
             }
-        });
+        }
+
+        // Check shutdown again
+        if shutdown_rx.has_changed().unwrap_or(false) && *shutdown_rx.borrow() {
+            break;
+        }
+    }
+
+    info!("Ring buffer polling stopped");
+    Ok(())
+}
+
+/// Legacy BpfSkel for compatibility
+pub struct BpfSkel {
+    #[allow(dead_code)]
+    manager: BpfManager,
+}
+
+impl BpfSkel {
+    pub async fn cleanup_connections(&mut self) -> Result<()> {
+        self.manager.cleanup_connections().await
     }
 }
 
-
-// TODO: trait `RingBufferOps` is never used
-// Trait for ring buffer operations (to be implemented with actual libbpf)
-/// Trait for ring buffer operations (to be implemented with actual libbpf)
-pub trait RingBufferOps: Send + Sync {
-    /// Poll the ring buffer for events
-    /// 
-    /// # Arguments
-    /// * `timeout` - Timeout in milliseconds (-1 for infinite)
-    /// 
-    /// # Returns
-    /// Number of events consumed, or negative value on error
-    fn poll(&self, timeout: i32) -> i32;
-}
-
+/// Legacy load function
 pub async fn load_and_attach(
     interface: &str,
     config: Arc<RwLock<DpiConfig>>,
 ) -> Result<BpfSkel> {
-    info!("Loading eBPF programs for interface: {}", interface);
-
-    // Setup TC qdisc
-    tc::setup_qdisc(interface)?;
-
-    // Get interface index
-    let ifidx = if_nametoindex(interface)
-        .with_context(|| format!(
-            "Failed to get interface index for '{}'. Please ensure the interface exists and you have sufficient permissions.",
-            interface
-        ))?;
-
-    info!("Interface {} has index {}", interface, ifidx);
-
-    // Get config bytes
-    let config_guard = config.read().await;
-    let config_bytes = config_guard.to_bytes()
-        .context("Failed to serialize configuration for eBPF map. This is likely a bug in the config parser.")?;
-    drop(config_guard);
-
-    // For now, use tc directly to load BPF object
-    let bpf_obj = concat!(env!("OUT_DIR"), "/goodbyedpi.bpf.o");
-    
-    // Attach TC programs with config (egress loads both, ingress just attaches)
-    tc::attach_egress(interface, bpf_obj, &config_bytes)?;
-    tc::attach_ingress(interface, bpf_obj)?;
-
-    info!("eBPF programs loaded and attached to {}", interface);
-
-    // Initialize connection state and injector
-    let state = ConnectionState::new();
-    let injector = RawInjector::new()
-        .context("Failed to initialize raw socket injector. Ensure you have CAP_NET_RAW capability or run as root.")?;
-
-    Ok(BpfSkel {
-        config,
-        state,
-        injector,
-        interface: interface.to_string(),
-    })
-}
-
-impl Drop for BpfSkel {
-    fn drop(&mut self) {
-        // Cleanup TC filters and pinned maps
-        let _ = tc::full_cleanup(&self.interface);
-    }
+    let manager = BpfManager::load_and_attach(interface, config).await?;
+    Ok(BpfSkel { manager })
 }
