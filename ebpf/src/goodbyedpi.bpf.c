@@ -230,7 +230,9 @@ static __always_inline void copy_payload_to_event(struct event *e, void *payload
 {
     /* Determine how many bytes to copy (min of actual length and MAX_PAYLOAD_SIZE) */
     __u32 copy_len = payload_len < MAX_PAYLOAD_SIZE ? payload_len : MAX_PAYLOAD_SIZE;
-    
+   
+    copy_len &= 0x3F;
+
     /* Initialize payload buffer to zero */
     __builtin_memset(e->payload, 0, MAX_PAYLOAD_SIZE);
     
@@ -605,8 +607,8 @@ static __always_inline int parse_tls_client_hello_sni(void *payload, __u32 paylo
     __u8 session_id_len;
     if (bpf_probe_read_kernel(&session_id_len, 1, data + offset) < 0)
         return -1;
+    session_id_len &= 0x3F;
     offset += 1 + session_id_len;
-    
     /* Skip cipher suites */
     if (offset + 2 > payload_len)
         return -1;
@@ -614,6 +616,9 @@ static __always_inline int parse_tls_client_hello_sni(void *payload, __u32 paylo
     if (bpf_probe_read_kernel(&cipher_suites_len, 2, data + offset) < 0)
         return -1;
     cipher_suites_len = bpf_ntohs(cipher_suites_len);
+    /* Жесткая проверка на максимальный размер cipher suites (защита от вредоносных значений) */
+    if (cipher_suites_len > 4096)
+        return -1;
     offset += 2 + cipher_suites_len;
     
     /* Skip compression methods */
@@ -622,6 +627,7 @@ static __always_inline int parse_tls_client_hello_sni(void *payload, __u32 paylo
     __u8 compression_len;
     if (bpf_probe_read_kernel(&compression_len, 1, data + offset) < 0)
         return -1;
+    compression_len &= 0xFF;
     offset += 1 + compression_len;
     
     /* Now we're at extensions */
@@ -642,6 +648,8 @@ static __always_inline int parse_tls_client_hello_sni(void *payload, __u32 paylo
     /* Loop through extensions (bounded for BPF verifier) */
     #pragma unroll
     for (int i = 0; i < MAX_EXTENSIONS_ITER; i++) {
+        offset &= 0x3FFF;
+
         if (offset + 4 > extensions_end)
             break;
         
