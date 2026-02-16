@@ -128,10 +128,21 @@ fn bpf_thread_main(
             .context("Failed to set config map")?;
         info!("Config map updated ({} bytes)", config_bytes.len());
         
-        // Log config values for debugging
-        if config_bytes.len() >= 4 {
+        // Log all config values for debugging
+        if config_bytes.len() >= 24 {
             let split_pos = i32::from_ne_bytes([config_bytes[0], config_bytes[1], config_bytes[2], config_bytes[3]]);
-            info!("  split_pos={}", split_pos);
+            let oob_pos = i32::from_ne_bytes([config_bytes[4], config_bytes[5], config_bytes[6], config_bytes[7]]);
+            let fake_offset = i32::from_ne_bytes([config_bytes[8], config_bytes[9], config_bytes[10], config_bytes[11]]);
+            let tlsrec_pos = i32::from_ne_bytes([config_bytes[12], config_bytes[13], config_bytes[14], config_bytes[15]]);
+            let auto_flags = config_bytes[16];
+            let ip_fragment = config_bytes[20];
+            let frag_size = u16::from_ne_bytes([config_bytes[22], config_bytes[23]]);
+            
+            info!("  BPF Config: split_pos={}, oob_pos={}, fake_offset={}, tlsrec_pos={}",
+                  split_pos, oob_pos, fake_offset, tlsrec_pos);
+            info!("  BPF Config: auto_rst={}, auto_redirect={}, auto_ssl={}",
+                  auto_flags & 0x01 != 0, auto_flags & 0x02 != 0, auto_flags & 0x04 != 0);
+            info!("  BPF Config: ip_fragment={}, frag_size={}", ip_fragment, frag_size);
         }
     } else {
         warn!("Config map not found in BPF object!");

@@ -228,13 +228,16 @@ static __always_inline void update_stats_error(struct stats *s)
 /* Helper to copy payload data into event structure using skb.
  * Returns the number of bytes actually copied (0 to MAX_PAYLOAD_SIZE).
  */
-static __always_inline __u8 copy_payload_to_event_skb(struct __sk_buff *skb, struct event *e, 
+static __always_inline __u8 copy_payload_to_event_skb(struct __sk_buff *skb, struct event *e,
                                                        __u32 payload_offset, __u32 payload_len)
 {
     /* Determine how many bytes to copy (min of actual length and MAX_PAYLOAD_SIZE) */
     __u32 copy_len = payload_len < MAX_PAYLOAD_SIZE ? payload_len : MAX_PAYLOAD_SIZE;
    
     copy_len &= 0x3F;
+
+    bpf_dbg_printk("[GoodByeDPI] copy_payload: ENTER payload_offset=%u, payload_len=%u, copy_len=%u, skb_len=%u\n",
+                   payload_offset, payload_len, copy_len, skb->len);
 
     /* Initialize payload buffer to zero */
     __builtin_memset(e->payload, 0, MAX_PAYLOAD_SIZE);
@@ -243,17 +246,17 @@ static __always_inline __u8 copy_payload_to_event_skb(struct __sk_buff *skb, str
      * Note: bpf_skb_load_bytes can read from paged/frags data (GSO/TSO)
      */
     if (copy_len > 0) {
-        bpf_dbg_printk("[GoodByeDPI] copy_payload: offset=%u, len=%u, skb_len=%u\n", 
-                       payload_offset, copy_len, skb->len);
-        
         /* bpf_skb_load_bytes handles GSO/TSO frags automatically */
         int ret = bpf_skb_load_bytes(skb, payload_offset, e->payload, copy_len);
         if (ret < 0) {
-            bpf_dbg_printk("[GoodByeDPI] Failed to load payload bytes: ret=%d, offset=%u\n", 
-                           ret, payload_offset);
+            bpf_dbg_printk("[GoodByeDPI] copy_payload FAILED: ret=%d, offset=%u, len=%u\n",
+                           ret, payload_offset, copy_len);
             return 0;
         }
-        bpf_dbg_printk("[GoodByeDPI] copy_payload: SUCCESS\n");
+        bpf_dbg_printk("[GoodByeDPI] copy_payload SUCCESS: copied %u bytes, first_byte=0x%02x\n",
+                       copy_len, e->payload[0]);
+    } else {
+        bpf_dbg_printk("[GoodByeDPI] copy_payload: ZERO copy_len (payload_len=%u)\n", payload_len);
     }
     
     return (__u8)copy_len;
@@ -999,6 +1002,18 @@ static __always_inline int process_tcp(struct __sk_buff *skb, struct config *cfg
     /* This makes DPI think packets are out of order, potentially bypassing detection */
     /* Userspace will send second part of payload first, then first part */
     if (state->stage == STAGE_OOB || state->stage == STAGE_SPLIT) {
+        /* CRITICAL FIX: Only apply disorder if we have payload to reorder */
+        if (payload_len == 0) {
+            bpf_dbg_printk("[GoodByeDPI] DISORDER: skipping - empty payload (stage=%d)\n", state->stage);
+            /* Reset stage to avoid infinite loop */
+            state->stage = STAGE_INIT;
+            bpf_map_update_elem(&conn_map, key, state, BPF_EXIST);
+            return TC_ACT_OK;
+        }
+        
+        bpf_dbg_printk("[GoodByeDPI] DISORDER: triggering with payload_len=%u (stage=%d)\n",
+                       payload_len, state->stage);
+        
         /* Send event to userspace to trigger disorder logic */
         struct event *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
         if (e) {
@@ -1119,20 +1134,27 @@ static __always_inline int process_udp(struct __sk_buff *skb, struct config *cfg
                                        struct conn_key *key, int is_ipv6,
                                        __u16 src_port, __u16 dst_port)
 {
+    bpf_dbg_printk("[GoodByeDPI] UDP packet: sport=%u dport=%u payload_len=%u ipv6=%d\n",
+                   src_port, dst_port, payload_len, is_ipv6);
+    
     /* Check if this looks like QUIC Initial packet using skb */
     int is_quic = is_quic_initial_skb(skb, payload_offset, payload_len);
     
     update_stats_packet(stats, 0, 1, is_ipv6, 0, 0, is_quic);
 
-    if (!is_quic)
+    if (!is_quic) {
+        bpf_dbg_printk("[GoodByeDPI] UDP: not QUIC Initial (first_byte check failed)\n");
         return TC_ACT_OK;
+    }
 
     /* Only process QUIC to port 443 (HTTPS/QUIC) */
-    if (dst_port != 443 && src_port != 443)
+    if (dst_port != 443 && src_port != 443) {
+        bpf_dbg_printk("[GoodByeDPI] QUIC: port not 443, skipping (dport=%u)\n", dst_port);
         return TC_ACT_OK;
+    }
 
-    bpf_dbg_printk("[GoodByeDPI] QUIC detected: payload_len=%u ipv6=%d port=%u frag=%d\n", 
-                   payload_len, is_ipv6, dst_port, cfg->ip_fragment);
+    bpf_dbg_printk("[GoodByeDPI] QUIC detected: payload_len=%u ipv6=%d port=%u ip_fragment=%d frag_size=%u\n",
+                   payload_len, is_ipv6, dst_port, cfg->ip_fragment, cfg->frag_size);
 
     key->src_port = src_port;
     key->dst_port = dst_port;
