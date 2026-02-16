@@ -50,13 +50,17 @@ struct config {
     __u8 auto_ssl;
     __u8 ip_fragment;      /* Enable IP fragmentation for QUIC/UDP */
     __u16 frag_size;       /* Fragment size (0 = default 8 bytes) */
+    __u8 disorder;         /* Enable packet disorder technique */
 };
 
 /* Default fragment size for QUIC */
 #define DEFAULT_QUIC_FRAG_SIZE 8
 
-/* Maximum payload size to send via ring buffer */
-#define MAX_PAYLOAD_SIZE 64
+/* Maximum payload size to send via ring buffer
+ * 1024 bytes covers most TLS Client Hello (~200-600B) and partial QUIC Initial.
+ * Limited by BPF stack size and verifier constraints on memset/memcpy.
+ */
+#define MAX_PAYLOAD_SIZE 1024
 
 /* GSO (Generic Segmentation Offload) bypass */
 #define TCP_GSO_OFF 0x10000
@@ -90,10 +94,10 @@ struct event {
     __u32 seq;
     __u32 ack;
     __u8 flags;
-    __u8 payload_len;  /* Actual payload length (may be larger than MAX_PAYLOAD_SIZE) */
     __u8 is_ipv6;      /* 0 = IPv4, 1 = IPv6 */
-    __u8 sni_offset;   /* SNI hostname offset in payload (for TLS Client Hello) */
-    __u8 sni_length;   /* SNI hostname length (for TLS Client Hello) */
+    __u16 payload_len; /* Actual payload length (may be larger than MAX_PAYLOAD_SIZE, clamped to 65535) */
+    __u16 sni_offset;  /* SNI hostname offset in payload (for TLS Client Hello) */
+    __u16 sni_length;  /* SNI hostname length (for TLS Client Hello) */
     __u8 reserved;     /* Padding for alignment */
     __u8 payload[MAX_PAYLOAD_SIZE];  /* First MAX_PAYLOAD_SIZE bytes of packet payload */
 };
@@ -226,10 +230,10 @@ static __always_inline void update_stats_error(struct stats *s)
 }
 
 /* Helper to copy payload data into event structure using skb.
- * Returns the number of bytes actually copied (0 to MAX_PAYLOAD_SIZE).
+ * Returns the number of bytes actually copied (0 to MAX_PAYLOAD_SIZE) as u16.
  */
-static __always_inline __u8 copy_payload_to_event_skb(struct __sk_buff *skb, struct event *e,
-                                                       __u32 payload_offset, __u32 payload_len)
+static __always_inline __u16 copy_payload_to_event_skb(struct __sk_buff *skb, struct event *e,
+                                                        __u32 payload_offset, __u32 payload_len)
 {
     /* Determine how many bytes to copy (min of actual length and MAX_PAYLOAD_SIZE) */
     __u32 copy_len = payload_len < MAX_PAYLOAD_SIZE ? payload_len : MAX_PAYLOAD_SIZE;
@@ -257,7 +261,7 @@ static __always_inline __u8 copy_payload_to_event_skb(struct __sk_buff *skb, str
         bpf_dbg_printk("[GoodByeDPI] copy_payload: ZERO copy_len (payload_len=%u)\n", payload_len);
     }
     
-    return (__u8)copy_len;
+    return (__u16)copy_len;
 }
 
 /* Parse IPv4 TCP packet - returns payload offset instead of pointer */
@@ -999,7 +1003,7 @@ static __always_inline int process_tcp(struct __sk_buff *skb, struct config *cfg
     /* Technique 4: Disorder - Reorder packets by modifying sequence numbers */
     /* This makes DPI think packets are out of order, potentially bypassing detection */
     /* Userspace will send second part of payload first, then first part */
-    if (state->stage == STAGE_OOB || state->stage == STAGE_SPLIT) {
+    if (cfg->disorder && (state->stage == STAGE_OOB || state->stage == STAGE_SPLIT)) {
         /* CRITICAL FIX: Only apply disorder if we have payload to reorder */
         if (payload_len == 0) {
             bpf_dbg_printk("[GoodByeDPI] DISORDER: skipping - empty payload (stage=%d)\n", state->stage);
@@ -1031,7 +1035,7 @@ static __always_inline int process_tcp(struct __sk_buff *skb, struct config *cfg
             e->ack = bpf_ntohl(tcp->ack_seq);
             /* Store original TCP flags */
             e->flags = (tcp->fin | (tcp->syn << 1) | (tcp->rst << 2) | (tcp->psh << 3)) & 0x0F;
-            e->payload_len = payload_len > 255 ? 255 : payload_len;
+            e->payload_len = payload_len > 65535 ? 65535 : (__u16)payload_len;
             e->is_ipv6 = is_ipv6;
             e->sni_offset = 0;
             e->sni_length = 0;
@@ -1105,8 +1109,8 @@ static __always_inline int process_tcp(struct __sk_buff *skb, struct config *cfg
                     e->flags = (tcp->fin | (tcp->syn << 1) | (tcp->rst << 2) | (tcp->psh << 3)) & 0x0F;
                     e->is_ipv6 = is_ipv6;
                     /* Store SNI offset and length for userspace */
-                    e->sni_offset = sni_off > 255 ? 255 : sni_off;
-                    e->sni_length = sni_len > 255 ? 255 : sni_len;
+                    e->sni_offset = sni_off > 65535 ? 65535 : (__u16)sni_off;
+                    e->sni_length = sni_len > 65535 ? 65535 : (__u16)sni_len;
                     /* Store split position in reserved field */
                     e->reserved = split_at > 255 ? 255 : split_at;
                     /* Copy payload data using skb */
@@ -1432,19 +1436,20 @@ int dpi_ingress(struct __sk_buff *skb)
             e->sni_offset = 0;
             e->sni_length = 0;
             e->reserved = 0;
-            /* Initialize payload to zero for RST */
-            __builtin_memset(e->payload, 0, MAX_PAYLOAD_SIZE);
+            /* RST packets have no payload, no need to initialize payload buffer */
             bpf_ringbuf_submit(e, 0);
         }
     }
 
     /* Detect HTTP Redirect (302/301) for auto-logic */
     if (cfg->auto_redirect) {
-        __u8 buf[MAX_PAYLOAD_SIZE];
-        if (skb_read_bytes(skb, payload_offset, buf, sizeof(buf)) == 0) {
-            if (buf[0] == 'H' && buf[1] == 'T' && buf[2] == 'T' && buf[3] == 'P') {
-                /* Check for 302 or 301 */
-                if (buf[9] == '3' && buf[10] == '0' && (buf[11] == '1' || buf[11] == '2')) {
+        /* Check for "HTTP" prefix and redirect status without large buffer */
+        __u8 http_check[12];
+        if (bpf_skb_load_bytes(skb, payload_offset, http_check, sizeof(http_check)) == 0) {
+            if (http_check[0] == 'H' && http_check[1] == 'T' && http_check[2] == 'T' && http_check[3] == 'P') {
+                /* Check for 302 or 301 at positions 9-11 */
+                if (http_check[9] == '3' && http_check[10] == '0' && 
+                    (http_check[11] == '1' || http_check[11] == '2')) {
                     bpf_dbg_printk("[GoodByeDPI] INGRESS: HTTP Redirect detected!\n");
                     struct event *ev = bpf_ringbuf_reserve(&events, sizeof(*ev), 0);
                     if (ev) {
@@ -1463,14 +1468,14 @@ int dpi_ingress(struct __sk_buff *skb)
                         ev->seq = bpf_ntohl(tcp->seq);
                         ev->ack = bpf_ntohl(tcp->ack_seq);
                         ev->flags = 0;
-                        ev->payload_len = MAX_PAYLOAD_SIZE;
                         ev->is_ipv6 = key.is_ipv6;
                         ev->sni_offset = 0;
                         ev->sni_length = 0;
                         ev->reserved = 0;
-                        /* Copy HTTP response payload */
-                        __builtin_memset(ev->payload, 0, MAX_PAYLOAD_SIZE);
-                        __builtin_memcpy(ev->payload, buf, MAX_PAYLOAD_SIZE);
+                        /* Copy HTTP response payload directly from skb */
+                        __u16 copied = copy_payload_to_event_skb(skb, ev, payload_offset, 
+                                                                  skb->len > payload_offset ? skb->len - payload_offset : 0);
+                        ev->payload_len = copied;
                         bpf_ringbuf_submit(ev, 0);
                     }
                 }
@@ -1480,10 +1485,11 @@ int dpi_ingress(struct __sk_buff *skb)
 
     /* Detect SSL/TLS errors (alert level fatal) */
     if (cfg->auto_ssl) {
-        __u8 buf[MAX_PAYLOAD_SIZE];
-        if (skb_read_bytes(skb, payload_offset, buf, sizeof(buf)) == 0) {
-            /* TLS alert: content type 0x15, alert level 0x02 = fatal */
-            if (buf[0] == 0x15 && buf[5] == 0x02) {
+        /* Check for TLS alert without large buffer - need only 6 bytes */
+        __u8 tls_check[6];
+        if (bpf_skb_load_bytes(skb, payload_offset, tls_check, sizeof(tls_check)) == 0) {
+            /* TLS alert: content type 0x15, alert level 0x02 = fatal (at offset 5) */
+            if (tls_check[0] == 0x15 && tls_check[5] == 0x02) {
                 bpf_dbg_printk("[GoodByeDPI] INGRESS: SSL Fatal Alert detected!\n");
                 struct event *ev = bpf_ringbuf_reserve(&events, sizeof(*ev), 0);
                 if (ev) {
@@ -1502,14 +1508,14 @@ int dpi_ingress(struct __sk_buff *skb)
                     ev->seq = bpf_ntohl(tcp->seq);
                     ev->ack = bpf_ntohl(tcp->ack_seq);
                     ev->flags = 0;
-                    ev->payload_len = MAX_PAYLOAD_SIZE;
                     ev->is_ipv6 = key.is_ipv6;
                     ev->sni_offset = 0;
                     ev->sni_length = 0;
                     ev->reserved = 0;
-                    /* Copy TLS alert payload */
-                    __builtin_memset(ev->payload, 0, MAX_PAYLOAD_SIZE);
-                    __builtin_memcpy(ev->payload, buf, MAX_PAYLOAD_SIZE);
+                    /* Copy TLS alert payload directly from skb */
+                    __u16 copied = copy_payload_to_event_skb(skb, ev, payload_offset,
+                                                              skb->len > payload_offset ? skb->len - payload_offset : 0);
+                    ev->payload_len = copied;
                     bpf_ringbuf_submit(ev, 0);
                 }
             }

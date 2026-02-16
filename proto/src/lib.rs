@@ -24,6 +24,7 @@
 ///     auto_ssl: false,
 ///     ip_fragment: 1,     // Enable IP fragmentation for QUIC
 ///     frag_size: 8,       // 8-byte fragments
+///     disorder: false,    // Disable packet disorder
 /// };
 /// ```
 #[repr(C)]
@@ -55,6 +56,8 @@ pub struct Config {
     pub ip_fragment: u8,
     /// Fragment size for IP fragmentation (0 = default 8 bytes)
     pub frag_size: u16,
+    /// Enable packet disorder technique (send packets out of order)
+    pub disorder: bool,
 }
 
 /// Statistics counters from BPF
@@ -133,7 +136,9 @@ pub mod stages {
 }
 
 /// Maximum payload size that can be sent via ring buffer
-pub const MAX_PAYLOAD_SIZE: usize = 64;
+/// 1024 bytes covers most TLS Client Hello (~200-600B) and partial QUIC Initial.
+/// Limited by BPF stack size and verifier constraints on memset/memcpy.
+pub const MAX_PAYLOAD_SIZE: usize = 1024;
 
 /// Event from BPF ring buffer - supports both IPv4 and IPv6
 ///
@@ -159,7 +164,7 @@ pub const MAX_PAYLOAD_SIZE: usize = 64;
 ///     sni_offset: 0,
 ///     sni_length: 0,
 ///     reserved: 0,
-///     payload: [0u8; 64],
+///     payload: [0u8; 1024],
 /// };
 /// ```
 #[repr(C)]
@@ -193,16 +198,16 @@ pub struct Event {
     pub ack: u32,
     /// TCP flags (FIN, SYN, RST, PSH, ACK, URG)
     pub flags: u8,
-    /// Payload length (actual length, may be larger than MAX_PAYLOAD_SIZE)
-    pub payload_len: u8,
     /// IP version flag: `0` = IPv4, `1` = IPv6
     pub is_ipv6: u8,
+    /// Payload length (actual length, may be larger than MAX_PAYLOAD_SIZE, clamped to 65535)
+    pub payload_len: u16,
     /// SNI offset in payload (for TLS Client Hello)
     /// Contains the offset of the SNI hostname within the payload
-    pub sni_offset: u8,
+    pub sni_offset: u16,
     /// SNI length (for TLS Client Hello)
     /// Contains the length of the SNI hostname
-    pub sni_length: u8,
+    pub sni_length: u16,
     /// Padding for alignment / reserved for future use
     pub reserved: u8,
     /// Payload data (first MAX_PAYLOAD_SIZE bytes of actual payload)
@@ -220,8 +225,8 @@ impl Default for Event {
             seq: 0,
             ack: 0,
             flags: 0,
-            payload_len: 0,
             is_ipv6: 0,
+            payload_len: 0,
             sni_offset: 0,
             sni_length: 0,
             reserved: 0,

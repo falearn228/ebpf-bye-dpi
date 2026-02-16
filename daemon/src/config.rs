@@ -149,6 +149,7 @@ impl DpiConfig {
             auto_ssl: self.auto_ssl,
             ip_fragment: self.ip_fragment as u8,
             frag_size: self.frag_size,
+            disorder: self.use_disorder,
         }
     }
 
@@ -439,5 +440,22 @@ mod tests {
         let cloned = cfg.clone();
         assert_eq!(cloned.use_disorder, cfg.use_disorder);
         assert!(cloned.use_disorder);
+    }
+
+    #[test]
+    fn test_to_proto_with_disorder() {
+        let cfg = DpiConfig::parse("s1 -o1 -d -Ar").unwrap();
+        let proto = cfg.to_proto();
+        assert_eq!(proto.split_pos, 1);
+        assert_eq!(proto.oob_pos, 1);
+        assert!(proto.disorder);
+        assert!(proto.auto_rst);
+    }
+
+    #[test]
+    fn test_to_proto_disorder_disabled() {
+        let cfg = DpiConfig::parse("s1 -o1 -Ar").unwrap();
+        let proto = cfg.to_proto();
+        assert!(!proto.disorder);
     }
 }

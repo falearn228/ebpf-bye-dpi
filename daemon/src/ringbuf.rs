@@ -867,7 +867,7 @@ mod tests {
             sni_offset: 0,
             sni_length: 0,
             reserved: 0,
-            payload: [0u8; 64],
+            payload: [0u8; MAX_PAYLOAD_SIZE],
         };
 
         // We can't create EventProcessor in tests without a raw socket,
@@ -907,7 +907,7 @@ mod tests {
             seq: 1000,
             ack: 500,
             flags: 0x18, // PSH|ACK
-            payload_len: tls_payload.len() as u8,
+            payload_len: tls_payload.len() as u16,
             is_ipv6: 0,
             sni_offset: 10,  // SNI starts at offset 10
             sni_length: 12,  // SNI is 12 bytes long
@@ -1009,7 +1009,7 @@ mod tests {
             seq: 1000,
             ack: 500,
             flags: 0x38, // URG|PSH|ACK
-            payload_len: http_payload.len() as u8,
+            payload_len: http_payload.len() as u16,
             is_ipv6: 0,
             sni_offset: 0,
             sni_length: 0,
@@ -1109,7 +1109,7 @@ mod tests {
             seq: 1000,
             ack: 500,
             flags: 0x18, // PSH|ACK
-            payload_len: http_payload.len() as u8,
+            payload_len: http_payload.len() as u16,
             is_ipv6: 0,
             sni_offset: 0,
             sni_length: 0,
