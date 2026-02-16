@@ -25,6 +25,8 @@ pub struct EventProcessor {
     injector: RawInjector,
     /// Optional auto-logic state machine
     auto_logic: Option<Arc<AutoLogic>>,
+    /// Channel for sending config updates to BPF thread
+    config_update_tx: Option<std::sync::mpsc::Sender<Vec<u8>>>,
 }
 
 impl EventProcessor {
@@ -38,6 +40,7 @@ impl EventProcessor {
         Ok(Self { 
             injector,
             auto_logic: None,
+            config_update_tx: None,
         })
     }
 
@@ -51,6 +54,29 @@ impl EventProcessor {
         Ok(Self { 
             injector,
             auto_logic: Some(auto_logic),
+            config_update_tx: None,
+        })
+    }
+
+    /// Set the config update channel for BPF updates
+    pub fn set_config_update_tx(&mut self, tx: std::sync::mpsc::Sender<Vec<u8>>) {
+        self.config_update_tx = Some(tx);
+    }
+
+    /// Create event processor with auto-logic and config update channel
+    pub fn with_auto_logic_and_channel(
+        auto_logic: Arc<AutoLogic>,
+        config_update_tx: std::sync::mpsc::Sender<Vec<u8>>,
+    ) -> Result<Self> {
+        let injector = RawInjector::new()
+            .context("Failed to create raw socket injector for event processor")?;
+        
+        info!("Event processor initialized with auto-logic and BPF config channel");
+        
+        Ok(Self { 
+            injector,
+            auto_logic: Some(auto_logic),
+            config_update_tx: Some(config_update_tx),
         })
     }
 
@@ -68,12 +94,34 @@ impl EventProcessor {
             event_count += 1;
             info!("[PROCESSOR] Received event #{} from channel, type={}", event_count, event.event_type);
             
-            let cfg = config.read().await;
-            self.process_event(&event, &cfg).await;
+            let mut cfg = config.write().await;
+            self.process_event(&event, &mut cfg).await;
+            
+            // Check if config was modified by auto-logic and update BPF
+            if self.config_update_tx.is_some() {
+                // Always update BPF config after processing events that might change strategy
+                if let Err(e) = self.update_bpf_config(&cfg) {
+                    warn!("[AUTO] Failed to update BPF config: {}", e);
+                }
+            }
             drop(cfg);
         }
         
         info!("Event processing loop stopped, total events processed: {}", event_count);
+    }
+
+    /// Update BPF config via the config update channel
+    fn update_bpf_config(&self, config: &DpiConfig) -> Result<()> {
+        if let Some(ref tx) = self.config_update_tx {
+            let config_bytes = config.to_bytes()
+                .context("Failed to serialize config for BPF update")?;
+            
+            tx.send(config_bytes)
+                .context("Failed to send config update to BPF thread")?;
+            
+            debug!("[AUTO] BPF config update sent");
+        }
+        Ok(())
     }
 
     /// Build connection key from event
@@ -89,7 +137,7 @@ impl EventProcessor {
     }
 
     /// Process a single event
-    async fn process_event(&self, event: &Event, config: &DpiConfig) {
+    async fn process_event(&self, event: &Event, config: &mut DpiConfig) {
         let (src_ip, dst_ip) = event.format_ips();
         
         info!("[RINGBUF] Processing event type={} from {}:{} -> {}:{}",
@@ -272,7 +320,7 @@ impl EventProcessor {
     }
 
     /// Handle RST detection for auto-logic
-    async fn handle_rst_detected(&self, event: &Event, config: &DpiConfig, src_ip: &str, dst_ip: &str) {
+    async fn handle_rst_detected(&self, event: &Event, config: &mut DpiConfig, src_ip: &str, dst_ip: &str) {
         if !config.auto_rst {
             return;
         }
@@ -312,7 +360,7 @@ impl EventProcessor {
     }
 
     /// Handle HTTP Redirect detection for auto-logic
-    async fn handle_redirect_detected(&self, event: &Event, config: &DpiConfig, src_ip: &str, dst_ip: &str) {
+    async fn handle_redirect_detected(&self, event: &Event, config: &mut DpiConfig, src_ip: &str, dst_ip: &str) {
         if !config.auto_redirect {
             return;
         }
@@ -349,7 +397,7 @@ impl EventProcessor {
     }
 
     /// Handle SSL/TLS error detection for auto-logic
-    async fn handle_ssl_error_detected(&self, event: &Event, config: &DpiConfig, src_ip: &str, dst_ip: &str) {
+    async fn handle_ssl_error_detected(&self, event: &Event, config: &mut DpiConfig, src_ip: &str, dst_ip: &str) {
         if !config.auto_ssl {
             return;
         }
@@ -389,16 +437,65 @@ impl EventProcessor {
     }
 
     /// Apply a strategy to handle the current connection
-    async fn apply_strategy(&self, strategy: &Strategy, event: &Event, config: &DpiConfig) {
+    /// 
+    /// Updates the BPF configuration based on the recommended strategy.
+    /// This modifies the shared config and sends an update to the BPF thread.
+    async fn apply_strategy(&self, strategy: &Strategy, event: &Event, config: &mut DpiConfig) {
         info!("[AUTO] Applying strategy: {}", strategy.description());
         
         let recs = ConfigRecommendations::from(strategy);
         
-        // For now, we log the recommended configuration
-        // In a full implementation, this would update the BPF config map
+        // Apply configuration changes based on strategy recommendations
+        let mut config_changed = false;
+        
+        // Update split position if recommended
+        if let Some(split_pos) = recs.split_pos {
+            if config.split_pos != Some(split_pos) {
+                info!("[AUTO] Updating split_pos: {:?} -> {}", config.split_pos, split_pos);
+                config.split_pos = Some(split_pos);
+                config_changed = true;
+            }
+        }
+        
+        // Update fake settings if recommended
+        if recs.use_fake {
+            if config.fake_offset != recs.fake_offset {
+                info!("[AUTO] Updating fake_offset: {:?} -> {:?}", config.fake_offset, recs.fake_offset);
+                config.fake_offset = recs.fake_offset;
+                config_changed = true;
+            }
+        } else if config.fake_offset.is_some() && !matches!(strategy, Strategy::FakeWithSplit { .. }) {
+            // Disable fake if strategy doesn't use it (but preserve if it does)
+            info!("[AUTO] Disabling fake packet (fake_offset=None)");
+            config.fake_offset = None;
+            config_changed = true;
+        }
+        
+        // Update TLS record split if recommended
+        if recs.use_tlsrec {
+            // TLS record split uses split_pos from strategy
+            if let Some(split_pos) = recs.split_pos {
+                if config.tlsrec_pos != Some(split_pos) {
+                    info!("[AUTO] Updating tlsrec_pos: {:?} -> {}", config.tlsrec_pos, split_pos);
+                    config.tlsrec_pos = Some(split_pos);
+                    config_changed = true;
+                }
+            }
+        }
+        
+        // Update disorder if recommended
+        if recs.use_disorder {
+            if !config.use_disorder {
+                info!("[AUTO] Enabling packet disorder");
+                config.use_disorder = true;
+                config_changed = true;
+            }
+        }
+        
+        // Log the current configuration state
         debug!(
-            "[AUTO] Recommended config: split_pos={:?}, use_fake={}, fake_offset={:?}, use_tlsrec={}, use_disorder={}",
-            recs.split_pos, recs.use_fake, recs.fake_offset, recs.use_tlsrec, recs.use_disorder
+            "[AUTO] Current BPF config: split_pos={:?}, fake_offset={:?}, tlsrec_pos={:?}, disorder={}",
+            config.split_pos, config.fake_offset, config.tlsrec_pos, config.use_disorder
         );
         
         // If the strategy uses fake and we have a fake_offset, inject a fake packet
@@ -415,6 +512,11 @@ impl EventProcessor {
                 // Note: In a real implementation, we might need to re-inject the packet
                 // with the new split position. For now, we just log it.
             }
+        }
+        
+        // BPF config will be updated by the caller (run loop) if changed
+        if config_changed {
+            info!("[AUTO] Configuration updated, BPF map will be synchronized");
         }
     }
 

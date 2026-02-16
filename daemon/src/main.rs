@@ -83,10 +83,18 @@ async fn main() -> Result<()> {
     
     info!("eBPF programs loaded and attached successfully on {}", args.interface);
 
+    // Get config update channel from bpf_manager (for auto-logic to update BPF config)
+    let config_update_tx = bpf_manager.take_config_sender();
+    
     // Create event processor with auto-logic if enabled
     let event_processor = if let Some(ref al) = auto_logic {
-        EventProcessor::with_auto_logic(al.clone())
-            .context("Failed to create event processor with auto-logic")?
+        if let Some(tx) = config_update_tx {
+            EventProcessor::with_auto_logic_and_channel(al.clone(), tx)
+                .context("Failed to create event processor with auto-logic and config channel")?
+        } else {
+            EventProcessor::with_auto_logic(al.clone())
+                .context("Failed to create event processor with auto-logic")?
+        }
     } else {
         EventProcessor::new()
             .context("Failed to create event processor")?

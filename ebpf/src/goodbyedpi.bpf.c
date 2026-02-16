@@ -537,24 +537,74 @@ static __always_inline int is_http_request_skb(struct __sk_buff *skb, __u32 payl
             word == 0x50555420);  /* "PUT " */
 }
 
-/* Check if payload looks like QUIC (simplified check) - skb version */
+/* QUIC version constants */
+#define QUIC_VERSION_1           0x00000001
+#define QUIC_VERSION_2           0x6b3343cf
+#define QUIC_VERSION_DRAFT_29    0xff00001d
+#define QUIC_VERSION_DRAFT_30    0xff00001e
+#define QUIC_VERSION_DRAFT_31    0xff00001f
+#define QUIC_VERSION_DRAFT_32    0xff000020
+
+/* Check if payload looks like QUIC Initial packet - skb version */
+/* QUIC Long Header format:
+ * First byte: 1STTTXXX where S=1, TTT=packet type (0=Initial), XXX=reserved
+ * Bytes 1-4: Version (32-bit big-endian)
+ * Byte 5: DCID len
+ * Bytes 6-21: DCID (0-255 bytes, determined by len field)
+ * Byte after DCID: SCID len
+ * etc.
+ */
 static __always_inline int is_quic_initial_skb(struct __sk_buff *skb, __u32 payload_offset, __u32 payload_len)
 {
-    if (payload_len < 4)
+    /* QUIC Initial requires at least: 1 byte header + 4 bytes version + DCID len + SCID len */
+    if (payload_len < 6)
         return 0;
 
     __u8 first_byte;
+    __u8 version_bytes[4];
     
+    /* Load first byte (header) */
     if (bpf_skb_load_bytes(skb, payload_offset, &first_byte, sizeof(first_byte)) < 0)
         return 0;
 
-    /* QUIC Long Header: first bit is 1 (0x80 mask) */
-    /* Version 1: 0x00 0x00 0x00 0x01 */
+    /* QUIC Long Header: first bit must be 1 (0x80 mask) */
     if ((first_byte & 0x80) == 0)
-        return 0;  /* Short header, not Initial */
+        return 0;  /* Short header, not Long header */
+    
+    /* Packet type (bits 5-7): 0x00 = Initial */
+    /* First byte for Initial: 0b1STTTXXX where TTT=000 for Initial */
+    /* So Initial packets have first byte in range 0x80-0x83 (or with reserved bits set) */
+    __u8 packet_type = (first_byte & 0x30) >> 4;
+    if (packet_type != 0)
+        return 0;  /* Not an Initial packet (could be 0-RTT, Handshake, Retry) */
 
-    /* It's likely QUIC Initial if first bit is set */
-    return 1;
+    /* Load version (4 bytes after first byte) */
+    if (bpf_skb_load_bytes(skb, payload_offset + 1, version_bytes, 4) < 0)
+        return 0;
+    
+    __u32 version = ((__u32)version_bytes[0] << 24) |
+                    ((__u32)version_bytes[1] << 16) |
+                    ((__u32)version_bytes[2] << 8)  |
+                    ((__u32)version_bytes[3]);
+    
+    /* Check for known QUIC versions */
+    /* Version 1: 0x00000001 */
+    if (version == QUIC_VERSION_1)
+        return 1;
+    
+    /* Version 2: 0x6b3343cf */
+    if (version == QUIC_VERSION_2)
+        return 1;
+    
+    /* QUIC draft versions: 0xff0000XX where XX is draft number */
+    if ((version & 0xffffff00) == 0xff000000) {
+        __u8 draft = version & 0xff;
+        if (draft >= 0x1d && draft <= 0x20)  /* Draft 29-32 */
+            return 1;
+    }
+    
+    /* Not a recognized QUIC version */
+    return 0;
 }
 
 /* TLS Constants */
@@ -1196,16 +1246,18 @@ static __always_inline int process_udp(struct __sk_buff *skb, struct config *cfg
         }
         
         /* Drop the original packet - userspace will send fragmented version */
+        bpf_dbg_printk("[GoodByeDPI] QUIC: dropped for fragmentation (frag_size=%u)\n", frag_size);
         return TC_ACT_SHOT;
     }
     
-    /* If QUIC detected but fragmentation not enabled, still drop the packet
-     * to force fallback to TCP/TLS where our DPI bypass techniques work */
-    if (dst_port == 443) {
-        bpf_dbg_printk("[GoodByeDPI] QUIC to port 443: dropping to force TCP fallback\n");
-        return TC_ACT_SHOT;
-    }
-    
+    /* QUIC detected but fragmentation not enabled - pass through normally.
+     * We don't force TCP fallback here because:
+     * 1. User may want HTTP/3 to work for non-blocked sites
+     * 2. Chrome handles QUIC blocking via timeout + retry, not packet drops
+     * 3. Silent drops cause timeouts instead of fast fallback
+     * To force TCP fallback, user should use browser settings or disable QUIC.
+     */
+    bpf_dbg_printk("[GoodByeDPI] QUIC: passing through (fragmentation disabled)\n");
     return TC_ACT_OK;
 }
 

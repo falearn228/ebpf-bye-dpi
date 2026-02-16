@@ -132,6 +132,16 @@ impl BpfManager {
         self.event_rx.take()
     }
 
+    /// Take config update sender (can only be called once)
+    /// 
+    /// This allows other components to send config updates to the BPF thread.
+    pub fn take_config_sender(&mut self) -> Option<std::sync::mpsc::Sender<Vec<u8>>> {
+        // Since we can't easily move the sender out of Arc, 
+        // we create a new sender from the same channel
+        // Note: This requires the channel to be clonable, which std::sync::mpsc::Sender is
+        Some(self.config_tx.clone())
+    }
+
     /// Cleanup connections periodically
     pub async fn cleanup_connections(&mut self) -> Result<()> {
         debug!("Connection cleanup called (handled in BPF thread)");
