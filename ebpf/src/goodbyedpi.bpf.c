@@ -233,8 +233,6 @@ static __always_inline __u8 copy_payload_to_event_skb(struct __sk_buff *skb, str
 {
     /* Determine how many bytes to copy (min of actual length and MAX_PAYLOAD_SIZE) */
     __u32 copy_len = payload_len < MAX_PAYLOAD_SIZE ? payload_len : MAX_PAYLOAD_SIZE;
-   
-    copy_len &= 0x3F;
 
     bpf_dbg_printk("[GoodByeDPI] copy_payload: ENTER payload_offset=%u, payload_len=%u, copy_len=%u, skb_len=%u\n",
                    payload_offset, payload_len, copy_len, skb->len);

@@ -150,16 +150,9 @@ async fn main() -> Result<()> {
 
     // Cleanup
     info!("Cleaning up...");
-    drop(bpf_manager);
     
-    // Additional cleanup to ensure TC filters are removed
-    if let Err(e) = tc::full_cleanup(&args.interface) {
-        log::warn!(
-            "Cleanup error for interface '{}': {}. \
-             You may need to manually remove TC filters with: tc qdisc del dev {} clsact",
-            args.interface, e, args.interface
-        );
-    }
+    // Gracefully shutdown BPF manager (waits for thread to finish)
+    bpf_manager.shutdown();
     
     info!("Goodbye!");
     Ok(())

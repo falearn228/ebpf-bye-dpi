@@ -2,12 +2,11 @@ use anyhow::{Context, Result};
 use log::{debug, error, info, warn};
 use std::os::fd::AsFd;
 use std::sync::Arc;
-use std::thread;
+use std::thread::{self, JoinHandle};
 use std::time::Duration;
 use tokio::sync::{mpsc, watch, RwLock};
 
 use crate::config::DpiConfig;
-use crate::injector::RawInjector;
 use crate::state::ConnectionState;
 use goodbyedpi_proto::Event;
 
@@ -19,11 +18,11 @@ const RING_BUFFER_TIMEOUT_MS: i32 = 100;
 /// BPF Manager - handles eBPF lifecycle and ring buffer
 pub struct BpfManager {
     _state: ConnectionState,
-    _interface: String,
+    interface: String,
     /// Event receiver channel (taken by main for event processing)
     event_rx: Option<mpsc::Receiver<Event>>,
     /// Handle to the BPF thread
-    _bpf_thread: thread::JoinHandle<()>,
+    bpf_thread: Option<JoinHandle<()>>,
     /// Shutdown sender for BPF thread
     shutdown_tx: watch::Sender<bool>,
 }
@@ -70,9 +69,9 @@ impl BpfManager {
 
         Ok(Self {
             _state: state,
-            _interface: interface.to_string(),
+            interface: interface.to_string(),
             event_rx: Some(event_rx),
-            _bpf_thread: bpf_thread,
+            bpf_thread: Some(bpf_thread),
             shutdown_tx,
         })
     }
@@ -87,6 +86,34 @@ impl BpfManager {
         debug!("Connection cleanup called (handled in BPF thread)");
         Ok(())
     }
+
+    /// Shutdown BPF manager gracefully
+    ///
+    /// This method sends a shutdown signal and waits for the BPF thread to complete.
+    /// It also performs TC cleanup. This is the preferred way to shut down the manager.
+    pub fn shutdown(mut self) {
+        info!("Shutting down BPF manager...");
+        
+        // Signal BPF thread to stop
+        let _ = self.shutdown_tx.send(true);
+        info!("Shutdown signal sent to BPF thread");
+        
+        // Wait for BPF thread to finish
+        if let Some(handle) = self.bpf_thread.take() {
+            info!("Waiting for BPF thread to finish...");
+            match handle.join() {
+                Ok(()) => info!("BPF thread finished successfully"),
+                Err(e) => error!("BPF thread panicked: {:?}", e),
+            }
+        }
+        
+        // Additional TC cleanup (in case BPF thread didn't complete it)
+        if let Err(e) = crate::tc::full_cleanup(&self.interface) {
+            warn!("TC cleanup error for interface '{}': {}", self.interface, e);
+        }
+        
+        info!("BPF manager shutdown complete");
+    }
 }
 
 impl Drop for BpfManager {
@@ -94,6 +121,13 @@ impl Drop for BpfManager {
         // Signal BPF thread to stop
         let _ = self.shutdown_tx.send(true);
         info!("BPF manager dropped, signaling shutdown...");
+        
+        // Note: We cannot wait for the thread here because Drop cannot be async
+        // and join() might block. Use shutdown() for graceful shutdown.
+        // The thread will clean up TC on its own when it receives the signal.
+        if self.bpf_thread.is_some() {
+            warn!("BPF manager dropped without calling shutdown() - thread may not finish cleanly");
+        }
     }
 }
 
@@ -190,12 +224,6 @@ fn bpf_thread_main(
         info!("TC ingress program attached to {}", interface);
     } else {
         return Err(anyhow::anyhow!("dpi_ingress program not found"));
-    }
-
-    // Create injector for packet injection
-    let injector = RawInjector::new().ok();
-    if injector.is_some() {
-        info!("Raw injector created in BPF thread");
     }
 
     // Setup ring buffer
