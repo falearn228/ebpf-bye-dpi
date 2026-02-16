@@ -40,6 +40,26 @@ impl RawInjector {
 
         let raw_fd = sock.into_raw_fd();
         
+        // Set IP_HDRINCL to build our own IP headers
+        let hdrincl: i32 = 1;
+        let ret = unsafe {
+            libc::setsockopt(
+                raw_fd,
+                libc::IPPROTO_IP,
+                IP_HDRINCL,
+                &hdrincl as *const _ as *const libc::c_void,
+                std::mem::size_of::<i32>() as libc::socklen_t,
+            )
+        };
+        
+        if ret < 0 {
+            let err = std::io::Error::last_os_error();
+            return Err(anyhow::anyhow!(
+                "Failed to set IP_HDRINCL on TCP raw socket: {} (os error {})",
+                err, err.raw_os_error().unwrap_or(-1)
+            ));
+        }
+        
         // Set mark to avoid eBPF processing (prevent loops)
         unsafe {
             let mark: i32 = 0xD0F; // USERSPACE_MARK
@@ -110,12 +130,9 @@ impl RawInjector {
         let tcp_header = build_tcp_header(src_port, dst_port, seq, ack, flags, payload);
         
         // Combine headers and payload
+        // Note: tcp_header already includes payload from build_tcp_header
         let mut packet = ip_header;
         packet.extend_from_slice(&tcp_header);
-        
-        if let Some(p) = payload {
-            packet.extend_from_slice(p);
-        }
 
         // Calculate and set IP checksum
         let ip_checksum = calculate_checksum(&packet[0..20]);
@@ -678,12 +695,9 @@ impl RawInjector {
         );
         
         // Combine headers and payload
+        // Note: tcp_header already includes payload from build_tcp_header_with_urgent
         let mut packet = ip_header;
         packet.extend_from_slice(&tcp_header);
-        
-        if let Some(p) = Some(payload) {
-            packet.extend_from_slice(p);
-        }
 
         // Calculate and set IP checksum
         let ip_checksum = calculate_checksum(&packet[0..20]);

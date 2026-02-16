@@ -1187,8 +1187,19 @@ static __always_inline int process_udp(struct __sk_buff *skb, struct config *cfg
             e->payload_len = copy_payload_to_event_skb(skb, e, payload_offset, payload_len);
             bpf_ringbuf_submit(e, 0);
             update_stats_event(stats);
-            bpf_dbg_printk("[GoodByeDPI] QUIC fragment triggered (size=%u)\n", frag_size);
+            update_stats_modified(stats);
+            bpf_dbg_printk("[GoodByeDPI] QUIC fragment triggered (size=%u), dropping original\n", frag_size);
         }
+        
+        /* Drop the original packet - userspace will send fragmented version */
+        return TC_ACT_SHOT;
+    }
+    
+    /* If QUIC detected but fragmentation not enabled, still drop the packet
+     * to force fallback to TCP/TLS where our DPI bypass techniques work */
+    if (dst_port == 443) {
+        bpf_dbg_printk("[GoodByeDPI] QUIC to port 443: dropping to force TCP fallback\n");
+        return TC_ACT_SHOT;
     }
     
     return TC_ACT_OK;

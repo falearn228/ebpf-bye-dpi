@@ -181,7 +181,7 @@ impl EventProcessor {
         info!(
             "[SPLIT] Real TCP split: {}:{} -> {}:{}, seq={}, split_pos={}, payload_len={}, preview={}",
             src_ip, event.src_port, dst_ip, event.dst_port,
-            u32::from_be(event.seq), split_pos, payload_len, payload_preview
+            event.seq, split_pos, payload_len, payload_preview
         );
 
         // Get IP addresses
@@ -195,8 +195,8 @@ impl EventProcessor {
         let (first_result, second_result) = self.injector.inject_split_packets(
             src_ipv4, dst_ipv4,
             event.src_port, event.dst_port,
-            u32::from_be(event.seq),
-            u32::from_be(event.ack),
+            event.seq,
+            event.ack,
             event.flags,
             payload,
             split_pos,
@@ -234,7 +234,7 @@ impl EventProcessor {
                 info!(
                     "[DISORDER] {}:{} -> {}:{}, seq={}, ipv6={}, payload_preview={}",
                     src_ip, event.src_port, dst_ip, event.dst_port,
-                    u32::from_be(event.seq), event.is_ipv6, payload_preview
+                    event.seq, event.is_ipv6, payload_preview
                 );
             }
             FLAG_QUIC_FRAG => {
@@ -257,7 +257,7 @@ impl EventProcessor {
                 info!(
                     "[FAKE] {}:{} -> {}:{}, seq={}, flags={:02x}, ipv6={}, payload_len={}, payload_preview={}",
                     src_ip, event.src_port, dst_ip, event.dst_port,
-                    u32::from_be(event.seq), event.flags, event.is_ipv6,
+                    event.seq, event.flags, event.is_ipv6,
                     event.payload_len, payload_preview
                 );
                 
@@ -287,7 +287,7 @@ impl EventProcessor {
         warn!(
             "[AUTO-RST] Connection reset detected: {}:{} -> {}:{}, seq={}, ipv6={}, payload_preview={}",
             src_ip, event.src_port, dst_ip, event.dst_port,
-            u32::from_be(event.seq), event.is_ipv6, payload_preview
+            event.seq, event.is_ipv6, payload_preview
         );
 
         // Use auto-logic if available
@@ -364,7 +364,7 @@ impl EventProcessor {
         warn!(
             "[AUTO-SSL] SSL Fatal Alert detected: {}:{} -> {}:{}, seq={}, ipv6={}, alert_data={}",
             src_ip, event.src_port, dst_ip, event.dst_port,
-            u32::from_be(event.seq), event.is_ipv6, payload_preview
+            event.seq, event.is_ipv6, payload_preview
         );
 
         // Use auto-logic if available
@@ -475,7 +475,7 @@ impl EventProcessor {
         info!(
             "[DISORDER] Packet disorder: {}:{} -> {}:{}, seq={}, split_pos={}, payload_len={}, preview={}",
             src_ip, event.src_port, dst_ip, event.dst_port,
-            u32::from_be(event.seq), split_pos, payload_len, payload_preview
+            event.seq, split_pos, payload_len, payload_preview
         );
 
         // Get IP addresses
@@ -489,8 +489,8 @@ impl EventProcessor {
         let (second_result, first_result) = self.injector.inject_disorder_packets(
             src_ipv4, dst_ipv4,
             event.src_port, event.dst_port,
-            u32::from_be(event.seq),
-            u32::from_be(event.ack),
+            event.seq,
+            event.ack,
             event.flags,
             payload,
             split_pos,
@@ -566,7 +566,7 @@ impl EventProcessor {
         info!(
             "[OOB] OOB packet injection: {}:{} -> {}:{}, seq={}, oob_pos={}, payload_len={}, preview={}",
             src_ip, event.src_port, dst_ip, event.dst_port,
-            u32::from_be(event.seq), oob_pos, payload_len, payload_preview
+            event.seq, oob_pos, payload_len, payload_preview
         );
 
         // Get IP addresses
@@ -581,8 +581,8 @@ impl EventProcessor {
         match self.injector.inject_oob_packet(
             src_ipv4, dst_ipv4,
             event.src_port, event.dst_port,
-            u32::from_be(event.seq),
-            u32::from_be(event.ack),
+            event.seq,
+            event.ack,
             oob_pos,
             payload,
         ) {
@@ -755,7 +755,7 @@ impl EventProcessor {
         info!(
             "[TLS SPLIT] TLS record split: {}:{} -> {}:{}, seq={}, split_pos={}, payload_len={}, preview={}{}",
             src_ip, event.src_port, dst_ip, event.dst_port,
-            u32::from_be(event.seq), split_pos, payload_len, payload_preview, sni_info
+            event.seq, split_pos, payload_len, payload_preview, sni_info
         );
 
         // Get IP addresses
@@ -770,8 +770,8 @@ impl EventProcessor {
         let (first_result, second_result) = self.injector.inject_tls_split_packets(
             src_ipv4, dst_ipv4,
             event.src_port, event.dst_port,
-            u32::from_be(event.seq),
-            u32::from_be(event.ack),
+            event.seq,
+            event.ack,
             event.flags,
             payload,
             split_pos,
@@ -814,15 +814,15 @@ impl EventProcessor {
         info!(
             "[FAKE] Injecting fake packet: {}:{} -> {}:{}, seq={}, offset={}, payload_len={}",
             src_ip, event.src_port, dst_ip, event.dst_port,
-            u32::from_be(event.seq), fake_offset, payload.len()
+            event.seq, fake_offset, payload.len()
         );
 
         // Use the new inject_fake_with_offset method
         self.injector.inject_fake_with_offset(
             src_ip, dst_ip,
             event.src_port, event.dst_port,
-            u32::from_be(event.seq),
-            u32::from_be(event.ack),
+            event.seq,
+            event.ack,
             fake_offset,
             payload,
         )?;

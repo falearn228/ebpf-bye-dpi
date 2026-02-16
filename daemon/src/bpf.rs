@@ -12,6 +12,8 @@ use goodbyedpi_proto::Event;
 
 /// Buffer size for event channel
 const EVENT_CHANNEL_SIZE: usize = 1024;
+/// Buffer size for config update channel
+const CONFIG_CHANNEL_SIZE: usize = 16;
 /// Ring buffer poll timeout (milliseconds)
 const RING_BUFFER_TIMEOUT_MS: i32 = 100;
 
@@ -25,6 +27,10 @@ pub struct BpfManager {
     bpf_thread: Option<JoinHandle<()>>,
     /// Shutdown sender for BPF thread
     shutdown_tx: watch::Sender<bool>,
+    /// Config update sender for BPF thread (sync channel for cross-thread communication)
+    config_tx: std::sync::mpsc::Sender<Vec<u8>>,
+    /// Reference to the config for updates
+    config: Arc<RwLock<DpiConfig>>,
 }
 
 impl BpfManager {
@@ -44,6 +50,9 @@ impl BpfManager {
         // Create async channel for events
         let (event_tx, event_rx) = mpsc::channel::<Event>(EVENT_CHANNEL_SIZE);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        
+        // Create sync channel for config updates (used from async context to sync BPF thread)
+        let (config_tx, config_rx) = std::sync::mpsc::channel::<Vec<u8>>();
 
         // Clone for the BPF thread
         let interface_clone = interface.to_string();
@@ -55,6 +64,7 @@ impl BpfManager {
                 config_bytes,
                 event_tx,
                 shutdown_rx,
+                config_rx,
             ) {
                 error!("BPF thread error: {}", e);
             }
@@ -73,7 +83,48 @@ impl BpfManager {
             event_rx: Some(event_rx),
             bpf_thread: Some(bpf_thread),
             shutdown_tx,
+            config_tx,
+            config,
         })
+    }
+    
+    /// Update BPF configuration at runtime
+    ///
+    /// This method serializes the current config and sends it to the BPF thread,
+    /// which updates the BPF map. This allows runtime configuration changes
+    /// without reloading the entire BPF program.
+    pub async fn update_config(&self) -> Result<()> {
+        info!("Updating BPF configuration...");
+        
+        // Read current config and serialize
+        let config_guard = self.config.read().await;
+        let config_bytes = config_guard.to_bytes()
+            .context("Failed to serialize configuration for eBPF map")?;
+        drop(config_guard);
+        
+        // Send to BPF thread (non-blocking, uses sync channel)
+        self.config_tx.send(config_bytes)
+            .context("Failed to send config update to BPF thread (thread may have exited)")?;
+        
+        info!("Configuration update sent to BPF thread");
+        Ok(())
+    }
+    
+    /// Update BPF configuration with a new config value
+    ///
+    /// This method takes a new config, updates the stored config reference,
+    /// and sends the update to the BPF thread.
+    pub async fn set_config(&self, new_config: DpiConfig) -> Result<()> {
+        info!("Setting new BPF configuration...");
+        
+        // Update the stored config
+        {
+            let mut config_guard = self.config.write().await;
+            *config_guard = new_config;
+        }
+        
+        // Send update to BPF thread
+        self.update_config().await
     }
 
     /// Take event receiver (can only be called once)
@@ -137,6 +188,7 @@ fn bpf_thread_main(
     config_bytes: Vec<u8>,
     event_tx: mpsc::Sender<Event>,
     mut shutdown_rx: watch::Receiver<bool>,
+    config_rx: std::sync::mpsc::Receiver<Vec<u8>>,
 ) -> Result<()> {
     info!("BPF thread started");
 
@@ -163,21 +215,7 @@ fn bpf_thread_main(
         info!("Config map updated ({} bytes)", config_bytes.len());
         
         // Log all config values for debugging
-        if config_bytes.len() >= 24 {
-            let split_pos = i32::from_ne_bytes([config_bytes[0], config_bytes[1], config_bytes[2], config_bytes[3]]);
-            let oob_pos = i32::from_ne_bytes([config_bytes[4], config_bytes[5], config_bytes[6], config_bytes[7]]);
-            let fake_offset = i32::from_ne_bytes([config_bytes[8], config_bytes[9], config_bytes[10], config_bytes[11]]);
-            let tlsrec_pos = i32::from_ne_bytes([config_bytes[12], config_bytes[13], config_bytes[14], config_bytes[15]]);
-            let auto_flags = config_bytes[16];
-            let ip_fragment = config_bytes[20];
-            let frag_size = u16::from_ne_bytes([config_bytes[22], config_bytes[23]]);
-            
-            info!("  BPF Config: split_pos={}, oob_pos={}, fake_offset={}, tlsrec_pos={}",
-                  split_pos, oob_pos, fake_offset, tlsrec_pos);
-            info!("  BPF Config: auto_rst={}, auto_redirect={}, auto_ssl={}",
-                  auto_flags & 0x01 != 0, auto_flags & 0x02 != 0, auto_flags & 0x04 != 0);
-            info!("  BPF Config: ip_fragment={}, frag_size={}", ip_fragment, frag_size);
-        }
+        log_config_bytes(&config_bytes);
     } else {
         warn!("Config map not found in BPF object!");
     }
@@ -226,6 +264,9 @@ fn bpf_thread_main(
         return Err(anyhow::anyhow!("dpi_ingress program not found"));
     }
 
+    // Get config_map reference for runtime updates
+    let config_map = obj.map("config_map");
+    
     // Setup ring buffer
     if let Some(events_map) = obj.map("events") {
         info!("Setting up ring buffer polling");
@@ -234,15 +275,27 @@ fn bpf_thread_main(
             events_map,
             event_tx,
             &mut shutdown_rx,
+            config_map,
+            config_rx,
         ) {
             error!("Ring buffer error: {}", e);
         }
     } else {
         warn!("No events map found");
         
-        // Just wait for shutdown
+        // Just wait for shutdown, also process config updates
         while !*shutdown_rx.borrow() {
             thread::sleep(Duration::from_millis(100));
+            
+            // Check for config updates
+            while let Ok(new_config) = config_rx.try_recv() {
+                if let Some(map) = config_map {
+                    if let Err(e) = update_config_map(map, &new_config) {
+                        error!("Failed to update config map: {}", e);
+                    }
+                }
+            }
+            
             if shutdown_rx.has_changed().unwrap_or(false) && *shutdown_rx.borrow() {
                 break;
             }
@@ -257,11 +310,49 @@ fn bpf_thread_main(
     Ok(())
 }
 
+/// Log configuration bytes for debugging
+fn log_config_bytes(config_bytes: &[u8]) {
+    if config_bytes.len() >= 24 {
+        let split_pos = i32::from_ne_bytes([config_bytes[0], config_bytes[1], config_bytes[2], config_bytes[3]]);
+        let oob_pos = i32::from_ne_bytes([config_bytes[4], config_bytes[5], config_bytes[6], config_bytes[7]]);
+        let fake_offset = i32::from_ne_bytes([config_bytes[8], config_bytes[9], config_bytes[10], config_bytes[11]]);
+        let tlsrec_pos = i32::from_ne_bytes([config_bytes[12], config_bytes[13], config_bytes[14], config_bytes[15]]);
+        let auto_flags = config_bytes[16];
+        let ip_fragment = config_bytes[20];
+        let frag_size = u16::from_ne_bytes([config_bytes[22], config_bytes[23]]);
+        
+        info!("  BPF Config: split_pos={}, oob_pos={}, fake_offset={}, tlsrec_pos={}",
+              split_pos, oob_pos, fake_offset, tlsrec_pos);
+        info!("  BPF Config: auto_rst={}, auto_redirect={}, auto_ssl={}",
+              auto_flags & 0x01 != 0, auto_flags & 0x02 != 0, auto_flags & 0x04 != 0);
+        info!("  BPF Config: ip_fragment={}, frag_size={}", ip_fragment, frag_size);
+    }
+}
+
+/// Update config map with new configuration bytes
+fn update_config_map(config_map: &libbpf_rs::Map, config_bytes: &[u8]) -> Result<()> {
+    let key: u32 = 0;
+    let key_bytes = unsafe {
+        std::slice::from_raw_parts(&key as *const _ as *const u8, 4)
+    };
+    
+    config_map
+        .update(key_bytes, config_bytes, libbpf_rs::MapFlags::ANY)
+        .context("Failed to update config map")?;
+    
+    info!("Config map updated at runtime ({} bytes)", config_bytes.len());
+    log_config_bytes(config_bytes);
+    
+    Ok(())
+}
+
 /// Run ring buffer polling
 fn run_ring_buffer_poll(
     events_map: &libbpf_rs::Map,
     event_tx: mpsc::Sender<Event>,
     shutdown_rx: &mut watch::Receiver<bool>,
+    config_map: Option<&libbpf_rs::Map>,
+    config_rx: std::sync::mpsc::Receiver<Vec<u8>>,
 ) -> Result<()> {
     use libbpf_rs::RingBufferBuilder;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -328,6 +419,17 @@ fn run_ring_buffer_poll(
         // Check shutdown
         if *shutdown_rx.borrow() {
             break;
+        }
+
+        // Process any pending config updates
+        while let Ok(new_config) = config_rx.try_recv() {
+            if let Some(map) = config_map {
+                if let Err(e) = update_config_map(map, &new_config) {
+                    error!("Failed to update config map: {}", e);
+                }
+            } else {
+                warn!("Config map not available for update");
+            }
         }
 
         // Poll with timeout
