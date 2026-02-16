@@ -62,13 +62,18 @@ impl EventProcessor {
     ) {
         info!("Event processing loop started");
         
+        let mut event_count = 0u64;
+        
         while let Some(event) = event_rx.recv().await {
+            event_count += 1;
+            info!("[PROCESSOR] Received event #{} from channel, type={}", event_count, event.event_type);
+            
             let cfg = config.read().await;
             self.process_event(&event, &cfg).await;
             drop(cfg);
         }
         
-        info!("Event processing loop stopped");
+        info!("Event processing loop stopped, total events processed: {}", event_count);
     }
 
     /// Build connection key from event
@@ -86,6 +91,9 @@ impl EventProcessor {
     /// Process a single event
     async fn process_event(&self, event: &Event, config: &DpiConfig) {
         let (src_ip, dst_ip) = event.format_ips();
+        
+        info!("[RINGBUF] Processing event type={} from {}:{} -> {}:{}",
+              event.event_type, src_ip, event.src_port, dst_ip, event.dst_port);
         
         match event.event_type {
             event_types::SPLIT_TRIGGERED => {
@@ -129,6 +137,9 @@ impl EventProcessor {
         src_ip: &str,
         dst_ip: &str,
     ) {
+        info!("[SPLIT] handle_split_triggered called for {}:{} -> {}:{}, event_type={}",
+              src_ip, event.src_port, dst_ip, event.dst_port, event.event_type);
+        
         // Only IPv4 supported for now
         if event.is_ipv6 != 0 {
             warn!("[SPLIT] IPv6 split not yet implemented for {}:{} -> {}:{}",
@@ -146,8 +157,8 @@ impl EventProcessor {
             }
         };
 
-        // Get payload from event
-        let payload_len = event.payload_len as usize;
+        // Get payload from event (clamped to MAX_PAYLOAD_SIZE for safety)
+        let payload_len = (event.payload_len as usize).min(MAX_PAYLOAD_SIZE);
         if payload_len == 0 {
             warn!("[SPLIT] Empty payload, nothing to split");
             return;
@@ -177,7 +188,7 @@ impl EventProcessor {
         let src_ipv4 = event.src_ip_v4();
         let dst_ipv4 = event.dst_ip_v4();
 
-        // Extract actual payload (up to payload_len bytes)
+        // Extract actual payload (already clamped to MAX_PAYLOAD_SIZE)
         let payload = &event.payload[..payload_len];
 
         // Inject split packets
@@ -426,8 +437,8 @@ impl EventProcessor {
             return;
         }
 
-        // Get payload from event
-        let payload_len = event.payload_len as usize;
+        // Get payload from event (clamped to MAX_PAYLOAD_SIZE for safety)
+        let payload_len = (event.payload_len as usize).min(MAX_PAYLOAD_SIZE);
         if payload_len == 0 {
             warn!("[DISORDER] Empty payload, nothing to disorder");
             return;
@@ -599,6 +610,9 @@ impl EventProcessor {
         dst_ip: &str,
         config: &DpiConfig,
     ) {
+        info!("[QUIC FRAG] Fragmentation triggered for {}:{} -> {}:{}, payload_len={}",
+              src_ip, event.src_port, dst_ip, event.dst_port, event.payload_len);
+        
         // Only IPv4 supported for now
         if event.is_ipv6 != 0 {
             warn!("[QUIC FRAG] IPv6 fragmentation not yet implemented for {}:{} -> {}:{}",
@@ -606,8 +620,8 @@ impl EventProcessor {
             return;
         }
 
-        // Get payload from event
-        let payload_len = event.payload_len as usize;
+        // Get payload from event (clamped to MAX_PAYLOAD_SIZE for safety)
+        let payload_len = (event.payload_len as usize).min(MAX_PAYLOAD_SIZE);
         if payload_len == 0 {
             warn!("[QUIC FRAG] Empty payload, nothing to fragment");
             return;
@@ -684,8 +698,8 @@ impl EventProcessor {
             return;
         }
 
-        // Get payload from event
-        let payload_len = event.payload_len as usize;
+        // Get payload from event (clamped to MAX_PAYLOAD_SIZE for safety)
+        let payload_len = (event.payload_len as usize).min(MAX_PAYLOAD_SIZE);
         if payload_len == 0 {
             warn!("[TLS SPLIT] Empty payload, nothing to split");
             return;
@@ -788,10 +802,10 @@ impl EventProcessor {
         // Convert isize to i32 for the injector method
         let fake_offset: i32 = config.fake_offset.unwrap_or(0) as i32;
         
-        // Get payload from event
-        let payload_len = event.payload_len as usize;
+        // Get payload from event (clamped to MAX_PAYLOAD_SIZE for safety)
+        let payload_len = (event.payload_len as usize).min(MAX_PAYLOAD_SIZE);
         let payload = if payload_len > 0 {
-            &event.payload[..payload_len.min(64)]
+            &event.payload[..payload_len]
         } else {
             // Default fake payload for HTTP
             b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n"

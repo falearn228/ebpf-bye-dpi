@@ -126,7 +126,15 @@ fn bpf_thread_main(
         config_map
             .update(key_bytes, &config_bytes, libbpf_rs::MapFlags::ANY)
             .context("Failed to set config map")?;
-        debug!("Config map updated ({} bytes)", config_bytes.len());
+        info!("Config map updated ({} bytes)", config_bytes.len());
+        
+        // Log config values for debugging
+        if config_bytes.len() >= 4 {
+            let split_pos = i32::from_ne_bytes([config_bytes[0], config_bytes[1], config_bytes[2], config_bytes[3]]);
+            info!("  split_pos={}", split_pos);
+        }
+    } else {
+        warn!("Config map not found in BPF object!");
     }
     info!("BPF object loaded in thread");
 
@@ -217,13 +225,21 @@ fn run_ring_buffer_poll(
     shutdown_rx: &mut watch::Receiver<bool>,
 ) -> Result<()> {
     use libbpf_rs::RingBufferBuilder;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     let mut builder = RingBufferBuilder::new();
     
+    // Event counter for diagnostics
+    static EVENT_COUNT: AtomicU64 = AtomicU64::new(0);
+    
     // Callback for ring buffer events
     let callback = move |data: &[u8]| -> i32 {
+        let count = EVENT_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+        
+        info!("[BPF CALLBACK] Called with {} bytes, event count={}", data.len(), count);
+        
         if data.len() < std::mem::size_of::<Event>() {
-            warn!("Event data too small: {} bytes", data.len());
+            warn!("Event data too small: {} bytes (expected {})", data.len(), std::mem::size_of::<Event>());
             return 0;
         }
 
@@ -232,10 +248,20 @@ fn run_ring_buffer_poll(
             std::ptr::read_unaligned(data.as_ptr() as *const Event)
         };
 
+        // Log received event
+        let (src_ip, dst_ip) = event.format_ips();
+        info!(
+            "[BPF] Received event type={} from {}:{} -> {}:{}",
+            event.event_type, src_ip, event.src_port, dst_ip, event.dst_port
+        );
+
         // Send to async context via channel
         match event_tx.try_send(event) {
-            Ok(_) => {}
-            Err(_) => {
+            Ok(_) => {
+                info!("[BPF] Event sent to channel successfully");
+            }
+            Err(e) => {
+                warn!("[BPF] Failed to send event to channel: {:?}", e);
                 // Channel full or closed
                 if event_tx.is_closed() {
                     return -1; // Signal to stop polling
@@ -246,15 +272,19 @@ fn run_ring_buffer_poll(
         0
     };
 
+    info!("[RINGBUF] Adding events map to ring buffer builder...");
     builder.add(events_map, callback)
         .context("Failed to add ring buffer callback")?;
+    info!("[RINGBUF] Events map added successfully");
     
     let ringbuf = builder.build()
         .context("Failed to build ring buffer")?;
+    info!("[RINGBUF] Ring buffer built successfully");
 
     info!("Ring buffer polling started");
 
     // Poll loop
+    let mut poll_count = 0u64;
     loop {
         // Check shutdown
         if *shutdown_rx.borrow() {
@@ -263,7 +293,12 @@ fn run_ring_buffer_poll(
 
         // Poll with timeout
         match ringbuf.poll(Duration::from_millis(RING_BUFFER_TIMEOUT_MS as u64)) {
-            Ok(_) => {}
+            Ok(_) => {
+                poll_count += 1;
+                if poll_count % 100 == 0 {
+                    info!("[RINGBUF] Poll #{} completed", poll_count);
+                }
+            }
             Err(e) => {
                 error!("Ring buffer poll error: {}", e);
                 break;
@@ -276,7 +311,7 @@ fn run_ring_buffer_poll(
         }
     }
 
-    info!("Ring buffer polling stopped");
+    info!("Ring buffer polling stopped, total polls: {}", poll_count);
     Ok(())
 }
 

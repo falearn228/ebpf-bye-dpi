@@ -225,8 +225,11 @@ static __always_inline void update_stats_error(struct stats *s)
         __sync_fetch_and_add(&s->errors, 1);
 }
 
-/* Helper to copy payload data into event structure */
-static __always_inline void copy_payload_to_event(struct event *e, void *payload, __u32 payload_len)
+/* Helper to copy payload data into event structure using skb.
+ * Returns the number of bytes actually copied (0 to MAX_PAYLOAD_SIZE).
+ */
+static __always_inline __u8 copy_payload_to_event_skb(struct __sk_buff *skb, struct event *e, 
+                                                       __u32 payload_offset, __u32 payload_len)
 {
     /* Determine how many bytes to copy (min of actual length and MAX_PAYLOAD_SIZE) */
     __u32 copy_len = payload_len < MAX_PAYLOAD_SIZE ? payload_len : MAX_PAYLOAD_SIZE;
@@ -236,17 +239,31 @@ static __always_inline void copy_payload_to_event(struct event *e, void *payload
     /* Initialize payload buffer to zero */
     __builtin_memset(e->payload, 0, MAX_PAYLOAD_SIZE);
     
-    /* Safely copy payload data */
-    if (payload && copy_len > 0) {
-        bpf_probe_read_kernel(e->payload, copy_len, payload);
+    /* Safely copy payload data using bpf_skb_load_bytes
+     * Note: bpf_skb_load_bytes can read from paged/frags data (GSO/TSO)
+     */
+    if (copy_len > 0) {
+        bpf_dbg_printk("[GoodByeDPI] copy_payload: offset=%u, len=%u, skb_len=%u\n", 
+                       payload_offset, copy_len, skb->len);
+        
+        /* bpf_skb_load_bytes handles GSO/TSO frags automatically */
+        int ret = bpf_skb_load_bytes(skb, payload_offset, e->payload, copy_len);
+        if (ret < 0) {
+            bpf_dbg_printk("[GoodByeDPI] Failed to load payload bytes: ret=%d, offset=%u\n", 
+                           ret, payload_offset);
+            return 0;
+        }
+        bpf_dbg_printk("[GoodByeDPI] copy_payload: SUCCESS\n");
     }
+    
+    return (__u8)copy_len;
 }
 
-/* Parse IPv4 TCP packet */
+/* Parse IPv4 TCP packet - returns payload offset instead of pointer */
 static __always_inline int parse_ipv4_tcp(struct __sk_buff *skb,
                                           struct iphdr **iph,
                                           struct tcphdr **tcph,
-                                          void **payload,
+                                          __u32 *payload_offset,
                                           __u32 *payload_len)
 {
     void *data = (void *)(long)skb->data;
@@ -278,17 +295,32 @@ static __always_inline int parse_ipv4_tcp(struct __sk_buff *skb,
     if (tcp_header_len < sizeof(struct tcphdr) || tcp_header_len > 60)
         return -1;
 
-    /* Check payload pointer is within bounds */
-    *payload = (void *)tcp + tcp_header_len;
-    if (*payload > data_end)
-        return -1;
-
-    /* Calculate payload length safely */
+    /* Calculate payload offset as sum of headers */
     __u32 total_headers = ETH_HLEN + ip_header_len + tcp_header_len;
+    *payload_offset = total_headers;
+    
+    /* Use actual packet length from data_end - data (handles GSO/TSO correctly) */
+    __u32 packet_len = (__u32)(data_end - data);
+    
+    bpf_dbg_printk("[GoodByeDPI] IPv4 TCP parse: skb_len=%u, linear_len=%u, total_headers=%u\n", 
+                   skb->len, packet_len, total_headers);
+    
+    /* For payload length calculation, use skb->len (includes frags) */
+    /* For offset verification, use packet_len (linear data only) */
+    if (*payload_offset > packet_len) {
+        bpf_dbg_printk("[GoodByeDPI] IPv4 TCP parse: payload in frags, offset=%u > linear=%u\n", 
+                       *payload_offset, packet_len);
+        /* Continue - bpf_skb_load_bytes can read from frags */
+    }
+
+    /* Calculate payload length from skb->len (includes frags for GSO) */
     if (skb->len > total_headers)
         *payload_len = skb->len - total_headers;
     else
         *payload_len = 0;
+    
+    bpf_dbg_printk("[GoodByeDPI] IPv4 TCP parse: payload_offset=%u, payload_len=%u\n", 
+                   *payload_offset, *payload_len);
 
     *iph = ip;
     *tcph = tcp;
@@ -296,9 +328,9 @@ static __always_inline int parse_ipv4_tcp(struct __sk_buff *skb,
     return 0;
 }
 
-/* Parse IPv6 TCP packet */
+/* Parse IPv6 TCP packet - returns payload offset instead of pointer */
 static __always_inline int parse_ipv6_tcp(struct __sk_buff *skb,
-                                          void **payload,
+                                          __u32 *payload_offset,
                                           __u32 *payload_len,
                                           struct conn_key *key)
 {
@@ -322,13 +354,19 @@ static __always_inline int parse_ipv6_tcp(struct __sk_buff *skb,
     if (tcp_header_len < sizeof(struct tcphdr) || tcp_header_len > 60)
         return -1;
 
-    /* Check payload pointer is within bounds */
-    *payload = (void *)tcp + tcp_header_len;
-    if (*payload > data_end)
+    /* Calculate payload offset as sum of headers */
+    __u32 total_headers = ETH_HLEN + sizeof(struct ipv6hdr) + tcp_header_len;
+    *payload_offset = total_headers;
+    
+    /* Use skb->len for payload length (includes frags for GSO) */
+    /* Use data_end - data for linear portion check */
+    __u32 linear_len = (__u32)(data_end - data);
+    
+    /* Verify payload offset is within bounds */
+    if (*payload_offset > skb->len)
         return -1;
 
-    /* Calculate payload length safely */
-    __u32 total_headers = ETH_HLEN + sizeof(struct ipv6hdr) + tcp_header_len;
+    /* Calculate payload length from skb->len (includes frags) */
     if (skb->len > total_headers)
         *payload_len = skb->len - total_headers;
     else
@@ -341,11 +379,11 @@ static __always_inline int parse_ipv6_tcp(struct __sk_buff *skb,
     return 0;
 }
 
-/* Parse IPv4 UDP packet (for QUIC) */
+/* Parse IPv4 UDP packet (for QUIC) - returns payload offset instead of pointer */
 static __always_inline int parse_ipv4_udp(struct __sk_buff *skb,
                                           struct iphdr **iph,
                                           struct udphdr **udph,
-                                          void **payload,
+                                          __u32 *payload_offset,
                                           __u32 *payload_len)
 {
     void *data = (void *)(long)skb->data;
@@ -377,12 +415,18 @@ static __always_inline int parse_ipv4_udp(struct __sk_buff *skb,
     if (udp_len < sizeof(struct udphdr))
         return -1;
 
-    /* Calculate payload - clamp to packet bounds */
+    /* Calculate payload offset */
     __u32 udp_header_len = sizeof(struct udphdr);
-    *payload = (void *)udp + udp_header_len;
+    __u32 total_headers = ETH_HLEN + ip_header_len + udp_header_len;
+    *payload_offset = total_headers;
     
+    /* Verify offset is within bounds */
+    if (*payload_offset > skb->len)
+        return -1;
+    
+    /* Calculate payload length - clamp to skb->len (includes frags for GSO) */
     __u32 calc_payload_len = udp_len - udp_header_len;
-    __u32 max_payload = (__u32)(data_end - *payload);
+    __u32 max_payload = (skb->len > *payload_offset) ? (skb->len - *payload_offset) : 0;
     *payload_len = calc_payload_len < max_payload ? calc_payload_len : max_payload;
 
     *iph = ip;
@@ -391,9 +435,9 @@ static __always_inline int parse_ipv4_udp(struct __sk_buff *skb,
     return 0;
 }
 
-/* Parse IPv6 UDP packet (for QUIC) */
+/* Parse IPv6 UDP packet (for QUIC) - returns payload offset instead of pointer */
 static __always_inline int parse_ipv6_udp(struct __sk_buff *skb,
-                                          void **payload,
+                                          __u32 *payload_offset,
                                           __u32 *payload_len,
                                           struct conn_key *key)
 {
@@ -417,12 +461,18 @@ static __always_inline int parse_ipv6_udp(struct __sk_buff *skb,
     if (udp_len < sizeof(struct udphdr))
         return -1;
 
-    /* Calculate payload - clamp to packet bounds */
+    /* Calculate payload offset */
     __u32 udp_header_len = sizeof(struct udphdr);
-    *payload = (void *)udp + udp_header_len;
+    __u32 total_headers = ETH_HLEN + sizeof(struct ipv6hdr) + udp_header_len;
+    *payload_offset = total_headers;
     
+    /* Verify offset is within bounds */
+    if (*payload_offset > skb->len)
+        return -1;
+    
+    /* Calculate payload length - clamp to skb->len (includes frags) */
     __u32 calc_payload_len = udp_len - udp_header_len;
-    __u32 max_payload = (__u32)(data_end - *payload);
+    __u32 max_payload = (skb->len > *payload_offset) ? (skb->len - *payload_offset) : 0;
     *payload_len = calc_payload_len < max_payload ? calc_payload_len : max_payload;
 
     /* Fill key with IPv6 addresses */
@@ -432,36 +482,44 @@ static __always_inline int parse_ipv6_udp(struct __sk_buff *skb,
     return 0;
 }
 
-/* Check if payload looks like TLS Client Hello */
-static __always_inline int is_tls_client_hello(void *payload, __u32 payload_len)
+/* New versions using skb for TC eBPF - these are the correct implementations */
+static __always_inline int is_tls_client_hello_skb(struct __sk_buff *skb, __u32 payload_offset, __u32 payload_len)
 {
     if (payload_len < 6)
         return 0;
 
-    __u8 *data = payload;
-    __u8 content_type;
-    __u16 version;
+    __u8 buf[6];
+    if (bpf_skb_load_bytes(skb, payload_offset, buf, 6) < 0) {
+        bpf_dbg_printk("[GoodByeDPI] TLS check: failed to load bytes\n");
+        return 0;
+    }
     
-    if (bpf_probe_read_kernel(&content_type, sizeof(content_type), data) < 0)
-        return 0;
-    if (bpf_probe_read_kernel(&version, sizeof(version), data + 1) < 0)
-        return 0;
+    __u8 content_type = buf[0];
+    __u16 version = ((__u16)buf[1] << 8) | buf[2];
+    
+    bpf_dbg_printk("[GoodByeDPI] TLS check: content_type=0x%02x version=0x%04x\n",
+                   content_type, version);
 
     /* TLS record layer: content type 22 = Handshake */
-    return (content_type == 0x16 && bpf_ntohs(version) >= 0x0301);
+    return (content_type == 0x16 && version >= 0x0301);
 }
 
-/* Check if payload is HTTP request */
-static __always_inline int is_http_request(void *payload, __u32 payload_len)
+static __always_inline int is_http_request_skb(struct __sk_buff *skb, __u32 payload_offset, __u32 payload_len)
 {
     if (payload_len < 4)
         return 0;
 
-    __u8 *data = payload;
-    __u32 word;
-    
-    if (bpf_probe_read_kernel(&word, sizeof(word), data) < 0)
+    __u8 buf[4];
+    if (bpf_skb_load_bytes(skb, payload_offset, buf, 4) < 0) {
+        bpf_dbg_printk("[GoodByeDPI] HTTP check: failed to load bytes\n");
         return 0;
+    }
+    
+    /* Big endian word from bytes */
+    __u32 word = ((__u32)buf[0] << 24) | ((__u32)buf[1] << 16) | 
+                  ((__u32)buf[2] << 8) | ((__u32)buf[3]);
+    
+    bpf_dbg_printk("[GoodByeDPI] HTTP check: word=0x%08x\n", word);
 
     /* Check for common HTTP methods */
     return (word == 0x47455420 || /* "GET " */
@@ -474,16 +532,15 @@ static __always_inline int is_http_request(void *payload, __u32 payload_len)
             word == 0x50555420);  /* "PUT " */
 }
 
-/* Check if payload looks like QUIC (simplified check) */
-static __always_inline int is_quic_initial(void *payload, __u32 payload_len)
+/* Check if payload looks like QUIC (simplified check) - skb version */
+static __always_inline int is_quic_initial_skb(struct __sk_buff *skb, __u32 payload_offset, __u32 payload_len)
 {
     if (payload_len < 4)
         return 0;
 
-    __u8 *data = payload;
     __u8 first_byte;
     
-    if (bpf_probe_read_kernel(&first_byte, sizeof(first_byte), data) < 0)
+    if (bpf_skb_load_bytes(skb, payload_offset, &first_byte, sizeof(first_byte)) < 0)
         return 0;
 
     /* QUIC Long Header: first bit is 1 (0x80 mask) */
@@ -491,13 +548,7 @@ static __always_inline int is_quic_initial(void *payload, __u32 payload_len)
     if ((first_byte & 0x80) == 0)
         return 0;  /* Short header, not Initial */
 
-    /* Check for QUIC version (Q046, Q050, T050, T051, 1, etc) */
-    __u32 version;
-    if (bpf_probe_read_kernel(&version, sizeof(version), data) < 0)
-        return 0;
-    
-    /* Common QUIC versions in network byte order */
-    /* We just check if it's likely QUIC by the first byte pattern */
+    /* It's likely QUIC Initial if first bit is set */
     return 1;
 }
 
@@ -511,7 +562,7 @@ static __always_inline int is_quic_initial(void *payload, __u32 payload_len)
 #define MAX_SNI_LEN             253
 
 /*
- * Parse TLS Client Hello and find SNI extension offset.
+ * Parse TLS Client Hello and find SNI extension offset - skb version.
  *
  * TLS Record Layer (5 bytes):
  *   - content_type (1 byte): 0x16 = Handshake
@@ -543,11 +594,10 @@ static __always_inline int is_quic_initial(void *payload, __u32 payload_len)
  *
  * Returns: offset from payload start to SNI hostname, or negative on error
  */
-static __always_inline int parse_tls_client_hello_sni(void *payload, __u32 payload_len,
-                                                       __u32 *sni_offset, __u32 *sni_length)
+static __always_inline int parse_tls_client_hello_sni_skb(struct __sk_buff *skb, __u32 payload_offset, 
+                                                           __u32 payload_len,
+                                                           __u32 *sni_offset, __u32 *sni_length)
 {
-    __u8 *data = payload;
-    
     /* Need at least TLS record header + handshake header + client hello header */
     if (payload_len < 43)
         return -1;
@@ -557,11 +607,11 @@ static __always_inline int parse_tls_client_hello_sni(void *payload, __u32 paylo
     __u16 tls_version;
     __u16 record_len;
     
-    if (bpf_probe_read_kernel(&content_type, 1, data) < 0)
+    if (bpf_skb_load_bytes(skb, payload_offset, &content_type, 1) < 0)
         return -1;
-    if (bpf_probe_read_kernel(&tls_version, 2, data + 1) < 0)
+    if (bpf_skb_load_bytes(skb, payload_offset + 1, &tls_version, 2) < 0)
         return -1;
-    if (bpf_probe_read_kernel(&record_len, 2, data + 3) < 0)
+    if (bpf_skb_load_bytes(skb, payload_offset + 3, &record_len, 2) < 0)
         return -1;
     
     tls_version = bpf_ntohs(tls_version);
@@ -579,12 +629,12 @@ static __always_inline int parse_tls_client_hello_sni(void *payload, __u32 paylo
     __u8 handshake_type;
     __u32 handshake_len = 0;
     
-    if (bpf_probe_read_kernel(&handshake_type, 1, data + 5) < 0)
+    if (bpf_skb_load_bytes(skb, payload_offset + 5, &handshake_type, 1) < 0)
         return -1;
     
     /* Handshake length is 3 bytes (24-bit) */
     __u8 len_bytes[3];
-    if (bpf_probe_read_kernel(len_bytes, 3, data + 6) < 0)
+    if (bpf_skb_load_bytes(skb, payload_offset + 6, len_bytes, 3) < 0)
         return -1;
     handshake_len = (len_bytes[0] << 16) | (len_bytes[1] << 8) | len_bytes[2];
     
@@ -605,15 +655,16 @@ static __always_inline int parse_tls_client_hello_sni(void *payload, __u32 paylo
     if (offset + 1 > payload_len)
         return -1;
     __u8 session_id_len;
-    if (bpf_probe_read_kernel(&session_id_len, 1, data + offset) < 0)
+    if (bpf_skb_load_bytes(skb, payload_offset + offset, &session_id_len, 1) < 0)
         return -1;
     session_id_len &= 0x3F;
     offset += 1 + session_id_len;
+    
     /* Skip cipher suites */
     if (offset + 2 > payload_len)
         return -1;
     __u16 cipher_suites_len;
-    if (bpf_probe_read_kernel(&cipher_suites_len, 2, data + offset) < 0)
+    if (bpf_skb_load_bytes(skb, payload_offset + offset, &cipher_suites_len, 2) < 0)
         return -1;
     cipher_suites_len = bpf_ntohs(cipher_suites_len);
     /* Жесткая проверка на максимальный размер cipher suites (защита от вредоносных значений) */
@@ -625,7 +676,7 @@ static __always_inline int parse_tls_client_hello_sni(void *payload, __u32 paylo
     if (offset + 1 > payload_len)
         return -1;
     __u8 compression_len;
-    if (bpf_probe_read_kernel(&compression_len, 1, data + offset) < 0)
+    if (bpf_skb_load_bytes(skb, payload_offset + offset, &compression_len, 1) < 0)
         return -1;
     compression_len &= 0xFF;
     offset += 1 + compression_len;
@@ -635,7 +686,7 @@ static __always_inline int parse_tls_client_hello_sni(void *payload, __u32 paylo
         return -1;
     
     __u16 extensions_len;
-    if (bpf_probe_read_kernel(&extensions_len, 2, data + offset) < 0)
+    if (bpf_skb_load_bytes(skb, payload_offset + offset, &extensions_len, 2) < 0)
         return -1;
     extensions_len = bpf_ntohs(extensions_len);
     offset += 2;
@@ -656,9 +707,9 @@ static __always_inline int parse_tls_client_hello_sni(void *payload, __u32 paylo
         __u16 ext_type;
         __u16 ext_len;
         
-        if (bpf_probe_read_kernel(&ext_type, 2, data + offset) < 0)
+        if (bpf_skb_load_bytes(skb, payload_offset + offset, &ext_type, 2) < 0)
             break;
-        if (bpf_probe_read_kernel(&ext_len, 2, data + offset + 2) < 0)
+        if (bpf_skb_load_bytes(skb, payload_offset + offset + 2, &ext_len, 2) < 0)
             break;
         
         ext_type = bpf_ntohs(ext_type);
@@ -673,7 +724,7 @@ static __always_inline int parse_tls_client_hello_sni(void *payload, __u32 paylo
             
             /* SNI list length (2 bytes) */
             __u16 sni_list_len;
-            if (bpf_probe_read_kernel(&sni_list_len, 2, data + sni_data_offset) < 0)
+            if (bpf_skb_load_bytes(skb, payload_offset + sni_data_offset, &sni_list_len, 2) < 0)
                 break;
             sni_list_len = bpf_ntohs(sni_list_len);
             
@@ -686,9 +737,9 @@ static __always_inline int parse_tls_client_hello_sni(void *payload, __u32 paylo
             __u8 name_type;
             __u16 name_len;
             
-            if (bpf_probe_read_kernel(&name_type, 1, data + sni_entry_offset) < 0)
+            if (bpf_skb_load_bytes(skb, payload_offset + sni_entry_offset, &name_type, 1) < 0)
                 break;
-            if (bpf_probe_read_kernel(&name_len, 2, data + sni_entry_offset + 1) < 0)
+            if (bpf_skb_load_bytes(skb, payload_offset + sni_entry_offset + 1, &name_len, 2) < 0)
                 break;
             name_len = bpf_ntohs(name_len);
             
@@ -715,13 +766,16 @@ static __always_inline int parse_tls_client_hello_sni(void *payload, __u32 paylo
     return -1;  /* SNI not found */
 }
 
-/* Legacy function for compatibility - now uses real parser */
-static __always_inline int find_sni_offset(void *payload, __u32 payload_len)
+/* Helper function to find SNI offset - skb version 
+ * Note: This function requires skb context and is kept for API compatibility.
+ * For new code, use parse_tls_client_hello_sni_skb directly.
+ */
+static __always_inline int find_sni_offset_skb(struct __sk_buff *skb, __u32 payload_offset, __u32 payload_len)
 {
     __u32 sni_offset = 0;
     __u32 sni_length = 0;
     
-    if (parse_tls_client_hello_sni(payload, payload_len, &sni_offset, &sni_length) == 0) {
+    if (parse_tls_client_hello_sni_skb(skb, payload_offset, payload_len, &sni_offset, &sni_length) == 0) {
         return (__s32)sni_offset;
     }
     return -1;
@@ -735,18 +789,26 @@ static __always_inline int skb_read_bytes(struct __sk_buff *skb, __u32 offset, v
 
 /* Process TCP packet (IPv4 or IPv6) */
 static __always_inline int process_tcp(struct __sk_buff *skb, struct config *cfg, struct stats *stats,
-                                       struct iphdr *ip, struct tcphdr *tcp, void *payload, __u32 payload_len,
+                                       struct iphdr *ip, struct tcphdr *tcp, __u32 payload_offset, __u32 payload_len,
                                        struct conn_key *key, int is_ipv6)
 {
     update_stats_packet(stats, 1, 0, is_ipv6, 0, 0, 0);
 
-    /* Only process outgoing packets with payload */
-    if (payload_len == 0)
-        return TC_ACT_OK;
+    bpf_dbg_printk("[GoodByeDPI] process_tcp: ENTER sport=%u dport=%u payload_len=%u\n",
+                   bpf_ntohs(tcp->source), bpf_ntohs(tcp->dest), payload_len);
 
-    /* Check for HTTP/HTTPS */
-    int is_http = is_http_request(payload, payload_len);
-    int is_tls = is_tls_client_hello(payload, payload_len);
+    /* Only process outgoing packets with payload */
+    if (payload_len == 0) {
+        bpf_dbg_printk("[GoodByeDPI] process_tcp: EXIT - empty payload\n");
+        return TC_ACT_OK;
+    }
+
+    bpf_dbg_printk("[GoodByeDPI] TCP packet: sport=%u dport=%u len=%u offset=%u\n",
+                   bpf_ntohs(tcp->source), bpf_ntohs(tcp->dest), payload_len, payload_offset);
+
+    /* Check for HTTP/HTTPS using skb functions */
+    int is_http = is_http_request_skb(skb, payload_offset, payload_len);
+    int is_tls = is_tls_client_hello_skb(skb, payload_offset, payload_len);
     
     if (is_http) {
         bpf_dbg_printk("[GoodByeDPI] HTTP detected: payload_len=%u\n", payload_len);
@@ -792,8 +854,13 @@ static __always_inline int process_tcp(struct __sk_buff *skb, struct config *cfg
 
     /* Apply DPI bypass techniques based on stage */
     
+    bpf_dbg_printk("[GoodByeDPI] Checking techniques: split_pos=%d, stage=%d, payload_len=%u\n",
+                   cfg->split_pos, state->stage, payload_len);
+    
     /* Technique 1: Real TCP Split - drop original packet and send two parts from userspace */
     if (cfg->split_pos > 0 && state->stage == STAGE_INIT) {
+        bpf_dbg_printk("[GoodByeDPI] SPLIT condition met: split_pos=%d < payload_len=%u\n",
+                       cfg->split_pos, payload_len);
         if ((__u32)cfg->split_pos < payload_len) {
             bpf_dbg_printk("[GoodByeDPI] REAL SPLIT triggered at pos=%d, dropping packet\n", cfg->split_pos);
             state->stage = STAGE_SPLIT;
@@ -801,6 +868,9 @@ static __always_inline int process_tcp(struct __sk_buff *skb, struct config *cfg
             
             /* Send event to userspace to inject both split parts */
             struct event *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
+            if (!e) {
+                bpf_dbg_printk("[GoodByeDPI] FAILED to reserve ringbuf event!\n");
+            }
             if (e) {
                 e->type = EVENT_SPLIT_TRIGGERED;
                 /* Copy IP addresses - full IPv6 support */
@@ -819,12 +889,11 @@ static __always_inline int process_tcp(struct __sk_buff *skb, struct config *cfg
                 /* Store split position in flags field (lower byte) and TCP flags (upper byte) */
                 e->flags = (tcp->fin | (tcp->syn << 1) | (tcp->rst << 2) | (tcp->psh << 3)) & 0x0F;
                 e->reserved = (__u8)((cfg->split_pos > 255) ? 255 : cfg->split_pos);  /* Split position */
-                e->payload_len = payload_len > 255 ? 255 : payload_len;
                 e->is_ipv6 = is_ipv6;
                 e->sni_offset = 0;
                 e->sni_length = 0;
-                /* Copy payload data */
-                copy_payload_to_event(e, payload, payload_len);
+                /* Copy payload data using skb - payload_len is now actual copied bytes */
+                e->payload_len = copy_payload_to_event_skb(skb, e, payload_offset, payload_len);
                 bpf_ringbuf_submit(e, 0);
                 update_stats_event(stats);
                 bpf_dbg_printk("[GoodByeDPI] SPLIT event sent to userspace (ipv6=%d, split_pos=%d)\n", is_ipv6, cfg->split_pos);
@@ -864,12 +933,11 @@ static __always_inline int process_tcp(struct __sk_buff *skb, struct config *cfg
                 e->flags = (tcp->fin | (tcp->syn << 1) | (tcp->rst << 2) | 
                            (tcp->psh << 3) | (tcp->ack << 4) | TCP_FLAG_URG) & 0x3F;
                 e->reserved = (__u8)((cfg->oob_pos > 255) ? 255 : cfg->oob_pos);  /* OOB position */
-                e->payload_len = payload_len > 255 ? 255 : payload_len;
                 e->is_ipv6 = is_ipv6;
                 e->sni_offset = 0;
                 e->sni_length = 0;
-                /* Copy payload data */
-                copy_payload_to_event(e, payload, payload_len);
+                /* Copy payload data using skb - payload_len is now actual copied bytes */
+                e->payload_len = copy_payload_to_event_skb(skb, e, payload_offset, payload_len);
                 bpf_ringbuf_submit(e, 0);
                 update_stats_event(stats);
                 state->stage = STAGE_OOB;
@@ -913,12 +981,11 @@ static __always_inline int process_tcp(struct __sk_buff *skb, struct config *cfg
             /* flags byte 0 = TCP flags, bytes 1-2 reserved for future */
             e->flags = (tcp->fin | (tcp->syn << 1) | (tcp->rst << 2) | (tcp->psh << 3)) & 0x0F;
             e->reserved = 0;  /* Will be handled by userspace based on config */
-            e->payload_len = payload_len > 255 ? 255 : payload_len;
             e->is_ipv6 = is_ipv6;
             e->sni_offset = 0;
             e->sni_length = 0;
-            /* Copy payload data for potential fake packet content */
-            copy_payload_to_event(e, payload, payload_len);
+            /* Copy payload data for potential fake packet content using skb */
+            e->payload_len = copy_payload_to_event_skb(skb, e, payload_offset, payload_len);
             bpf_ringbuf_submit(e, 0);
             update_stats_event(stats);
             state->stage = STAGE_FAKE_SENT;
@@ -957,8 +1024,8 @@ static __always_inline int process_tcp(struct __sk_buff *skb, struct config *cfg
             e->sni_length = 0;
             /* Store split position hint in reserved (0 = let userspace decide) */
             e->reserved = 0;
-            /* Copy payload data */
-            copy_payload_to_event(e, payload, payload_len);
+            /* Copy payload data using skb */
+            copy_payload_to_event_skb(skb, e, payload_offset, payload_len);
             bpf_ringbuf_submit(e, 0);
             update_stats_event(stats);
             state->stage = STAGE_DISORDER;
@@ -977,8 +1044,8 @@ static __always_inline int process_tcp(struct __sk_buff *skb, struct config *cfg
         __u32 sni_off = 0;
         __u32 sni_len = 0;
         
-        /* Parse TLS Client Hello to find SNI */
-        if (parse_tls_client_hello_sni(payload, payload_len, &sni_off, &sni_len) == 0) {
+        /* Parse TLS Client Hello to find SNI using skb */
+        if (parse_tls_client_hello_sni_skb(skb, payload_offset, payload_len, &sni_off, &sni_len) == 0) {
             /* Calculate split position based on config:
              * - tlsrec_pos = 0: split at SNI start
              * - tlsrec_pos > 0: split at SNI start + tlsrec_pos (inside SNI)
@@ -1023,15 +1090,14 @@ static __always_inline int process_tcp(struct __sk_buff *skb, struct config *cfg
                     e->seq = bpf_ntohl(tcp->seq);
                     e->ack = bpf_ntohl(tcp->ack_seq);
                     e->flags = (tcp->fin | (tcp->syn << 1) | (tcp->rst << 2) | (tcp->psh << 3)) & 0x0F;
-                    e->payload_len = payload_len > 255 ? 255 : payload_len;
                     e->is_ipv6 = is_ipv6;
                     /* Store SNI offset and length for userspace */
                     e->sni_offset = sni_off > 255 ? 255 : sni_off;
                     e->sni_length = sni_len > 255 ? 255 : sni_len;
                     /* Store split position in reserved field */
                     e->reserved = split_at > 255 ? 255 : split_at;
-                    /* Copy payload data */
-                    copy_payload_to_event(e, payload, payload_len);
+                    /* Copy payload data using skb */
+                    e->payload_len = copy_payload_to_event_skb(skb, e, payload_offset, payload_len);
                     bpf_ringbuf_submit(e, 0);
                     update_stats_event(stats);
                     bpf_dbg_printk("[GoodByeDPI] TLSREC event sent (split=%u, sni=%u:%u)\n",
@@ -1049,12 +1115,12 @@ static __always_inline int process_tcp(struct __sk_buff *skb, struct config *cfg
 
 /* Process UDP packet (QUIC) for DPI bypass */
 static __always_inline int process_udp(struct __sk_buff *skb, struct config *cfg, struct stats *stats,
-                                       void *payload, __u32 payload_len,
+                                       __u32 payload_offset, __u32 payload_len,
                                        struct conn_key *key, int is_ipv6,
                                        __u16 src_port, __u16 dst_port)
 {
-    /* Check if this looks like QUIC Initial packet */
-    int is_quic = is_quic_initial(payload, payload_len);
+    /* Check if this looks like QUIC Initial packet using skb */
+    int is_quic = is_quic_initial_skb(skb, payload_offset, payload_len);
     
     update_stats_packet(stats, 0, 1, is_ipv6, 0, 0, is_quic);
 
@@ -1093,13 +1159,12 @@ static __always_inline int process_udp(struct __sk_buff *skb, struct config *cfg
             e->src_port = key->src_port;
             e->dst_port = key->dst_port;
             e->flags = 0;  /* No special flags needed - event type identifies this */
-            e->payload_len = payload_len > 255 ? 255 : payload_len;
             e->is_ipv6 = is_ipv6;
             e->sni_offset = 0;
             e->sni_length = 0;
             e->reserved = frag_size > 255 ? 255 : (__u8)frag_size;
-            /* Copy payload data */
-            copy_payload_to_event(e, payload, payload_len);
+            /* Copy payload data using skb */
+            e->payload_len = copy_payload_to_event_skb(skb, e, payload_offset, payload_len);
             bpf_ringbuf_submit(e, 0);
             update_stats_event(stats);
             bpf_dbg_printk("[GoodByeDPI] QUIC fragment triggered (size=%u)\n", frag_size);
@@ -1127,15 +1192,22 @@ int dpi_egress(struct __sk_buff *skb)
     void *data = (void *)(long)skb->data;
     void *data_end = (void *)(long)skb->data_end;
 
+    bpf_dbg_printk("[GoodByeDPI] dpi_egress: ENTER, data_end-data=%u\n", 
+                   (__u32)(data_end - data));
+
     /* Parse Ethernet */
-    if (data + ETH_HLEN > data_end)
+    if (data + ETH_HLEN > data_end) {
+        bpf_dbg_printk("[GoodByeDPI] dpi_egress: packet too small for eth\n");
         return TC_ACT_OK;
+    }
 
     struct ethhdr *eth = data;
     __u16 eth_proto = bpf_ntohs(eth->h_proto);
 
+    bpf_dbg_printk("[GoodByeDPI] dpi_egress: eth_proto=0x%04x\n", eth_proto);
+
     struct conn_key key = {};
-    void *payload = NULL;
+    __u32 payload_offset = 0;
     __u32 payload_len = 0;
     int ret;
 
@@ -1146,17 +1218,18 @@ int dpi_egress(struct __sk_buff *skb)
         struct udphdr *udp = NULL;
 
         /* Try TCP first */
-        ret = parse_ipv4_tcp(skb, &ip, &tcp, &payload, &payload_len);
+        ret = parse_ipv4_tcp(skb, &ip, &tcp, &payload_offset, &payload_len);
+        bpf_dbg_printk("[GoodByeDPI] dpi_egress: parse_ipv4_tcp ret=%d\n", ret);
         if (ret == 0 && ip && tcp) {
-            return process_tcp(skb, cfg, stats, ip, tcp, payload, payload_len, &key, 0);
+            return process_tcp(skb, cfg, stats, ip, tcp, payload_offset, payload_len, &key, 0);
         }
 
         /* Try UDP (QUIC) */
-        ret = parse_ipv4_udp(skb, &ip, &udp, &payload, &payload_len);
+        ret = parse_ipv4_udp(skb, &ip, &udp, &payload_offset, &payload_len);
         if (ret == 0 && ip && udp) {
             key.src_ip[0] = ip->saddr;
             key.dst_ip[0] = ip->daddr;
-            return process_udp(skb, cfg, stats, payload, payload_len, &key, 0,
+            return process_udp(skb, cfg, stats, payload_offset, payload_len, &key, 0,
                               bpf_ntohs(udp->source), bpf_ntohs(udp->dest));
         }
     }
@@ -1170,6 +1243,8 @@ int dpi_egress(struct __sk_buff *skb)
         if ((void *)ip6 + sizeof(*ip6) > data_end)
             return TC_ACT_OK;
 
+        /* Use skb->len for payload length (includes frags for GSO) */
+
         /* Try TCP */
         if (ip6->nexthdr == IPPROTO_TCP) {
             tcp = (void *)ip6 + sizeof(struct ipv6hdr);
@@ -1177,13 +1252,18 @@ int dpi_egress(struct __sk_buff *skb)
                 return TC_ACT_OK;
 
             __u32 tcp_header_len = tcp->doff * 4;
-            payload = (void *)tcp + tcp_header_len;
-            payload_len = skb->len - ETH_HLEN - sizeof(struct ipv6hdr) - tcp_header_len;
+            payload_offset = ETH_HLEN + sizeof(struct ipv6hdr) + tcp_header_len;
+            
+            /* Calculate payload length from skb->len */
+            if (skb->len > payload_offset)
+                payload_len = skb->len - payload_offset;
+            else
+                payload_len = 0;
 
             __builtin_memcpy(key.src_ip, &ip6->saddr, 16);
             __builtin_memcpy(key.dst_ip, &ip6->daddr, 16);
 
-            return process_tcp(skb, cfg, stats, NULL, tcp, payload, payload_len, &key, 1);
+            return process_tcp(skb, cfg, stats, NULL, tcp, payload_offset, payload_len, &key, 1);
         }
         /* Try UDP (QUIC) */
         else if (ip6->nexthdr == IPPROTO_UDP) {
@@ -1192,13 +1272,17 @@ int dpi_egress(struct __sk_buff *skb)
                 return TC_ACT_OK;
 
             __u32 udp_header_len = sizeof(struct udphdr);
-            payload = (void *)udp + udp_header_len;
-            payload_len = bpf_ntohs(udp->len) - udp_header_len;
+            payload_offset = ETH_HLEN + sizeof(struct ipv6hdr) + udp_header_len;
+            
+            /* Calculate payload length from skb->len and UDP header */
+            __u32 calc_payload_len = bpf_ntohs(udp->len) - udp_header_len;
+            __u32 max_payload = (skb->len > payload_offset) ? (skb->len - payload_offset) : 0;
+            payload_len = calc_payload_len < max_payload ? calc_payload_len : max_payload;
 
             __builtin_memcpy(key.src_ip, &ip6->saddr, 16);
             __builtin_memcpy(key.dst_ip, &ip6->daddr, 16);
 
-            return process_udp(skb, cfg, stats, payload, payload_len, &key, 1,
+            return process_udp(skb, cfg, stats, payload_offset, payload_len, &key, 1,
                               bpf_ntohs(udp->source), bpf_ntohs(udp->dest));
         }
     }
