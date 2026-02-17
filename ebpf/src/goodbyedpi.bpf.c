@@ -39,7 +39,9 @@
             bpf_printk(fmt, ##__VA_ARGS__);                \
     })
 
-/* Config structure shared with userspace */
+/* Config structure shared with userspace
+ * Total size: 24 bytes (22 data + 2 padding)
+ */
 struct config {
     __s32 split_pos;
     __s32 oob_pos;
@@ -51,6 +53,7 @@ struct config {
     __u8 ip_fragment;      /* Enable IP fragmentation for QUIC/UDP */
     __u16 frag_size;       /* Fragment size (0 = default 8 bytes) */
     __u8 disorder;         /* Enable packet disorder technique */
+    __u8 pad[1];           /* Explicit padding, MUST be zeroed */
 };
 
 /* Default fragment size for QUIC */
@@ -65,7 +68,10 @@ struct config {
 /* GSO (Generic Segmentation Offload) bypass */
 #define TCP_GSO_OFF 0x10000
 
-/* Connection key - now with IPv6 support */
+/* Connection key - now with IPv6 support
+ * Packed to 36 bytes (no uninitialized padding)
+ * Layout: IPs(32) + ports(4) + proto info(2) + padding(2, zeroed)
+ */
 struct conn_key {
     __u32 src_ip[4];   /* IPv4 uses only [0], IPv6 uses all */
     __u32 dst_ip[4];
@@ -73,18 +79,25 @@ struct conn_key {
     __u16 dst_port;
     __u8 is_ipv6;      /* 0 = IPv4, 1 = IPv6 */
     __u8 proto;        /* IPPROTO_TCP or IPPROTO_UDP */
+    __u8 pad[2];       /* Explicit padding, MUST be zeroed */
 };
 
-/* Connection state */
+/* Connection state - 24 bytes
+ * Layout: timestamp(8) + seq/ack(8) + stage(1) + flags(1) + reserved(6)
+ * Aligned to 8 bytes due to timestamp, explicit zeroed padding
+ */
 struct conn_state {
-    __u8 stage;
-    __u32 last_seq;
-    __u32 last_ack;
-    __u8 flags;
-    __u64 timestamp;
+    __u64 timestamp;   /* 8 bytes, offset 0 */
+    __u32 last_seq;    /* 4 bytes, offset 8 */
+    __u32 last_ack;    /* 4 bytes, offset 12 */
+    __u8 stage;        /* 1 byte, offset 16 */
+    __u8 flags;        /* 1 byte, offset 17 */
+    __u8 reserved[6];  /* 6 bytes, offset 18 - explicit zeroed padding to 24 */
 };
 
-/* Ring buffer event - supports both IPv4 and IPv6 */
+/* Ring buffer event - supports both IPv4 and IPv6
+ * Total size: 1084 bytes (57 header + 1024 payload + 3 padding)
+ */
 struct event {
     __u32 type;
     __u32 src_ip[4];   /* IPv4: only [0] is used, IPv6: all 4 values (16 bytes) */
@@ -98,8 +111,9 @@ struct event {
     __u16 payload_len; /* Actual payload length (may be larger than MAX_PAYLOAD_SIZE, clamped to 65535) */
     __u16 sni_offset;  /* SNI hostname offset in payload (for TLS Client Hello) */
     __u16 sni_length;  /* SNI hostname length (for TLS Client Hello) */
-    __u8 reserved;     /* Padding for alignment */
+    __u8 reserved;     /* Reserved for future use */
     __u8 payload[MAX_PAYLOAD_SIZE];  /* First MAX_PAYLOAD_SIZE bytes of packet payload */
+    __u8 pad[3];       /* Explicit padding to 4-byte alignment */
 };
 
 enum {
@@ -190,6 +204,29 @@ static __always_inline struct stats *get_stats(void)
 {
     __u32 key = 0;
     return bpf_map_lookup_elem(&stats_map, &key);
+}
+
+/* Helper to initialize conn_key - MUST be called before using key for map lookup
+ * Ensures padding fields are zeroed to avoid garbage key mismatches
+ */
+static __always_inline void init_conn_key(struct conn_key *key)
+{
+    /* Zero the entire structure including padding */
+    __builtin_memset(key, 0, sizeof(*key));
+}
+
+/* Helper to initialize conn_state - MUST be called when creating new state
+ * Ensures reserved padding fields are zeroed
+ */
+static __always_inline void init_conn_state(struct conn_state *state, __u8 stage_val, __u8 flags_val)
+{
+    state->timestamp = bpf_ktime_get_ns();
+    state->last_seq = 0;
+    state->last_ack = 0;
+    state->stage = stage_val;
+    state->flags = flags_val;
+    state->reserved[0] = 0;
+    state->reserved[1] = 0;
 }
 
 static __always_inline void update_stats_packet(struct stats *s, int is_tcp, int is_udp, int is_ipv6, int is_http, int is_tls, int is_quic)
@@ -895,12 +932,14 @@ static __always_inline int process_tcp(struct __sk_buff *skb, struct config *cfg
     /* Get or create connection state */
     struct conn_state *state = bpf_map_lookup_elem(&conn_map, key);
     if (!state) {
-        struct conn_state new_state = {
-            .stage = STAGE_INIT,
-            .last_seq = bpf_ntohl(tcp->seq),
-            .last_ack = bpf_ntohl(tcp->ack_seq),
-            .timestamp = bpf_ktime_get_ns(),
-        };
+        struct conn_state new_state;
+        /* Zero all fields including reserved padding */
+        __builtin_memset(&new_state, 0, sizeof(new_state));
+        new_state.stage = STAGE_INIT;
+        new_state.last_seq = bpf_ntohl(tcp->seq);
+        new_state.last_ack = bpf_ntohl(tcp->ack_seq);
+        new_state.timestamp = bpf_ktime_get_ns();
+        /* flags and reserved are already zeroed by memset */
         bpf_map_update_elem(&conn_map, key, &new_state, BPF_ANY);
         state = bpf_map_lookup_elem(&conn_map, key);
         if (!state)

@@ -537,6 +537,7 @@ mod tests {
             dst_port: 443,
             is_ipv6: 0,
             proto: 6,
+            _pad: [0; 2],
         };
         
         // Test RST handling

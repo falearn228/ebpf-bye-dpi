@@ -133,6 +133,7 @@ impl EventProcessor {
             dst_port: event.dst_port,
             is_ipv6: event.is_ipv6,
             proto: 6, // TCP
+            _pad: [0; 2], // Explicit zeroed padding for consistent hashing
         }
     }
 
@@ -970,6 +971,7 @@ mod tests {
             sni_length: 0,
             reserved: 0,
             payload: [0u8; MAX_PAYLOAD_SIZE],
+            _pad: [0; 3],
         };
 
         // We can't create EventProcessor in tests without a raw socket,
@@ -981,6 +983,7 @@ mod tests {
             dst_port: 443,
             is_ipv6: 0,
             proto: 6,
+            _pad: [0; 2],
         };
 
         assert_eq!(expected_key.src_port, 12345);
@@ -1015,6 +1018,7 @@ mod tests {
             sni_length: 12,  // SNI is 12 bytes long
             reserved: 15,    // Split position (within handshake data)
             payload,
+            _pad: [0; 3],
         };
         
         // Verify event fields
@@ -1087,6 +1091,7 @@ mod tests {
             sni_length: 12,
             reserved: 20,
             payload: [0u8; MAX_PAYLOAD_SIZE],
+            _pad: [0; 3],
         };
         
         assert_eq!(event_ipv6.is_ipv6, 1);
@@ -1117,6 +1122,7 @@ mod tests {
             sni_length: 0,
             reserved: 10, // OOB position (urgent pointer)
             payload,
+            _pad: [0; 3],
         };
         
         // Verify event fields
@@ -1171,6 +1177,7 @@ mod tests {
             sni_length: 0,
             reserved: 10,
             payload: [0u8; MAX_PAYLOAD_SIZE],
+            _pad: [0; 3],
         };
         
         assert_eq!(event_ipv6.is_ipv6, 1);
@@ -1217,6 +1224,7 @@ mod tests {
             sni_length: 0,
             reserved: 0, // 0 = let userspace decide split position
             payload,
+            _pad: [0; 3],
         };
         
         // Verify event fields
@@ -1292,6 +1300,7 @@ mod tests {
             sni_length: 0,
             reserved: 0,
             payload: [0u8; MAX_PAYLOAD_SIZE],
+            _pad: [0; 3],
         };
         
         assert_eq!(event_ipv6.is_ipv6, 1);
@@ -1317,6 +1326,7 @@ mod tests {
             sni_length: 0,
             reserved: 0,
             payload: [0u8; MAX_PAYLOAD_SIZE],
+            _pad: [0; 3],
         };
         
         assert_eq!(event_empty.payload_len, 0);

@@ -25,10 +25,11 @@
 ///     ip_fragment: 1,     // Enable IP fragmentation for QUIC
 ///     frag_size: 8,       // 8-byte fragments
 ///     disorder: false,    // Disable packet disorder
+///     _pad: [0; 1],       // Explicit padding, must be zeroed
 /// };
 /// ```
 #[repr(C)]
-#[derive(Default, Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 pub struct Config {
     /// Split position for HTTP/TLS request fragmentation
     /// - `-1` or `0` = disabled
@@ -58,6 +59,26 @@ pub struct Config {
     pub frag_size: u16,
     /// Enable packet disorder technique (send packets out of order)
     pub disorder: bool,
+    /// Explicit padding - MUST be zeroed
+    pub _pad: [u8; 1],
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            split_pos: 0,
+            oob_pos: 0,
+            fake_offset: 0,
+            tlsrec_pos: 0,
+            auto_rst: false,
+            auto_redirect: false,
+            auto_ssl: false,
+            ip_fragment: 0,
+            frag_size: 0,
+            disorder: false,
+            _pad: [0; 1],
+        }
+    }
 }
 
 /// Statistics counters from BPF
@@ -77,8 +98,9 @@ pub struct Stats {
 }
 
 /// Connection key - supports both IPv4 and IPv6
+/// Packed to 40 bytes with explicit zeroed padding
 #[repr(C)]
-#[derive(Default, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ConnKey {
     /// IPv4: only [0] is used, rest are 0
     /// IPv6: all 4 u32 values (16 bytes total)
@@ -90,6 +112,22 @@ pub struct ConnKey {
     pub is_ipv6: u8,
     /// IPPROTO_TCP (6) or IPPROTO_UDP (17)
     pub proto: u8,
+    /// Explicit padding - MUST be zeroed for consistent hashing
+    pub _pad: [u8; 2],
+}
+
+impl Default for ConnKey {
+    fn default() -> Self {
+        Self {
+            src_ip: [0; 4],
+            dst_ip: [0; 4],
+            src_port: 0,
+            dst_port: 0,
+            is_ipv6: 0,
+            proto: 0,
+            _pad: [0; 2], // Explicitly zeroed padding
+        }
+    }
 }
 
 /// Event types sent from BPF to userspace via ring buffer
@@ -165,6 +203,7 @@ pub const MAX_PAYLOAD_SIZE: usize = 1024;
 ///     sni_length: 0,
 ///     reserved: 0,
 ///     payload: [0u8; 1024],
+///     _pad: [0; 3],
 /// };
 /// ```
 #[repr(C)]
@@ -212,6 +251,8 @@ pub struct Event {
     pub reserved: u8,
     /// Payload data (first MAX_PAYLOAD_SIZE bytes of actual payload)
     pub payload: [u8; MAX_PAYLOAD_SIZE],
+    /// Explicit padding to 4-byte alignment - MUST be zeroed
+    pub _pad: [u8; 3],
 }
 
 impl Default for Event {
@@ -231,6 +272,7 @@ impl Default for Event {
             sni_length: 0,
             reserved: 0,
             payload: [0; MAX_PAYLOAD_SIZE],
+            _pad: [0; 3],
         }
     }
 }
@@ -290,9 +332,18 @@ impl Event {
 ///
 /// Tracks the processing state for each active connection.
 /// Used to coordinate multi-stage bypass techniques.
+/// 
+/// Layout matches eBPF: timestamp(8) + last_seq(4) + last_ack(4) + stage(1) + flags(1) + reserved(6)
+/// Total size: 24 bytes (aligned to 8 bytes due to u64)
 #[repr(C)]
-#[derive(Default, Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 pub struct ConnState {
+    /// Timestamp of last activity (nanoseconds since boot)
+    pub timestamp: u64,
+    /// Last seen TCP sequence number
+    pub last_seq: u32,
+    /// Last seen TCP acknowledgment number
+    pub last_ack: u32,
     /// Current processing stage - one of `stages::*`
     /// 
     /// Stages:
@@ -302,14 +353,23 @@ pub struct ConnState {
     /// - `3` = FAKE_SENT
     /// - `4` = TLSREC
     pub stage: u8,
-    /// Last seen TCP sequence number
-    pub last_seq: u32,
-    /// Last seen TCP acknowledgment number
-    pub last_ack: u32,
     /// Connection flags (reserved for future use)
     pub flags: u8,
-    /// Timestamp of last activity (nanoseconds since boot)
-    pub timestamp: u64,
+    /// Reserved padding - must be zeroed for consistency (6 bytes to align to 24)
+    pub _reserved: [u8; 6],
+}
+
+impl Default for ConnState {
+    fn default() -> Self {
+        Self {
+            timestamp: 0,
+            last_seq: 0,
+            last_ack: 0,
+            stage: 0,
+            flags: 0,
+            _reserved: [0; 6],
+        }
+    }
 }
 
 // Legacy constants - prefer using `stages::*` module
@@ -457,5 +517,46 @@ impl AutoLogicState {
             2 => 5,
             _ => 10,
         }
+    }
+}
+
+// Compile-time assertions to verify struct sizes match eBPF C code
+#[cfg(test)]
+mod size_tests {
+    use super::*;
+
+    #[test]
+    fn test_conn_key_size() {
+        assert_eq!(std::mem::size_of::<ConnKey>(), 40, "ConnKey must be 40 bytes");
+    }
+
+    #[test]
+    fn test_conn_state_size() {
+        assert_eq!(std::mem::size_of::<ConnState>(), 24, "ConnState must be 24 bytes (8-byte aligned)");
+    }
+
+    #[test]
+    fn test_config_size() {
+        assert_eq!(std::mem::size_of::<Config>(), 24, "Config must be 24 bytes");
+    }
+
+    #[test]
+    fn test_event_size() {
+        assert_eq!(std::mem::size_of::<Event>(), 1084, "Event must be 1084 bytes (4 + 16 + 16 + 2 + 2 + 4 + 4 + 1 + 1 + 2 + 2 + 2 + 1 + 1024 = 1083, padded to 1084)");
+    }
+
+    #[test]
+    fn test_stats_size() {
+        assert_eq!(std::mem::size_of::<Stats>(), 80, "Stats must be 80 bytes");
+    }
+
+    #[test]
+    fn test_conn_key_alignment() {
+        assert_eq!(std::mem::align_of::<ConnKey>(), 4, "ConnKey must be 4-byte aligned");
+    }
+
+    #[test]
+    fn test_conn_state_alignment() {
+        assert_eq!(std::mem::align_of::<ConnState>(), 8, "ConnState must be 8-byte aligned (due to u64 timestamp)");
     }
 }

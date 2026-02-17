@@ -150,6 +150,7 @@ impl DpiConfig {
             ip_fragment: self.ip_fragment as u8,
             frag_size: self.frag_size,
             disorder: self.use_disorder,
+            _pad: [0; 1],
         }
     }
 
