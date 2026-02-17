@@ -233,37 +233,37 @@ static __always_inline void update_stats_packet(struct stats *s, int is_tcp, int
 {
     if (!s)
         return;
-    __sync_fetch_and_add(&s->packets_total, 1);
+    __atomic_fetch_add(&s->packets_total, 1, __ATOMIC_RELAXED);
     if (is_tcp)
-        __sync_fetch_and_add(&s->packets_tcp, 1);
+        __atomic_fetch_add(&s->packets_tcp, 1, __ATOMIC_RELAXED);
     if (is_udp)
-        __sync_fetch_and_add(&s->packets_udp, 1);
+        __atomic_fetch_add(&s->packets_udp, 1, __ATOMIC_RELAXED);
     if (is_ipv6)
-        __sync_fetch_and_add(&s->packets_ipv6, 1);
+        __atomic_fetch_add(&s->packets_ipv6, 1, __ATOMIC_RELAXED);
     if (is_http)
-        __sync_fetch_and_add(&s->packets_http, 1);
+        __atomic_fetch_add(&s->packets_http, 1, __ATOMIC_RELAXED);
     if (is_tls)
-        __sync_fetch_and_add(&s->packets_tls, 1);
+        __atomic_fetch_add(&s->packets_tls, 1, __ATOMIC_RELAXED);
     if (is_quic)
-        __sync_fetch_and_add(&s->packets_quic, 1);
+        __atomic_fetch_add(&s->packets_quic, 1, __ATOMIC_RELAXED);
 }
 
 static __always_inline void update_stats_modified(struct stats *s)
 {
     if (s)
-        __sync_fetch_and_add(&s->packets_modified, 1);
+        __atomic_fetch_add(&s->packets_modified, 1, __ATOMIC_RELAXED);
 }
 
 static __always_inline void update_stats_event(struct stats *s)
 {
     if (s)
-        __sync_fetch_and_add(&s->events_sent, 1);
+        __atomic_fetch_add(&s->events_sent, 1, __ATOMIC_RELAXED);
 }
 
 static __always_inline void update_stats_error(struct stats *s)
 {
     if (s)
-        __sync_fetch_and_add(&s->errors, 1);
+        __atomic_fetch_add(&s->errors, 1, __ATOMIC_RELAXED);
 }
 
 /* Helper to copy payload data into event structure using skb.
