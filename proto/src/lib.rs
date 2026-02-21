@@ -44,8 +44,10 @@ pub struct Config {
     /// - positive/negative = offset value
     pub fake_offset: i32,
     /// TLS record split position
-    /// - `-1` or `0` = disabled
-    /// - positive value = byte position to split TLS record
+    /// - `-1` = disabled
+    /// - `0` = split at SNI start
+    /// - positive value = split after SNI start
+    /// - negative value (< -1) = split from SNI end
     pub tlsrec_pos: i32,
     /// Enable automatic RST packet detection and handling
     pub auto_rst: bool,
@@ -69,7 +71,7 @@ impl Default for Config {
             split_pos: 0,
             oob_pos: 0,
             fake_offset: 0,
-            tlsrec_pos: 0,
+            tlsrec_pos: -1,
             auto_rst: false,
             auto_redirect: false,
             auto_ssl: false,
@@ -291,14 +293,22 @@ impl Event {
     /// Get source IP as Ipv6Addr (only valid if is_ipv6 == 1)
     pub fn src_ip_v6(&self) -> std::net::Ipv6Addr {
         let bytes: [u8; 16] = [
-            (self.src_ip[0] >> 24) as u8, (self.src_ip[0] >> 16) as u8, 
-            (self.src_ip[0] >> 8) as u8, self.src_ip[0] as u8,
-            (self.src_ip[1] >> 24) as u8, (self.src_ip[1] >> 16) as u8,
-            (self.src_ip[1] >> 8) as u8, self.src_ip[1] as u8,
-            (self.src_ip[2] >> 24) as u8, (self.src_ip[2] >> 16) as u8,
-            (self.src_ip[2] >> 8) as u8, self.src_ip[2] as u8,
-            (self.src_ip[3] >> 24) as u8, (self.src_ip[3] >> 16) as u8,
-            (self.src_ip[3] >> 8) as u8, self.src_ip[3] as u8,
+            (self.src_ip[0] >> 24) as u8,
+            (self.src_ip[0] >> 16) as u8,
+            (self.src_ip[0] >> 8) as u8,
+            self.src_ip[0] as u8,
+            (self.src_ip[1] >> 24) as u8,
+            (self.src_ip[1] >> 16) as u8,
+            (self.src_ip[1] >> 8) as u8,
+            self.src_ip[1] as u8,
+            (self.src_ip[2] >> 24) as u8,
+            (self.src_ip[2] >> 16) as u8,
+            (self.src_ip[2] >> 8) as u8,
+            self.src_ip[2] as u8,
+            (self.src_ip[3] >> 24) as u8,
+            (self.src_ip[3] >> 16) as u8,
+            (self.src_ip[3] >> 8) as u8,
+            self.src_ip[3] as u8,
         ];
         std::net::Ipv6Addr::from(bytes)
     }
@@ -306,14 +316,22 @@ impl Event {
     /// Get destination IP as Ipv6Addr (only valid if is_ipv6 == 1)
     pub fn dst_ip_v6(&self) -> std::net::Ipv6Addr {
         let bytes: [u8; 16] = [
-            (self.dst_ip[0] >> 24) as u8, (self.dst_ip[0] >> 16) as u8,
-            (self.dst_ip[0] >> 8) as u8, self.dst_ip[0] as u8,
-            (self.dst_ip[1] >> 24) as u8, (self.dst_ip[1] >> 16) as u8,
-            (self.dst_ip[1] >> 8) as u8, self.dst_ip[1] as u8,
-            (self.dst_ip[2] >> 24) as u8, (self.dst_ip[2] >> 16) as u8,
-            (self.dst_ip[2] >> 8) as u8, self.dst_ip[2] as u8,
-            (self.dst_ip[3] >> 24) as u8, (self.dst_ip[3] >> 16) as u8,
-            (self.dst_ip[3] >> 8) as u8, self.dst_ip[3] as u8,
+            (self.dst_ip[0] >> 24) as u8,
+            (self.dst_ip[0] >> 16) as u8,
+            (self.dst_ip[0] >> 8) as u8,
+            self.dst_ip[0] as u8,
+            (self.dst_ip[1] >> 24) as u8,
+            (self.dst_ip[1] >> 16) as u8,
+            (self.dst_ip[1] >> 8) as u8,
+            self.dst_ip[1] as u8,
+            (self.dst_ip[2] >> 24) as u8,
+            (self.dst_ip[2] >> 16) as u8,
+            (self.dst_ip[2] >> 8) as u8,
+            self.dst_ip[2] as u8,
+            (self.dst_ip[3] >> 24) as u8,
+            (self.dst_ip[3] >> 16) as u8,
+            (self.dst_ip[3] >> 8) as u8,
+            self.dst_ip[3] as u8,
         ];
         std::net::Ipv6Addr::from(bytes)
     }
@@ -321,7 +339,10 @@ impl Event {
     /// Format IP addresses for display
     pub fn format_ips(&self) -> (String, String) {
         if self.is_ipv6 != 0 {
-            (format!("[{}]", self.src_ip_v6()), format!("[{}]", self.dst_ip_v6()))
+            (
+                format!("[{}]", self.src_ip_v6()),
+                format!("[{}]", self.dst_ip_v6()),
+            )
         } else {
             (self.src_ip_v4().to_string(), self.dst_ip_v4().to_string())
         }
@@ -332,7 +353,7 @@ impl Event {
 ///
 /// Tracks the processing state for each active connection.
 /// Used to coordinate multi-stage bypass techniques.
-/// 
+///
 /// Layout matches eBPF: timestamp(8) + last_seq(4) + last_ack(4) + stage(1) + flags(1) + reserved(6)
 /// Total size: 24 bytes (aligned to 8 bytes due to u64)
 #[repr(C)]
@@ -345,7 +366,7 @@ pub struct ConnState {
     /// Last seen TCP acknowledgment number
     pub last_ack: u32,
     /// Current processing stage - one of `stages::*`
-    /// 
+    ///
     /// Stages:
     /// - `0` = INIT
     /// - `1` = SPLIT
@@ -527,12 +548,20 @@ mod size_tests {
 
     #[test]
     fn test_conn_key_size() {
-        assert_eq!(std::mem::size_of::<ConnKey>(), 40, "ConnKey must be 40 bytes");
+        assert_eq!(
+            std::mem::size_of::<ConnKey>(),
+            40,
+            "ConnKey must be 40 bytes"
+        );
     }
 
     #[test]
     fn test_conn_state_size() {
-        assert_eq!(std::mem::size_of::<ConnState>(), 24, "ConnState must be 24 bytes (8-byte aligned)");
+        assert_eq!(
+            std::mem::size_of::<ConnState>(),
+            24,
+            "ConnState must be 24 bytes (8-byte aligned)"
+        );
     }
 
     #[test]
@@ -552,11 +581,19 @@ mod size_tests {
 
     #[test]
     fn test_conn_key_alignment() {
-        assert_eq!(std::mem::align_of::<ConnKey>(), 4, "ConnKey must be 4-byte aligned");
+        assert_eq!(
+            std::mem::align_of::<ConnKey>(),
+            4,
+            "ConnKey must be 4-byte aligned"
+        );
     }
 
     #[test]
     fn test_conn_state_alignment() {
-        assert_eq!(std::mem::align_of::<ConnState>(), 8, "ConnState must be 8-byte aligned (due to u64 timestamp)");
+        assert_eq!(
+            std::mem::align_of::<ConnState>(),
+            8,
+            "ConnState must be 8-byte aligned (due to u64 timestamp)"
+        );
     }
 }

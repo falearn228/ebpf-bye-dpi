@@ -39,6 +39,7 @@
 | `-At`    | `--auto redirect` | ✅ Ready   | Auto-detect HTTP 301/302 redirect                 |
 | `-f-1`   | `--fake -1`       | ✅ Ready   | Fake packet injection via raw socket              |
 | `-r1+s`  | `--tlsrec 1+s`    | ✅ Ready   | TLS record split injection with proper headers    |
+| `-r-2`   | `--tlsrec -2`     | ✅ Ready   | TLS record split relative to SNI end              |
 | `-As`    | `--auto ssl`      | ✅ Ready   | Auto-detect SSL fatal alerts                      |
 | `-g8`    | `--frag 8`        | ✅ Ready   | QUIC/UDP IP fragmentation via raw socket          |
 | `-g16`   | `--frag 16`       | ✅ Ready   | QUIC/UDP IP fragmentation via raw socket          |
@@ -79,6 +80,9 @@ sudo ./target/release/goodbyedpi-daemon -i eth0 -c "s1 -o1 -f-1"
 
 # Расширенный режим с авто-логикой
 sudo ./target/release/goodbyedpi-daemon -i eth0 -c "s1 -o1 -Ar -f-1 -r1+s -At -As"
+
+# TLSREC c отрицательным offset (от конца SNI)
+sudo ./target/release/goodbyedpi-daemon -i eth0 -c "s1 -r-2 -Ar"
 
 # Режим отладки
 sudo ./target/release/goodbyedpi-daemon -i eth0 -c "s1 -o1" --debug
@@ -170,9 +174,15 @@ injector.inject_fake_packet(
 │   └── src/main.rs
 ├── proto/                   # Общие структуры
 │   └── src/lib.rs           # Config, Event, ConnKey, ConnState
+├── docs/
+│   └── DEVELOPMENT.md       # Runbook для разработки и эксплуатации
 └── systemd/                 # Файлы systemd
     └── goodbyedpi.service
 ```
+
+## Документация разработчика
+
+- `docs/DEVELOPMENT.md` — практический runbook: сборка, запуск, диагностика, откат.
 
 ## Диагностика и устранение неполадок
 

@@ -34,10 +34,10 @@ impl EventProcessor {
     pub fn new() -> Result<Self> {
         let injector = RawInjector::new()
             .context("Failed to create raw socket injector for event processor")?;
-        
+
         info!("Event processor initialized with raw socket injector");
-        
-        Ok(Self { 
+
+        Ok(Self {
             injector,
             auto_logic: None,
             config_update_tx: None,
@@ -48,10 +48,10 @@ impl EventProcessor {
     pub fn with_auto_logic(auto_logic: Arc<AutoLogic>) -> Result<Self> {
         let injector = RawInjector::new()
             .context("Failed to create raw socket injector for event processor")?;
-        
+
         info!("Event processor initialized with raw socket injector and auto-logic");
-        
-        Ok(Self { 
+
+        Ok(Self {
             injector,
             auto_logic: Some(auto_logic),
             config_update_tx: None,
@@ -70,10 +70,10 @@ impl EventProcessor {
     ) -> Result<Self> {
         let injector = RawInjector::new()
             .context("Failed to create raw socket injector for event processor")?;
-        
+
         info!("Event processor initialized with auto-logic and BPF config channel");
-        
-        Ok(Self { 
+
+        Ok(Self {
             injector,
             auto_logic: Some(auto_logic),
             config_update_tx: Some(config_update_tx),
@@ -81,22 +81,21 @@ impl EventProcessor {
     }
 
     /// Run event processing loop
-    pub async fn run(
-        &self,
-        mut event_rx: Receiver<Event>,
-        config: Arc<RwLock<DpiConfig>>,
-    ) {
+    pub async fn run(&self, mut event_rx: Receiver<Event>, config: Arc<RwLock<DpiConfig>>) {
         info!("Event processing loop started");
-        
+
         let mut event_count = 0u64;
-        
+
         while let Some(event) = event_rx.recv().await {
             event_count += 1;
-            info!("[PROCESSOR] Received event #{} from channel, type={}", event_count, event.event_type);
-            
+            info!(
+                "[PROCESSOR] Received event #{} from channel, type={}",
+                event_count, event.event_type
+            );
+
             let mut cfg = config.write().await;
             self.process_event(&event, &mut cfg).await;
-            
+
             // Check if config was modified by auto-logic and update BPF
             if self.config_update_tx.is_some() {
                 // Always update BPF config after processing events that might change strategy
@@ -106,19 +105,23 @@ impl EventProcessor {
             }
             drop(cfg);
         }
-        
-        info!("Event processing loop stopped, total events processed: {}", event_count);
+
+        info!(
+            "Event processing loop stopped, total events processed: {}",
+            event_count
+        );
     }
 
     /// Update BPF config via the config update channel
     fn update_bpf_config(&self, config: &DpiConfig) -> Result<()> {
         if let Some(ref tx) = self.config_update_tx {
-            let config_bytes = config.to_bytes()
+            let config_bytes = config
+                .to_bytes()
                 .context("Failed to serialize config for BPF update")?;
-            
+
             tx.send(config_bytes)
                 .context("Failed to send config update to BPF thread")?;
-            
+
             debug!("[AUTO] BPF config update sent");
         }
         Ok(())
@@ -132,7 +135,7 @@ impl EventProcessor {
             src_port: event.src_port,
             dst_port: event.dst_port,
             is_ipv6: event.is_ipv6,
-            proto: 6, // TCP
+            proto: 6,     // TCP
             _pad: [0; 2], // Explicit zeroed padding for consistent hashing
         }
     }
@@ -140,31 +143,40 @@ impl EventProcessor {
     /// Process a single event
     async fn process_event(&self, event: &Event, config: &mut DpiConfig) {
         let (src_ip, dst_ip) = event.format_ips();
-        
-        info!("[RINGBUF] Processing event type={} from {}:{} -> {}:{}",
-              event.event_type, src_ip, event.src_port, dst_ip, event.dst_port);
-        
+
+        info!(
+            "[RINGBUF] Processing event type={} from {}:{} -> {}:{}",
+            event.event_type, src_ip, event.src_port, dst_ip, event.dst_port
+        );
+
         match event.event_type {
             event_types::SPLIT_TRIGGERED => {
-                self.handle_split_triggered(event, config, &src_ip, &dst_ip).await;
+                self.handle_split_triggered(event, config, &src_ip, &dst_ip)
+                    .await;
             }
             event_types::FAKE_TRIGGERED => {
-                self.handle_fake_triggered(event, config, &src_ip, &dst_ip).await;
+                self.handle_fake_triggered(event, config, &src_ip, &dst_ip)
+                    .await;
             }
             event_types::RST_DETECTED => {
-                self.handle_rst_detected(event, config, &src_ip, &dst_ip).await;
+                self.handle_rst_detected(event, config, &src_ip, &dst_ip)
+                    .await;
             }
             event_types::REDIRECT_DETECTED => {
-                self.handle_redirect_detected(event, config, &src_ip, &dst_ip).await;
+                self.handle_redirect_detected(event, config, &src_ip, &dst_ip)
+                    .await;
             }
             event_types::SSL_ERROR_DETECTED => {
-                self.handle_ssl_error_detected(event, config, &src_ip, &dst_ip).await;
+                self.handle_ssl_error_detected(event, config, &src_ip, &dst_ip)
+                    .await;
             }
             event_types::DISORDER_TRIGGERED => {
-                self.handle_disorder_triggered(event, config, &src_ip, &dst_ip).await;
+                self.handle_disorder_triggered(event, config, &src_ip, &dst_ip)
+                    .await;
             }
             event_types::QUIC_FRAGMENT_TRIGGERED => {
-                self.handle_quic_fragmentation(event, &src_ip, &dst_ip, config).await;
+                self.handle_quic_fragmentation(event, &src_ip, &dst_ip, config)
+                    .await;
             }
             event_types::OOB_TRIGGERED => {
                 self.handle_oob_triggered(event, &src_ip, &dst_ip).await;
@@ -186,13 +198,17 @@ impl EventProcessor {
         src_ip: &str,
         dst_ip: &str,
     ) {
-        info!("[SPLIT] handle_split_triggered called for {}:{} -> {}:{}, event_type={}",
-              src_ip, event.src_port, dst_ip, event.dst_port, event.event_type);
-        
+        info!(
+            "[SPLIT] handle_split_triggered called for {}:{} -> {}:{}, event_type={}",
+            src_ip, event.src_port, dst_ip, event.dst_port, event.event_type
+        );
+
         // Only IPv4 supported for now
         if event.is_ipv6 != 0 {
-            warn!("[SPLIT] IPv6 split not yet implemented for {}:{} -> {}:{}",
-                  src_ip, event.src_port, dst_ip, event.dst_port);
+            warn!(
+                "[SPLIT] IPv6 split not yet implemented for {}:{} -> {}:{}",
+                src_ip, event.src_port, dst_ip, event.dst_port
+            );
             return;
         }
 
@@ -215,8 +231,10 @@ impl EventProcessor {
 
         // Validate split position
         if split_pos >= payload_len {
-            warn!("[SPLIT] Split position {} >= payload length {}, skipping",
-                  split_pos, payload_len);
+            warn!(
+                "[SPLIT] Split position {} >= payload length {}, skipping",
+                split_pos, payload_len
+            );
             return;
         }
 
@@ -242,8 +260,10 @@ impl EventProcessor {
 
         // Inject split packets
         let (first_result, second_result) = self.injector.inject_split_packets(
-            src_ipv4, dst_ipv4,
-            event.src_port, event.dst_port,
+            src_ipv4,
+            dst_ipv4,
+            event.src_port,
+            event.dst_port,
             event.seq,
             event.ack,
             event.flags,
@@ -253,12 +273,18 @@ impl EventProcessor {
 
         // Log results
         match first_result {
-            Ok(_) => info!("[SPLIT] First packet sent successfully ({} bytes)", split_pos),
+            Ok(_) => info!(
+                "[SPLIT] First packet sent successfully ({} bytes)",
+                split_pos
+            ),
             Err(e) => warn!("[SPLIT] Failed to send first packet: {}", e),
         }
 
         match second_result {
-            Ok(_) => info!("[SPLIT] Second packet sent successfully ({} bytes)", payload_len - split_pos),
+            Ok(_) => info!(
+                "[SPLIT] Second packet sent successfully ({} bytes)",
+                payload_len - split_pos
+            ),
             Err(e) => warn!("[SPLIT] Failed to send second packet: {}", e),
         }
     }
@@ -277,22 +303,33 @@ impl EventProcessor {
             .map(|b| format!("{:02x}", b))
             .collect::<Vec<_>>()
             .join(" ");
-        
+
         match event.flags {
             FLAG_DISORDER => {
                 info!(
                     "[DISORDER] {}:{} -> {}:{}, seq={}, ipv6={}, payload_preview={}",
-                    src_ip, event.src_port, dst_ip, event.dst_port,
-                    event.seq, event.is_ipv6, payload_preview
+                    src_ip,
+                    event.src_port,
+                    dst_ip,
+                    event.dst_port,
+                    event.seq,
+                    event.is_ipv6,
+                    payload_preview
                 );
             }
             FLAG_QUIC_FRAG => {
                 info!(
                     "[QUIC FRAG] {}:{} -> {}:{}, payload_len={}, ipv6={}, payload_preview={}",
-                    src_ip, event.src_port, dst_ip, event.dst_port,
-                    event.payload_len, event.is_ipv6, payload_preview
+                    src_ip,
+                    event.src_port,
+                    dst_ip,
+                    event.dst_port,
+                    event.payload_len,
+                    event.is_ipv6,
+                    payload_preview
                 );
-                self.handle_quic_fragmentation(event, src_ip, dst_ip, config).await;
+                self.handle_quic_fragmentation(event, src_ip, dst_ip, config)
+                    .await;
             }
             FLAG_TLS_SPLIT => {
                 info!(
@@ -309,7 +346,7 @@ impl EventProcessor {
                     event.seq, event.flags, event.is_ipv6,
                     event.payload_len, payload_preview
                 );
-                
+
                 // Inject fake packet if fake_offset is configured
                 if config.fake_offset.is_some() {
                     if let Err(e) = self.inject_fake_packet(event, config).await {
@@ -321,18 +358,24 @@ impl EventProcessor {
     }
 
     /// Handle RST detection for auto-logic
-    async fn handle_rst_detected(&self, event: &Event, config: &mut DpiConfig, src_ip: &str, dst_ip: &str) {
+    async fn handle_rst_detected(
+        &self,
+        event: &Event,
+        config: &mut DpiConfig,
+        src_ip: &str,
+        dst_ip: &str,
+    ) {
         if !config.auto_rst {
             return;
         }
-        
+
         // Log payload preview
         let payload_preview: String = event.payload[..16]
             .iter()
             .map(|b| format!("{:02x}", b))
             .collect::<Vec<_>>()
             .join(" ");
-        
+
         warn!(
             "[AUTO-RST] Connection reset detected: {}:{} -> {}:{}, seq={}, ipv6={}, payload_preview={}",
             src_ip, event.src_port, dst_ip, event.dst_port,
@@ -344,14 +387,11 @@ impl EventProcessor {
             let key = self.build_conn_key(event);
             let src_ip = event.src_ip_v4();
             let dst_ip = event.dst_ip_v4();
-            
-            if let Some(strategy) = auto_logic.handle_rst(
-                &key,
-                src_ip,
-                dst_ip,
-                event.src_port,
-                event.dst_port,
-            ).await {
+
+            if let Some(strategy) = auto_logic
+                .handle_rst(&key, src_ip, dst_ip, event.src_port, event.dst_port)
+                .await
+            {
                 // Apply the new strategy
                 self.apply_strategy(&strategy, event, config).await;
             }
@@ -361,18 +401,28 @@ impl EventProcessor {
     }
 
     /// Handle HTTP Redirect detection for auto-logic
-    async fn handle_redirect_detected(&self, event: &Event, config: &mut DpiConfig, src_ip: &str, dst_ip: &str) {
+    async fn handle_redirect_detected(
+        &self,
+        event: &Event,
+        config: &mut DpiConfig,
+        src_ip: &str,
+        dst_ip: &str,
+    ) {
         if !config.auto_redirect {
             return;
         }
-        
+
         // Try to extract HTTP response from payload
         let payload_len = (event.payload_len as usize).min(64);
         let payload_str = String::from_utf8_lossy(&event.payload[..payload_len]);
-        
+
         warn!(
             "[AUTO-REDIRECT] HTTP 301/302 detected: {}:{} -> {}:{}, ipv6={}, response_preview={}",
-            src_ip, event.src_port, dst_ip, event.dst_port, event.is_ipv6,
+            src_ip,
+            event.src_port,
+            dst_ip,
+            event.dst_port,
+            event.is_ipv6,
             payload_str.chars().take(50).collect::<String>()
         );
 
@@ -381,14 +431,11 @@ impl EventProcessor {
             let key = self.build_conn_key(event);
             let src_ip = event.src_ip_v4();
             let dst_ip = event.dst_ip_v4();
-            
-            if let Some(strategy) = auto_logic.handle_redirect(
-                &key,
-                src_ip,
-                dst_ip,
-                event.src_port,
-                event.dst_port,
-            ).await {
+
+            if let Some(strategy) = auto_logic
+                .handle_redirect(&key, src_ip, dst_ip, event.src_port, event.dst_port)
+                .await
+            {
                 // Apply the strengthened strategy
                 self.apply_strategy(&strategy, event, config).await;
             }
@@ -398,22 +445,33 @@ impl EventProcessor {
     }
 
     /// Handle SSL/TLS error detection for auto-logic
-    async fn handle_ssl_error_detected(&self, event: &Event, config: &mut DpiConfig, src_ip: &str, dst_ip: &str) {
+    async fn handle_ssl_error_detected(
+        &self,
+        event: &Event,
+        config: &mut DpiConfig,
+        src_ip: &str,
+        dst_ip: &str,
+    ) {
         if !config.auto_ssl {
             return;
         }
-        
+
         // Log TLS alert details from payload
         let payload_preview: String = event.payload[..16]
             .iter()
             .map(|b| format!("{:02x}", b))
             .collect::<Vec<_>>()
             .join(" ");
-        
+
         warn!(
             "[AUTO-SSL] SSL Fatal Alert detected: {}:{} -> {}:{}, seq={}, ipv6={}, alert_data={}",
-            src_ip, event.src_port, dst_ip, event.dst_port,
-            event.seq, event.is_ipv6, payload_preview
+            src_ip,
+            event.src_port,
+            dst_ip,
+            event.dst_port,
+            event.seq,
+            event.is_ipv6,
+            payload_preview
         );
 
         // Use auto-logic if available
@@ -421,14 +479,11 @@ impl EventProcessor {
             let key = self.build_conn_key(event);
             let src_ip = event.src_ip_v4();
             let dst_ip = event.dst_ip_v4();
-            
-            if let Some(strategy) = auto_logic.handle_ssl_error(
-                &key,
-                src_ip,
-                dst_ip,
-                event.src_port,
-                event.dst_port,
-            ).await {
+
+            if let Some(strategy) = auto_logic
+                .handle_ssl_error(&key, src_ip, dst_ip, event.src_port, event.dst_port)
+                .await
+            {
                 // Apply the TLS-focused strategy
                 self.apply_strategy(&strategy, event, config).await;
             }
@@ -438,52 +493,64 @@ impl EventProcessor {
     }
 
     /// Apply a strategy to handle the current connection
-    /// 
+    ///
     /// Updates the BPF configuration based on the recommended strategy.
     /// This modifies the shared config and sends an update to the BPF thread.
     async fn apply_strategy(&self, strategy: &Strategy, event: &Event, config: &mut DpiConfig) {
         info!("[AUTO] Applying strategy: {}", strategy.description());
-        
+
         let recs = ConfigRecommendations::from(strategy);
-        
+
         // Apply configuration changes based on strategy recommendations
         let mut config_changed = false;
-        
+
         // Update split position if recommended
         if let Some(split_pos) = recs.split_pos {
             if config.split_pos != Some(split_pos) {
-                info!("[AUTO] Updating split_pos: {:?} -> {}", config.split_pos, split_pos);
+                info!(
+                    "[AUTO] Updating split_pos: {:?} -> {}",
+                    config.split_pos, split_pos
+                );
                 config.split_pos = Some(split_pos);
                 config_changed = true;
             }
         }
-        
+
         // Update fake settings if recommended
         if recs.use_fake {
             if config.fake_offset != recs.fake_offset {
-                info!("[AUTO] Updating fake_offset: {:?} -> {:?}", config.fake_offset, recs.fake_offset);
+                info!(
+                    "[AUTO] Updating fake_offset: {:?} -> {:?}",
+                    config.fake_offset, recs.fake_offset
+                );
                 config.fake_offset = recs.fake_offset;
                 config_changed = true;
             }
-        } else if config.fake_offset.is_some() && !matches!(strategy, Strategy::FakeWithSplit { .. }) {
+        } else if config.fake_offset.is_some()
+            && !matches!(strategy, Strategy::FakeWithSplit { .. })
+        {
             // Disable fake if strategy doesn't use it (but preserve if it does)
             info!("[AUTO] Disabling fake packet (fake_offset=None)");
             config.fake_offset = None;
             config_changed = true;
         }
-        
+
         // Update TLS record split if recommended
         if recs.use_tlsrec {
             // TLS record split uses split_pos from strategy
             if let Some(split_pos) = recs.split_pos {
-                if config.tlsrec_pos != Some(split_pos) {
-                    info!("[AUTO] Updating tlsrec_pos: {:?} -> {}", config.tlsrec_pos, split_pos);
-                    config.tlsrec_pos = Some(split_pos);
+                let tlsrec_pos = split_pos as i32;
+                if config.tlsrec_pos != Some(tlsrec_pos) {
+                    info!(
+                        "[AUTO] Updating tlsrec_pos: {:?} -> {}",
+                        config.tlsrec_pos, split_pos
+                    );
+                    config.tlsrec_pos = Some(tlsrec_pos);
                     config_changed = true;
                 }
             }
         }
-        
+
         // Update disorder if recommended
         if recs.use_disorder {
             if !config.use_disorder {
@@ -492,20 +559,20 @@ impl EventProcessor {
                 config_changed = true;
             }
         }
-        
+
         // Log the current configuration state
         debug!(
             "[AUTO] Current BPF config: split_pos={:?}, fake_offset={:?}, tlsrec_pos={:?}, disorder={}",
             config.split_pos, config.fake_offset, config.tlsrec_pos, config.use_disorder
         );
-        
+
         // If the strategy uses fake and we have a fake_offset, inject a fake packet
         if recs.use_fake && recs.fake_offset.is_some() {
             if let Err(e) = self.inject_fake_packet(event, config).await {
                 warn!("[AUTO] Failed to inject fake packet for strategy: {}", e);
             }
         }
-        
+
         // If the strategy has a split position, perform the split
         if let Some(split_pos) = recs.split_pos {
             if event.payload_len as usize > split_pos {
@@ -514,7 +581,7 @@ impl EventProcessor {
                 // with the new split position. For now, we just log it.
             }
         }
-        
+
         // BPF config will be updated by the caller (run loop) if changed
         if config_changed {
             info!("[AUTO] Configuration updated, BPF map will be synchronized");
@@ -527,16 +594,18 @@ impl EventProcessor {
     /// The second part of the payload is sent first (with higher sequence number),
     /// followed by the first part. This confuses DPI systems.
     async fn handle_disorder_triggered(
-        &self, 
-        event: &Event, 
+        &self,
+        event: &Event,
         config: &DpiConfig,
-        src_ip: &str, 
+        src_ip: &str,
         dst_ip: &str,
     ) {
         // Only IPv4 supported for now
         if event.is_ipv6 != 0 {
-            warn!("[DISORDER] IPv6 disorder not yet implemented for {}:{} -> {}:{}",
-                  src_ip, event.src_port, dst_ip, event.dst_port);
+            warn!(
+                "[DISORDER] IPv6 disorder not yet implemented for {}:{} -> {}:{}",
+                src_ip, event.src_port, dst_ip, event.dst_port
+            );
             return;
         }
 
@@ -554,7 +623,10 @@ impl EventProcessor {
                 // Default: split in the middle or at position 10, whichever is smaller
                 let default_pos = 10.min(payload_len / 2).max(1);
                 if default_pos >= payload_len {
-                    warn!("[DISORDER] Payload too short for disorder: {} bytes", payload_len);
+                    warn!(
+                        "[DISORDER] Payload too short for disorder: {} bytes",
+                        payload_len
+                    );
                     return;
                 }
                 default_pos
@@ -563,8 +635,10 @@ impl EventProcessor {
 
         // Validate split position
         if split_pos >= payload_len {
-            warn!("[DISORDER] Split position {} >= payload length {}, skipping",
-                  split_pos, payload_len);
+            warn!(
+                "[DISORDER] Split position {} >= payload length {}, skipping",
+                split_pos, payload_len
+            );
             return;
         }
 
@@ -590,8 +664,10 @@ impl EventProcessor {
 
         // Inject packets in disorder (second part first, then first part)
         let (second_result, first_result) = self.injector.inject_disorder_packets(
-            src_ipv4, dst_ipv4,
-            event.src_port, event.dst_port,
+            src_ipv4,
+            dst_ipv4,
+            event.src_port,
+            event.dst_port,
             event.seq,
             event.ack,
             event.flags,
@@ -619,12 +695,7 @@ impl EventProcessor {
     /// Event fields used:
     /// - `reserved` - contains the OOB position (urgent pointer value)
     /// - `flags` - contains original TCP flags plus URG flag
-    async fn handle_oob_triggered(
-        &self,
-        event: &Event,
-        src_ip: &str,
-        dst_ip: &str,
-    ) {
+    async fn handle_oob_triggered(&self, event: &Event, src_ip: &str, dst_ip: &str) {
         // Only IPv4 supported for now
         if event.is_ipv6 != 0 {
             warn!(
@@ -682,8 +753,10 @@ impl EventProcessor {
 
         // Inject OOB packet with URG flag
         match self.injector.inject_oob_packet(
-            src_ipv4, dst_ipv4,
-            event.src_port, event.dst_port,
+            src_ipv4,
+            dst_ipv4,
+            event.src_port,
+            event.dst_port,
             event.seq,
             event.ack,
             oob_pos,
@@ -702,7 +775,7 @@ impl EventProcessor {
     }
 
     /// Handle QUIC fragmentation logic
-    /// 
+    ///
     /// Fragments UDP/QUIC payload into multiple IP fragments.
     /// Each fragment contains part of the UDP payload with IP MF flag
     /// set on all fragments except the last one.
@@ -713,13 +786,17 @@ impl EventProcessor {
         dst_ip: &str,
         config: &DpiConfig,
     ) {
-        info!("[QUIC FRAG] Fragmentation triggered for {}:{} -> {}:{}, payload_len={}",
-              src_ip, event.src_port, dst_ip, event.dst_port, event.payload_len);
-        
+        info!(
+            "[QUIC FRAG] Fragmentation triggered for {}:{} -> {}:{}, payload_len={}",
+            src_ip, event.src_port, dst_ip, event.dst_port, event.payload_len
+        );
+
         // Only IPv4 supported for now
         if event.is_ipv6 != 0 {
-            warn!("[QUIC FRAG] IPv6 fragmentation not yet implemented for {}:{} -> {}:{}",
-                  src_ip, event.src_port, dst_ip, event.dst_port);
+            warn!(
+                "[QUIC FRAG] IPv6 fragmentation not yet implemented for {}:{} -> {}:{}",
+                src_ip, event.src_port, dst_ip, event.dst_port
+            );
             return;
         }
 
@@ -760,8 +837,10 @@ impl EventProcessor {
 
         // Inject fragmented UDP packets
         match self.injector.udp_injector().inject_fragmented_udp(
-            src_ipv4, dst_ipv4,
-            event.src_port, event.dst_port,
+            src_ipv4,
+            dst_ipv4,
+            event.src_port,
+            event.dst_port,
             payload,
             frag_size,
         ) {
@@ -838,11 +917,20 @@ impl EventProcessor {
             if sni_start + sni_len <= payload_len.min(MAX_PAYLOAD_SIZE) {
                 let sni_bytes = &event.payload[sni_start..sni_start + sni_len];
                 match std::str::from_utf8(sni_bytes) {
-                    Ok(sni) => format!(", SNI='{}' (offset={}, len={})", sni, event.sni_offset, event.sni_length),
-                    Err(_) => format!(", SNI=<invalid utf8> (offset={}, len={})", event.sni_offset, event.sni_length),
+                    Ok(sni) => format!(
+                        ", SNI='{}' (offset={}, len={})",
+                        sni, event.sni_offset, event.sni_length
+                    ),
+                    Err(_) => format!(
+                        ", SNI=<invalid utf8> (offset={}, len={})",
+                        event.sni_offset, event.sni_length
+                    ),
                 }
             } else {
-                format!(", SNI offset/length out of bounds (offset={}, len={})", event.sni_offset, event.sni_length)
+                format!(
+                    ", SNI offset/length out of bounds (offset={}, len={})",
+                    event.sni_offset, event.sni_length
+                )
             }
         } else {
             String::new()
@@ -871,8 +959,10 @@ impl EventProcessor {
 
         // Inject TLS split packets
         let (first_result, second_result) = self.injector.inject_tls_split_packets(
-            src_ipv4, dst_ipv4,
-            event.src_port, event.dst_port,
+            src_ipv4,
+            dst_ipv4,
+            event.src_port,
+            event.dst_port,
             event.seq,
             event.ack,
             event.flags,
@@ -882,12 +972,18 @@ impl EventProcessor {
 
         // Log results
         match first_result {
-            Ok(_) => info!("[TLS SPLIT] First TLS record sent successfully ({} bytes to split pos)", split_pos),
+            Ok(_) => info!(
+                "[TLS SPLIT] First TLS record sent successfully ({} bytes to split pos)",
+                split_pos
+            ),
             Err(e) => warn!("[TLS SPLIT] Failed to send first TLS record: {}", e),
         }
 
         match second_result {
-            Ok(_) => info!("[TLS SPLIT] Second TLS record sent successfully ({} bytes remaining)", actual_len - split_pos),
+            Ok(_) => info!(
+                "[TLS SPLIT] Second TLS record sent successfully ({} bytes remaining)",
+                actual_len - split_pos
+            ),
             Err(e) => warn!("[TLS SPLIT] Failed to send second TLS record: {}", e),
         }
     }
@@ -896,15 +992,17 @@ impl EventProcessor {
     async fn inject_fake_packet(&self, event: &Event, config: &DpiConfig) -> Result<()> {
         // Only IPv4 supported for now
         if event.is_ipv6 != 0 {
-            return Err(anyhow::anyhow!("IPv6 fake packet injection not yet supported"));
+            return Err(anyhow::anyhow!(
+                "IPv6 fake packet injection not yet supported"
+            ));
         }
-        
+
         let src_ip = Ipv4Addr::from(u32::from_be(event.src_ip[0]));
         let dst_ip = Ipv4Addr::from(u32::from_be(event.dst_ip[0]));
-        
+
         // Convert isize to i32 for the injector method
         let fake_offset: i32 = config.fake_offset.unwrap_or(0) as i32;
-        
+
         // Get payload from event (clamped to MAX_PAYLOAD_SIZE for safety)
         let payload_len = (event.payload_len as usize).min(MAX_PAYLOAD_SIZE);
         let payload = if payload_len > 0 {
@@ -916,14 +1014,21 @@ impl EventProcessor {
 
         info!(
             "[FAKE] Injecting fake packet: {}:{} -> {}:{}, seq={}, offset={}, payload_len={}",
-            src_ip, event.src_port, dst_ip, event.dst_port,
-            event.seq, fake_offset, payload.len()
+            src_ip,
+            event.src_port,
+            dst_ip,
+            event.dst_port,
+            event.seq,
+            fake_offset,
+            payload.len()
         );
 
         // Use the new inject_fake_with_offset method
         self.injector.inject_fake_with_offset(
-            src_ip, dst_ip,
-            event.src_port, event.dst_port,
+            src_ip,
+            dst_ip,
+            event.src_port,
+            event.dst_port,
             event.seq,
             event.ack,
             fake_offset,
@@ -995,13 +1100,14 @@ mod tests {
         // Test that TLS split event fields are correctly interpreted
         let tls_payload = [
             0x16, 0x03, 0x01, 0x00, 0x20, // TLS header: Handshake, TLS 1.0, 32 bytes
-            0x01, 0x00, 0x00, 0x1c,       // Client Hello, 28 bytes
-            // ... more handshake data would follow
+            0x01, 0x00, 0x00,
+            0x1c, // Client Hello, 28 bytes
+                  // ... more handshake data would follow
         ];
-        
+
         let mut payload = [0u8; MAX_PAYLOAD_SIZE];
         payload[..tls_payload.len()].copy_from_slice(&tls_payload);
-        
+
         // Create a TLS split event
         let event = Event {
             event_type: event_types::TLSREC_TRIGGERED,
@@ -1014,20 +1120,20 @@ mod tests {
             flags: 0x18, // PSH|ACK
             payload_len: tls_payload.len() as u16,
             is_ipv6: 0,
-            sni_offset: 10,  // SNI starts at offset 10
-            sni_length: 12,  // SNI is 12 bytes long
-            reserved: 15,    // Split position (within handshake data)
+            sni_offset: 10, // SNI starts at offset 10
+            sni_length: 12, // SNI is 12 bytes long
+            reserved: 15,   // Split position (within handshake data)
             payload,
             _pad: [0; 3],
         };
-        
+
         // Verify event fields
         assert_eq!(event.event_type, event_types::TLSREC_TRIGGERED);
         assert_eq!(event.sni_offset, 10);
         assert_eq!(event.sni_length, 12);
         assert_eq!(event.reserved, 15); // Split position
         assert_eq!(event.is_ipv6, 0);
-        
+
         // Verify payload content
         assert_eq!(event.payload[0], 0x16); // Handshake content type
         assert_eq!(event.payload[1], 0x03); // Version major
@@ -1038,16 +1144,16 @@ mod tests {
     fn test_tls_split_validation() {
         // Test validation logic for TLS split positions
         const TLS_HEADER_LEN: usize = 5;
-        
+
         // Test case 1: split_pos too small (within TLS header)
         let split_pos_small = 3;
         assert!(split_pos_small <= TLS_HEADER_LEN);
-        
+
         // Test case 2: split_pos at payload boundary (no data for second record)
         let payload_len = 40;
         let split_pos_end = 40;
         assert!(split_pos_end >= payload_len);
-        
+
         // Test case 3: valid split position
         let split_pos_valid = 20;
         assert!(split_pos_valid > TLS_HEADER_LEN);
@@ -1060,14 +1166,14 @@ mod tests {
         let mut payload = [0u8; 64];
         let sni_bytes = b"example.com";
         let sni_offset = 10;
-        
+
         // Copy SNI into payload at offset
         payload[sni_offset..sni_offset + sni_bytes.len()].copy_from_slice(sni_bytes);
-        
+
         // Verify extraction
         let extracted = &payload[sni_offset..sni_offset + sni_bytes.len()];
         assert_eq!(extracted, sni_bytes);
-        
+
         // Test UTF-8 conversion
         let sni_str = std::str::from_utf8(extracted).unwrap();
         assert_eq!(sni_str, "example.com");
@@ -1093,7 +1199,7 @@ mod tests {
             payload: [0u8; MAX_PAYLOAD_SIZE],
             _pad: [0; 3],
         };
-        
+
         assert_eq!(event_ipv6.is_ipv6, 1);
         // In real handler, this would trigger the IPv6 warning and return early
     }
@@ -1102,10 +1208,10 @@ mod tests {
     fn test_oob_event_fields() {
         // Test that OOB event fields are correctly interpreted
         let http_payload = b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n";
-        
+
         let mut payload = [0u8; MAX_PAYLOAD_SIZE];
         payload[..http_payload.len()].copy_from_slice(http_payload);
-        
+
         // Create an OOB event
         let event = Event {
             event_type: event_types::OOB_TRIGGERED,
@@ -1124,13 +1230,13 @@ mod tests {
             payload,
             _pad: [0; 3],
         };
-        
+
         // Verify event fields
         assert_eq!(event.event_type, event_types::OOB_TRIGGERED);
         assert_eq!(event.flags, 0x38); // URG|PSH|ACK
         assert_eq!(event.reserved, 10); // OOB position
         assert_eq!(event.is_ipv6, 0);
-        
+
         // Verify payload content
         assert_eq!(&event.payload[..http_payload.len()], http_payload);
     }
@@ -1139,16 +1245,16 @@ mod tests {
     fn test_oob_validation() {
         // Test validation logic for OOB positions
         let payload_len = 100;
-        
+
         // Valid OOB position
         let oob_pos_valid: u8 = 50;
         assert!(oob_pos_valid > 0);
         assert!(oob_pos_valid as usize <= payload_len);
-        
+
         // Invalid OOB positions
         let oob_pos_zero: u8 = 0;
         let oob_pos_large: u8 = 150; // > payload_len
-        
+
         assert!(oob_pos_zero == 0);
         assert!(oob_pos_large as usize > payload_len);
     }
@@ -1179,7 +1285,7 @@ mod tests {
             payload: [0u8; MAX_PAYLOAD_SIZE],
             _pad: [0; 3],
         };
-        
+
         assert_eq!(event_ipv6.is_ipv6, 1);
         assert_eq!(event_ipv6.event_type, event_types::OOB_TRIGGERED);
         // In real handler, this would trigger the IPv6 warning and return early
@@ -1195,10 +1301,10 @@ mod tests {
     fn test_disorder_event_fields() {
         // Test that DISORDER event fields are correctly interpreted
         let http_payload = b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n";
-        
+
         let mut payload = [0u8; MAX_PAYLOAD_SIZE];
         payload[..http_payload.len()].copy_from_slice(http_payload);
-        
+
         // Create a DISORDER event
         // IP addresses stored as u32 values that will be interpreted as big-endian by src_ip_v4()
         // src_ip_v4() does: Ipv4Addr::from(u32::from_be(self.src_ip[0]))
@@ -1208,7 +1314,7 @@ mod tests {
         // from_be(0x0101A8C0) on LE = byte-swap(0x0101A8C0) = 0xC0A80101 = correct!
         let src_ip_val = 0x0101A8C0u32; // This is 0xC0A80101 in LE
         let dst_ip_val = 0x0100000Au32; // This is 0x0A000001 in LE
-        
+
         let event = Event {
             event_type: event_types::DISORDER_TRIGGERED,
             src_ip: [src_ip_val, 0, 0, 0],
@@ -1226,16 +1332,16 @@ mod tests {
             payload,
             _pad: [0; 3],
         };
-        
+
         // Verify event fields
         assert_eq!(event.event_type, event_types::DISORDER_TRIGGERED);
         assert_eq!(event.flags, 0x18);
         assert_eq!(event.reserved, 0);
         assert_eq!(event.is_ipv6, 0);
-        
+
         // Verify payload content
         assert_eq!(&event.payload[..http_payload.len()], http_payload);
-        
+
         // Verify IP addresses (src_ip_v4() converts from network byte order)
         assert_eq!(event.src_ip_v4().to_string(), "192.168.1.1");
         assert_eq!(event.dst_ip_v4().to_string(), "10.0.0.1");
@@ -1245,7 +1351,7 @@ mod tests {
     fn test_disorder_split_position_logic() {
         // Test split position selection logic for disorder
         let payload_len = 40;
-        
+
         // When config has valid split position
         let config_split_pos: Option<usize> = Some(10);
         let split_pos = match config_split_pos {
@@ -1253,7 +1359,7 @@ mod tests {
             _ => 10.min(payload_len / 2).max(1),
         };
         assert_eq!(split_pos, 10);
-        
+
         // When config split position is too large - should use default
         let config_split_large: Option<usize> = Some(100);
         let split_pos_large = match config_split_large {
@@ -1262,7 +1368,7 @@ mod tests {
         };
         // Default: 10.min(40/2).max(1) = 10.min(20).max(1) = 10
         assert_eq!(split_pos_large, 10);
-        
+
         // When config has no split position - should use default
         let config_split_none: Option<usize> = None;
         let split_pos_default = match config_split_none {
@@ -1271,7 +1377,7 @@ mod tests {
         };
         // Default: 10.min(40/2).max(1) = 10.min(20).max(1) = 10
         assert_eq!(split_pos_default, 10);
-        
+
         // Test with small payload - default should be clamped to at least 1
         let small_payload_len = 10;
         let split_pos_small = match None as Option<usize> {
@@ -1302,7 +1408,7 @@ mod tests {
             payload: [0u8; MAX_PAYLOAD_SIZE],
             _pad: [0; 3],
         };
-        
+
         assert_eq!(event_ipv6.is_ipv6, 1);
         assert_eq!(event_ipv6.event_type, event_types::DISORDER_TRIGGERED);
         // In real handler, this would trigger the IPv6 warning and return early
@@ -1328,7 +1434,7 @@ mod tests {
             payload: [0u8; MAX_PAYLOAD_SIZE],
             _pad: [0; 3],
         };
-        
+
         assert_eq!(event_empty.payload_len, 0);
         // In real handler, this would trigger "Empty payload" warning and return
     }
@@ -1338,9 +1444,9 @@ mod tests {
         // Test sequence number byte order handling for disorder
         let seq_be: u32 = 1000u32.to_be(); // Network byte order (big-endian)
         let seq_host = u32::from_be(seq_be); // Convert to host byte order
-        
+
         assert_eq!(seq_host, 1000);
-        
+
         // Test wrapping calculation with BE conversion
         let split_pos = 10;
         let second_seq = seq_host.wrapping_add(split_pos as u32);

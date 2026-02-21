@@ -6,13 +6,13 @@ pub struct DpiConfig {
     pub split_pos: Option<usize>,
     pub oob_positions: Vec<usize>,
     pub fake_offset: Option<isize>,
-    pub tlsrec_pos: Option<usize>,
+    pub tlsrec_pos: Option<i32>,
     pub auto_rst: bool,
     pub auto_redirect: bool,
     pub auto_ssl: bool,
-    pub ip_fragment: bool,     /* Enable IP fragmentation for QUIC/UDP */
-    pub frag_size: u16,        /* Fragment size (0 = default 8 bytes) */
-    pub use_disorder: bool,    /* Enable packet disorder technique */
+    pub ip_fragment: bool,  /* Enable IP fragmentation for QUIC/UDP */
+    pub frag_size: u16,     /* Fragment size (0 = default 8 bytes) */
+    pub use_disorder: bool, /* Enable packet disorder technique */
 }
 
 impl DpiConfig {
@@ -73,20 +73,22 @@ impl DpiConfig {
                     config.fake_offset = Some(offset);
                 }
                 "r" | "-r" => {
-                    // TLS record split: format like "1+s" or just "1"
+                    // TLS record split:
+                    //   rN+s  -> offset from SNI start (legacy syntax)
+                    //   rN    -> signed offset (negative means from SNI end)
                     if rest.contains("+s") {
-                        let num: usize = rest.split("+s").next().unwrap().parse()
+                        let num: i32 = rest.split("+s").next().unwrap().parse()
                             .with_context(|| format!(
                                 "Invalid TLS record position in token '{}'. \
-                                 Expected format 'N+s' where N is a number (e.g., 'r1+s'), got '{}'.",
+                                 Expected format 'N+s' where N is a signed number (e.g., 'r1+s' or 'r-2+s'), got '{}'.",
                                 token, rest
                             ))?;
                         config.tlsrec_pos = Some(num);
                     } else {
-                        let pos: usize = rest.parse()
+                        let pos: i32 = rest.parse()
                             .with_context(|| format!(
                                 "Invalid TLS record position in token '{}'. \
-                                 Expected a positive number or 'N+s' format (e.g., 'r1' or 'r1+s'), got '{}'.",
+                                 Expected a signed number or 'N+s' format (e.g., 'r1', 'r-2', or 'r1+s'), got '{}'.",
                                 token, rest
                             ))?;
                         config.tlsrec_pos = Some(pos);
@@ -143,7 +145,7 @@ impl DpiConfig {
             split_pos: self.split_pos.map(|p| p as i32).unwrap_or(-1),
             oob_pos: self.oob_positions.first().map(|p| *p as i32).unwrap_or(-1),
             fake_offset: self.fake_offset.unwrap_or(0) as i32,
-            tlsrec_pos: self.tlsrec_pos.map(|p| p as i32).unwrap_or(-1),
+            tlsrec_pos: self.tlsrec_pos.unwrap_or(-1),
             auto_rst: self.auto_rst,
             auto_redirect: self.auto_redirect,
             auto_ssl: self.auto_ssl,
@@ -155,26 +157,21 @@ impl DpiConfig {
     }
 
     /// Convert config to bytes for BPF map
-    /// 
+    ///
     /// # Safety
     /// This uses unsafe code to reinterpret the struct as bytes.
     /// The struct is repr(C) and should match the eBPF struct layout.
     pub fn to_bytes(&self) -> anyhow::Result<Vec<u8>> {
         let proto = self.to_proto();
         let size = std::mem::size_of::<ProtoConfig>();
-        
+
         if size == 0 {
             return Err(anyhow!(
                 "Invalid ProtoConfig size (0 bytes). This is likely a bug in the protocol definitions."
             ));
         }
-        
-        let bytes = unsafe {
-            std::slice::from_raw_parts(
-                &proto as *const _ as *const u8,
-                size
-            )
-        };
+
+        let bytes = unsafe { std::slice::from_raw_parts(&proto as *const _ as *const u8, size) };
         Ok(bytes.to_vec())
     }
 }
@@ -194,7 +191,7 @@ mod tests {
         assert!(cfg.auto_redirect);
         assert!(cfg.auto_ssl);
     }
-    
+
     #[test]
     fn test_parse_multiple_oob() {
         let cfg = DpiConfig::parse("s1 -o1 -o5 -o10").unwrap();
@@ -256,6 +253,18 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_negative_tlsrec_without_s() {
+        let cfg = DpiConfig::parse("r-2").unwrap();
+        assert_eq!(cfg.tlsrec_pos, Some(-2));
+    }
+
+    #[test]
+    fn test_parse_negative_tlsrec_with_s() {
+        let cfg = DpiConfig::parse("r-3+s").unwrap();
+        assert_eq!(cfg.tlsrec_pos, Some(-3));
+    }
+
+    #[test]
     fn test_parse_negative_fake_offset() {
         let cfg = DpiConfig::parse("f-10").unwrap();
         assert_eq!(cfg.fake_offset, Some(-10));
@@ -286,7 +295,10 @@ mod tests {
     fn test_parse_invalid_split_position() {
         let result = DpiConfig::parse("sabc");
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("Invalid split position"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Invalid split position"));
     }
 
     #[test]
@@ -299,7 +311,10 @@ mod tests {
     fn test_parse_invalid_fake_offset() {
         let result = DpiConfig::parse("fxyz");
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("Invalid fake offset"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Invalid fake offset"));
     }
 
     #[test]
@@ -313,7 +328,10 @@ mod tests {
     fn test_parse_unknown_auto_flag() {
         let result = DpiConfig::parse("-Az");
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("Unknown auto flag"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Unknown auto flag"));
     }
 
     #[test]

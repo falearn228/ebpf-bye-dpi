@@ -95,6 +95,9 @@ struct conn_state {
     __u8 reserved[6];  /* 6 bytes, offset 18 - explicit zeroed padding to 24 */
 };
 
+/* Connection state retention */
+#define CONN_STATE_TTL_NS (120ULL * 1000000000ULL)  /* 120 seconds */
+
 /* Ring buffer event - supports both IPv4 and IPv6
  * Total size: 1084 bytes (57 header + 1024 payload + 3 padding)
  */
@@ -154,7 +157,7 @@ struct {
 } config_map SEC(".maps");
 
 struct {
-    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
     __uint(max_entries, 65536);
     __type(key, struct conn_key);
     __type(value, struct conn_state);
@@ -930,7 +933,14 @@ static __always_inline int process_tcp(struct __sk_buff *skb, struct config *cfg
     key->proto = IPPROTO_TCP;
 
     /* Get or create connection state */
+    __u64 now = bpf_ktime_get_ns();
     struct conn_state *state = bpf_map_lookup_elem(&conn_map, key);
+    if (state && now > state->timestamp && (now - state->timestamp) > CONN_STATE_TTL_NS) {
+        bpf_dbg_printk("[GoodByeDPI] Expiring stale conn state (age_ns=%llu)\n", now - state->timestamp);
+        bpf_map_delete_elem(&conn_map, key);
+        state = NULL;
+    }
+
     if (!state) {
         struct conn_state new_state;
         /* Zero all fields including reserved padding */
@@ -938,13 +948,16 @@ static __always_inline int process_tcp(struct __sk_buff *skb, struct config *cfg
         new_state.stage = STAGE_INIT;
         new_state.last_seq = bpf_ntohl(tcp->seq);
         new_state.last_ack = bpf_ntohl(tcp->ack_seq);
-        new_state.timestamp = bpf_ktime_get_ns();
+        new_state.timestamp = now;
         /* flags and reserved are already zeroed by memset */
         bpf_map_update_elem(&conn_map, key, &new_state, BPF_ANY);
         state = bpf_map_lookup_elem(&conn_map, key);
         if (!state)
             return TC_ACT_OK;
     }
+
+    /* Keep state hot for LRU and TTL logic */
+    state->timestamp = now;
 
     /* Apply DPI bypass techniques based on stage */
     
@@ -1145,8 +1158,14 @@ static __always_inline int process_tcp(struct __sk_buff *skb, struct config *cfg
     }
 
     /* Technique 5: TLS Record Split - Split TLS record at SNI boundary */
-    /* This splits the TLS record itself (not TCP), making DPI see incomplete Client Hello */
-    if (cfg->tlsrec_pos >= 0 && is_tls && state->stage == STAGE_INIT) {
+    /* This splits the TLS record itself (not TCP), making DPI see incomplete Client Hello.
+     * tlsrec_pos semantics:
+     *   -1: disabled (userspace sentinel)
+     *    0: split at SNI start
+     *   >0: split after SNI start
+     *   <-1: split before SNI end
+     */
+    if (cfg->tlsrec_pos != -1 && is_tls && state->stage == STAGE_INIT) {
         __u32 sni_off = 0;
         __u32 sni_len = 0;
         
@@ -1501,35 +1520,48 @@ int dpi_ingress(struct __sk_buff *skb)
     if (!state)
         return TC_ACT_OK;
 
+    __u64 now = bpf_ktime_get_ns();
+    if (now > state->timestamp && (now - state->timestamp) > CONN_STATE_TTL_NS) {
+        bpf_map_delete_elem(&conn_map, &key);
+        return TC_ACT_OK;
+    }
+    state->timestamp = now;
+
     /* Detect RST packets for auto-retry logic */
-    if (tcp->rst && cfg->auto_rst) {
-        bpf_dbg_printk("[GoodByeDPI] INGRESS: RST detected! sport=%u dport=%u\n",
-                       bpf_ntohs(tcp->source), bpf_ntohs(tcp->dest));
-        struct event *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
-        if (e) {
-            e->type = EVENT_RST_DETECTED;
-            /* Copy IP addresses - full IPv6 support */
-            e->src_ip[0] = key.src_ip[0];
-            e->src_ip[1] = key.src_ip[1];
-            e->src_ip[2] = key.src_ip[2];
-            e->src_ip[3] = key.src_ip[3];
-            e->dst_ip[0] = key.dst_ip[0];
-            e->dst_ip[1] = key.dst_ip[1];
-            e->dst_ip[2] = key.dst_ip[2];
-            e->dst_ip[3] = key.dst_ip[3];
-            e->src_port = key.src_port;
-            e->dst_port = key.dst_port;
-            e->seq = bpf_ntohl(tcp->seq);
-            e->ack = bpf_ntohl(tcp->ack_seq);
-            e->flags = TCP_FLAG_RST;
-            e->payload_len = 0;  /* RST packets typically have no payload */
-            e->is_ipv6 = key.is_ipv6;
-            e->sni_offset = 0;
-            e->sni_length = 0;
-            e->reserved = 0;
-            /* RST packets have no payload, no need to initialize payload buffer */
-            bpf_ringbuf_submit(e, 0);
+    if (tcp->rst) {
+        if (cfg->auto_rst) {
+            bpf_dbg_printk("[GoodByeDPI] INGRESS: RST detected! sport=%u dport=%u\n",
+                           bpf_ntohs(tcp->source), bpf_ntohs(tcp->dest));
+            struct event *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
+            if (e) {
+                e->type = EVENT_RST_DETECTED;
+                /* Copy IP addresses - full IPv6 support */
+                e->src_ip[0] = key.src_ip[0];
+                e->src_ip[1] = key.src_ip[1];
+                e->src_ip[2] = key.src_ip[2];
+                e->src_ip[3] = key.src_ip[3];
+                e->dst_ip[0] = key.dst_ip[0];
+                e->dst_ip[1] = key.dst_ip[1];
+                e->dst_ip[2] = key.dst_ip[2];
+                e->dst_ip[3] = key.dst_ip[3];
+                e->src_port = key.src_port;
+                e->dst_port = key.dst_port;
+                e->seq = bpf_ntohl(tcp->seq);
+                e->ack = bpf_ntohl(tcp->ack_seq);
+                e->flags = TCP_FLAG_RST;
+                e->payload_len = 0;  /* RST packets typically have no payload */
+                e->is_ipv6 = key.is_ipv6;
+                e->sni_offset = 0;
+                e->sni_length = 0;
+                e->reserved = 0;
+                /* RST packets have no payload, no need to initialize payload buffer */
+                bpf_ringbuf_submit(e, 0);
+            }
         }
+
+        /* RST closes flow: remove connection state immediately */
+        bpf_map_delete_elem(&conn_map, &key);
+        return TC_ACT_OK;
     }
 
     /* Detect HTTP Redirect (302/301) for auto-logic */
