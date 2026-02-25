@@ -169,12 +169,24 @@ struct {
 } events SEC(".maps");
 
 /* SNI cache for quick lookups */
+struct sni_cache_entry {
+    __u64 timestamp_ns;
+    __u8 state;
+    __u8 pad[7];
+};
+
 struct {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);
     __uint(max_entries, 1024);
     __type(key, __u32);  /* dst_ip */
-    __type(value, __u8); /* has_sni */
+    __type(value, struct sni_cache_entry);
 } sni_cache SEC(".maps");
+
+/* SNI cache states */
+#define SNI_CACHE_NO_SNI   0
+#define SNI_CACHE_HAS_SNI  1
+/* Cache TTL: entries older than this are revalidated by parsing TLS ClientHello again */
+#define SNI_CACHE_TTL_NS (300ULL * 1000000000ULL)  /* 300 seconds */
 
 /* Statistics counters */
 struct stats {
@@ -687,7 +699,10 @@ static __always_inline int is_quic_initial_skb(struct __sk_buff *skb, __u32 payl
  *   - name_length (2 bytes)
  *   - name (variable)
  *
- * Returns: offset from payload start to SNI hostname, or negative on error
+ * Returns:
+ *   0  - success (SNI found, sni_offset/sni_length set)
+ *  -1  - parse error / malformed / incomplete ClientHello
+ *  -2  - valid ClientHello, but SNI extension not found
  */
 static __always_inline int parse_tls_client_hello_sni_skb(struct __sk_buff *skb, __u32 payload_offset, 
                                                            __u32 payload_len,
@@ -858,7 +873,7 @@ static __always_inline int parse_tls_client_hello_sni_skb(struct __sk_buff *skb,
         offset += 4 + ext_len;
     }
     
-    return -1;  /* SNI not found */
+    return -2;  /* Valid ClientHello but SNI not found */
 }
 
 /* Helper function to find SNI offset - skb version 
@@ -1168,9 +1183,41 @@ static __always_inline int process_tcp(struct __sk_buff *skb, struct config *cfg
     if (cfg->tlsrec_pos != -1 && is_tls && state->stage == STAGE_INIT) {
         __u32 sni_off = 0;
         __u32 sni_len = 0;
+        int parse_ret = -1;
+        struct sni_cache_entry *cached_sni = NULL;
+        __u32 cache_key = 0;
+        
+        /* SNI cache is IPv4-only for now (key = dst IPv4) */
+        if (!is_ipv6 && ip) {
+            cache_key = ip->daddr;
+            cached_sni = bpf_map_lookup_elem(&sni_cache, &cache_key);
+            if (cached_sni) {
+                if (now > cached_sni->timestamp_ns && (now - cached_sni->timestamp_ns) > SNI_CACHE_TTL_NS) {
+                    bpf_map_delete_elem(&sni_cache, &cache_key);
+                    cached_sni = NULL;
+                } else {
+                    /* Refresh cache entry liveness */
+                    cached_sni->timestamp_ns = now;
+                    if (cached_sni->state == SNI_CACHE_NO_SNI) {
+                        bpf_dbg_printk("[GoodByeDPI] TLSREC skip: SNI cache says no SNI for dst=%x\n",
+                                       bpf_ntohl(cache_key));
+                        goto tlsrec_done;
+                    }
+                }
+            }
+        }
         
         /* Parse TLS Client Hello to find SNI using skb */
-        if (parse_tls_client_hello_sni_skb(skb, payload_offset, payload_len, &sni_off, &sni_len) == 0) {
+        parse_ret = parse_tls_client_hello_sni_skb(skb, payload_offset, payload_len, &sni_off, &sni_len);
+        if (parse_ret == 0) {
+            if (!is_ipv6 && ip) {
+                struct sni_cache_entry has_sni = {
+                    .timestamp_ns = now,
+                    .state = SNI_CACHE_HAS_SNI,
+                    .pad = {0},
+                };
+                bpf_map_update_elem(&sni_cache, &cache_key, &has_sni, BPF_ANY);
+            }
             /* Calculate split position based on config:
              * - tlsrec_pos = 0: split at SNI start
              * - tlsrec_pos > 0: split at SNI start + tlsrec_pos (inside SNI)
@@ -1229,8 +1276,19 @@ static __always_inline int process_tcp(struct __sk_buff *skb, struct config *cfg
                                    split_at, sni_off, sni_len);
                 }
             }
+        } else if (parse_ret == -2) {
+            /* Cache negative result only for valid ClientHello without SNI */
+            if (!is_ipv6 && ip) {
+                struct sni_cache_entry has_sni = {
+                    .timestamp_ns = now,
+                    .state = SNI_CACHE_NO_SNI,
+                    .pad = {0},
+                };
+                bpf_map_update_elem(&sni_cache, &cache_key, &has_sni, BPF_ANY);
+            }
         }
     }
+tlsrec_done:
 
     /* Update state in map */
     bpf_map_update_elem(&conn_map, key, state, BPF_EXIST);

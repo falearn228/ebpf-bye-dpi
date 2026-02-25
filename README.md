@@ -63,8 +63,24 @@
 sudo apt-get install -y clang llvm libbpf-dev linux-headers-$(uname -r) \
     bpftool libelf-dev zlib1g-dev make
 
+# Установка зависимостей (Arch Linux)
+sudo pacman -Syu --needed clang llvm libbpf linux-headers bpftool libelf zlib make
+
 # Сборка проекта
 cargo build --release
+```
+
+### Быстрая установка через скрипт
+
+```bash
+# Из корня репозитория:
+./scripts/install.sh
+
+# Если зависимости уже установлены:
+./scripts/install.sh --no-deps
+
+# Запуск daemon сразу после установки:
+./scripts/install.sh --run --iface eth0 --config "s1 -o1 -Ar" --debug
 ```
 
 ## Использование
