@@ -44,9 +44,7 @@
 | `-g8`    | `--frag 8`        | ✅ Ready   | QUIC/UDP IP fragmentation via raw socket          |
 | `-g16`   | `--frag 16`       | ✅ Ready   | QUIC/UDP IP fragmentation via raw socket          |
 
-**Legend:**
-- ✅ Ready - Полностью реализовано
-- ⚠️ Partial - Detection работает, injection требует доработки
+
 
 ## Требования
 
@@ -198,8 +196,7 @@ injector.inject_fake_packet(
 
 ## Документация разработчика
 
-- `docs/DEVELOPMENT.md` — практический runbook: сборка, запуск, диагностика, откат.
-- `docs/INTERVIEW.md` — короткая версия для собеседований: архитектура, trade-offs, демо-план и 60-second pitch.
+- `docs/DEVELOPMENT.md` — практический runbook: сборка, запуск, диагностика, откат, планы.
 
 ## Диагностика и устранение неполадок
 
@@ -241,6 +238,8 @@ sudo tc filter show dev eth0 ingress
 
 # Мониторинг событий BPF
 sudo cat /sys/kernel/debug/tracing/trace_pipe
+или
+sudo cat /sys/kernel/tracing/trace_pipe
 
 # Проверить pinned maps
 ls -la /sys/fs/bpf/goodbyedpi/
@@ -255,30 +254,14 @@ ls -la /sys/fs/bpf/goodbyedpi/
 
 ## Безопасность
 
-- Код требует root-привилегий для загрузки eBPF программ
+- Код требует **root** привилегий для загрузки eBPF программ
 - Используются capabilities: CAP_BPF, CAP_NET_ADMIN, CAP_NET_RAW
 - В systemd service включены hardening опции
-- eBPF программы используют verifier для безопасности
+- eBPF программы используют свой verifier для безопасности
+
+## Проблемы
+- Бывает не запускается демон на WSL2 (Ubuntu) из-за особенностей WSL-вского ядра
 
 ## Лицензия
 
 GPL-2.0
-
-## Split packets 
-┌─────────────┐     ┌─────────────┐     ┌─────────────┐
-│  Приложение │────▶│   eBPF TC   │────▶│  Userspace  │
-│  (браузер)  │     │  (egress)   │     │   daemon    │
-└─────────────┘     └─────────────┘     └─────────────┘
-       │                   │                   │
-       │  TCP пакет        │                   │
-       │  (HTTP/TLS)       │                   │
-       ├──────────────────▶│                   │
-       │                   │                   │
-       │                   │ DROP (TC_ACT_SHOT)│
-       │                   │──── событие ─────▶│
-       │                   │  SPLIT_TRIGGERED  │
-       │                   │                   │
-       │                   │   ┌───────────────┤
-       │                   │   │ Пакет 1       │ (байты 0..split_pos)
-       │                   │   │ Пакет 2       │ (байты split_pos..end)
-       │                   │   └───────────────┤
