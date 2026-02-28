@@ -1,7 +1,7 @@
 use anyhow::{anyhow, Context, Result};
 use goodbyedpi_proto::Config as ProtoConfig;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DpiConfig {
     pub split_pos: Option<usize>,
     pub oob_positions: Vec<usize>,

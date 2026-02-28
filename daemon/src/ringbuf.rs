@@ -94,11 +94,11 @@ impl EventProcessor {
             );
 
             let mut cfg = config.write().await;
+            let cfg_before = cfg.clone();
             self.process_event(&event, &mut cfg).await;
 
-            // Check if config was modified by auto-logic and update BPF
-            if self.config_update_tx.is_some() {
-                // Always update BPF config after processing events that might change strategy
+            // Update BPF only when auto-logic actually changed configuration
+            if self.config_update_tx.is_some() && *cfg != cfg_before {
                 if let Err(e) = self.update_bpf_config(&cfg) {
                     warn!("[AUTO] Failed to update BPF config: {}", e);
                 }
