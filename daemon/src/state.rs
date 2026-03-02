@@ -1,14 +1,13 @@
 use goodbyedpi_proto::{ConnKey, ConnState};
-use std::collections::HashMap;
+use dashmap::DashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::RwLock;
 
 use crate::auto_logic::AutoLogic;
 
 /// Connection state manager with optional auto-logic
 pub struct ConnectionState {
-    states: Arc<RwLock<HashMap<ConnKey, (ConnState, Instant)>>>,
+    states: Arc<DashMap<ConnKey, (ConnState, Instant)>>,
     ttl: Duration,
     /// Auto-logic state machine (optional)
     auto_logic: Option<AutoLogic>,
@@ -17,7 +16,7 @@ pub struct ConnectionState {
 impl ConnectionState {
     pub fn new() -> Self {
         Self {
-            states: Arc::new(RwLock::new(HashMap::new())),
+            states: Arc::new(DashMap::new()),
             ttl: Duration::from_secs(60),
             auto_logic: None,
         }
@@ -26,7 +25,7 @@ impl ConnectionState {
     /// Create with auto-logic enabled
     pub fn with_auto_logic(auto_logic: AutoLogic) -> Self {
         Self {
-            states: Arc::new(RwLock::new(HashMap::new())),
+            states: Arc::new(DashMap::new()),
             ttl: Duration::from_secs(60),
             auto_logic: Some(auto_logic),
         }
@@ -39,20 +38,18 @@ impl ConnectionState {
 
     #[allow(dead_code)]
     pub async fn get(&self, key: &ConnKey) -> Option<ConnState> {
-        let states = self.states.read().await;
-        states.get(key).map(|(s, _)| *s)
+        self.states.get(key).map(|entry| entry.value().0)
     }
 
     #[allow(dead_code)]
     pub async fn insert(&self, key: ConnKey, state: ConnState) {
-        let mut states = self.states.write().await;
-        states.insert(key, (state, Instant::now()));
+        self.states.insert(key, (state, Instant::now()));
     }
 
     #[allow(dead_code)]
     pub async fn update(&self, key: &ConnKey, f: impl FnOnce(&mut ConnState)) -> bool {
-        let mut states = self.states.write().await;
-        if let Some((state, ts)) = states.get_mut(key) {
+        if let Some(mut entry) = self.states.get_mut(key) {
+            let (state, ts) = entry.value_mut();
             f(state);
             *ts = Instant::now();
             true
@@ -64,17 +61,14 @@ impl ConnectionState {
     /// Cleanup expired connections and auto-logic states
     pub async fn cleanup(&self) -> usize {
         // Cleanup basic states
-        let mut states = self.states.write().await;
-        let now = Instant::now();
-        let before = states.len();
-        states.retain(|_, (_, ts)| now.duration_since(*ts) < self.ttl);
-        let removed = before - states.len();
-        drop(states);
+        let before = self.states.len();
+        self.states.retain(|_, (_, ts)| ts.elapsed() < self.ttl);
+        let removed = before - self.states.len();
 
         // Cleanup auto-logic states if enabled
         if let Some(ref auto_logic) = self.auto_logic {
             let auto_removed = auto_logic.cleanup().await;
-            return removed + auto_removed as usize;
+            return removed + auto_removed;
         }
 
         removed

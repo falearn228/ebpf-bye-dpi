@@ -16,11 +16,10 @@
 //! ```
 
 use goodbyedpi_proto::{AutoLogicState, ConnKey, strategy_types};
-use std::collections::HashMap;
+use dashmap::DashMap;
 use std::net::Ipv4Addr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::RwLock;
 use log::{debug, info};
 
 /// Strategy configuration for a connection
@@ -267,7 +266,7 @@ impl From<&Strategy> for ConfigRecommendations {
 /// Auto-logic state machine manager
 pub struct AutoLogic {
     /// Per-connection states
-    states: Arc<RwLock<HashMap<ConnKey, AutoConnectionState>>>,
+    states: Arc<DashMap<ConnKey, AutoConnectionState>>,
     /// Time-to-live for connection states
     ttl: Duration,
     /// Whether auto-logic is enabled for RST
@@ -282,7 +281,7 @@ impl AutoLogic {
     /// Create new auto-logic manager
     pub fn new(enabled_rst: bool, enabled_redirect: bool, enabled_ssl: bool) -> Self {
         Self {
-            states: Arc::new(RwLock::new(HashMap::new())),
+            states: Arc::new(DashMap::new()),
             ttl: Duration::from_secs(60),
             enabled_rst,
             enabled_redirect,
@@ -292,17 +291,14 @@ impl AutoLogic {
 
     /// Get or create connection state
     pub async fn get_or_create(&self, key: &ConnKey) -> AutoConnectionState {
-        let mut states = self.states.write().await;
-        
-        states.entry(*key)
+        self.states.entry(*key)
             .or_insert_with(AutoConnectionState::new)
             .clone()
     }
 
     /// Get connection state if exists
     pub async fn get(&self, key: &ConnKey) -> Option<AutoConnectionState> {
-        let states = self.states.read().await;
-        states.get(key).cloned()
+        self.states.get(key).map(|state| state.clone())
     }
 
     /// Handle RST event for a connection
@@ -312,8 +308,8 @@ impl AutoLogic {
             return None;
         }
 
-        let mut states = self.states.write().await;
-        let state = states.entry(*key).or_insert_with(AutoConnectionState::new);
+        let entry = self.states.entry(*key);
+        let mut state = entry.or_insert_with(AutoConnectionState::new);
         
         debug!(
             "[AUTO-RST] {}:{} -> {}:{}",
@@ -331,8 +327,8 @@ impl AutoLogic {
             return None;
         }
 
-        let mut states = self.states.write().await;
-        let state = states.entry(*key).or_insert_with(AutoConnectionState::new);
+        let entry = self.states.entry(*key);
+        let mut state = entry.or_insert_with(AutoConnectionState::new);
         
         debug!(
             "[AUTO-REDIRECT] {}:{} -> {}:{}",
@@ -350,8 +346,8 @@ impl AutoLogic {
             return None;
         }
 
-        let mut states = self.states.write().await;
-        let state = states.entry(*key).or_insert_with(AutoConnectionState::new);
+        let entry = self.states.entry(*key);
+        let mut state = entry.or_insert_with(AutoConnectionState::new);
         
         debug!(
             "[AUTO-SSL] {}:{} -> {}:{}",
@@ -364,8 +360,7 @@ impl AutoLogic {
 
     /// Mark connection as successful
     pub async fn mark_success(&self, key: &ConnKey) {
-        let mut states = self.states.write().await;
-        if let Some(state) = states.get_mut(key) {
+        if let Some(mut state) = self.states.get_mut(key) {
             state.mark_success();
             debug!("[AUTO] Connection {:?} marked as successful", key);
         }
@@ -373,16 +368,14 @@ impl AutoLogic {
 
     /// Remove connection state
     pub async fn remove(&self, key: &ConnKey) {
-        let mut states = self.states.write().await;
-        states.remove(key);
+        self.states.remove(key);
     }
 
     /// Cleanup expired connections
     pub async fn cleanup(&self) -> usize {
-        let mut states = self.states.write().await;
-        let before = states.len();
-        states.retain(|_, state| !state.is_expired(self.ttl));
-        let removed = before - states.len();
+        let before = self.states.len();
+        self.states.retain(|_, state| !state.is_expired(self.ttl));
+        let removed = before - self.states.len();
         
         if removed > 0 {
             debug!("[AUTO] Cleaned up {} expired connection states", removed);
@@ -393,12 +386,12 @@ impl AutoLogic {
 
     /// Get statistics
     pub async fn get_stats(&self) -> AutoLogicStats {
-        let states = self.states.read().await;
-        let total = states.len() as u32;
+        let total = self.states.len() as u32;
         
-        let (rst_total, redirect_total, ssl_total, success_total) = states.values().fold(
+        let (rst_total, redirect_total, ssl_total, success_total) = self.states.iter().fold(
             (0u32, 0u32, 0u32, 0u32),
-            |(rst, redirect, ssl, success), state| {
+            |(rst, redirect, ssl, success), entry| {
+                let state = entry.value();
                 (
                     rst + state.rst_count,
                     redirect + state.redirect_count,
