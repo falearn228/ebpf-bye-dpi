@@ -469,24 +469,3 @@ fn run_ring_buffer_poll(
     info!("Ring buffer polling stopped, total polls: {}", poll_count);
     Ok(())
 }
-
-/// Legacy BpfSkel for compatibility
-pub struct BpfSkel {
-    #[allow(dead_code)]
-    manager: BpfManager,
-}
-
-impl BpfSkel {
-    pub async fn cleanup_connections(&mut self) -> Result<()> {
-        self.manager.cleanup_connections().await
-    }
-}
-
-/// Legacy load function
-pub async fn load_and_attach(
-    interface: &str,
-    config: Arc<RwLock<DpiConfig>>,
-) -> Result<BpfSkel> {
-    let manager = BpfManager::load_and_attach(interface, config).await?;
-    Ok(BpfSkel { manager })
-}
