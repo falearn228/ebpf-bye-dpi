@@ -1,7 +1,28 @@
 use anyhow::{anyhow, Context, Result};
+use goodbyedpi_proto::Event;
 use goodbyedpi_proto::{
     Config as ProtoConfig, PortRange, Rule as RuleConfig, RuleAction, RuleProtocol,
 };
+use std::fmt;
+
+use crate::rules::{parse_hostlist, parse_ipset, target_lists_allow_event, HostPattern, IpNetwork};
+
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct FakeProfiles {
+    pub quic: Option<Vec<u8>>,
+    pub discord: Option<Vec<u8>>,
+    pub stun: Option<Vec<u8>>,
+}
+
+impl fmt::Debug for FakeProfiles {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FakeProfiles")
+            .field("quic_len", &self.quic.as_ref().map(Vec::len))
+            .field("discord_len", &self.discord.as_ref().map(Vec::len))
+            .field("stun_len", &self.stun.as_ref().map(Vec::len))
+            .finish()
+    }
+}
 
 #[derive(Debug, Clone, Default)]
 struct RuleDraft {
@@ -26,6 +47,11 @@ pub struct DpiConfig {
     pub bpf_printk: bool,   /* Enable bpf_printk debug logs */
     pub filter_tcp: Vec<PortRange>,
     pub filter_udp: Vec<PortRange>,
+    pub hostlist: Vec<HostPattern>,
+    pub hostlist_exclude: Vec<HostPattern>,
+    pub ipset: Vec<IpNetwork>,
+    pub ipset_exclude: Vec<IpNetwork>,
+    pub fake_profiles: FakeProfiles,
     pub rules: Vec<RuleConfig>,
 }
 
@@ -45,6 +71,11 @@ impl DpiConfig {
             bpf_printk: false,
             filter_tcp: Vec::new(),
             filter_udp: Vec::new(),
+            hostlist: Vec::new(),
+            hostlist_exclude: Vec::new(),
+            ipset: Vec::new(),
+            ipset_exclude: Vec::new(),
+            fake_profiles: FakeProfiles::default(),
             rules: Vec::new(),
         };
 
@@ -132,6 +163,18 @@ impl DpiConfig {
     pub fn udp_port_allowed(&self, port: u16) -> bool {
         port_allowed(&self.filter_udp, port)
     }
+
+    /// Returns true when host/ip list targeting allows this event.
+    /// If all include-lists are empty, event is allowed by default.
+    pub fn target_allowed(&self, event: &Event) -> bool {
+        target_lists_allow_event(
+            event,
+            &self.hostlist,
+            &self.hostlist_exclude,
+            &self.ipset,
+            &self.ipset_exclude,
+        )
+    }
 }
 
 fn port_allowed(ranges: &[PortRange], port: u16) -> bool {
@@ -159,7 +202,61 @@ where
         config.filter_udp = parse_ports(&value)?;
         return Ok(Some(true));
     }
+    if let Some(value) = parse_long_option_value("--hostlist", token, tokens) {
+        let value = value?;
+        config.hostlist = parse_hostlist(&value)?;
+        return Ok(Some(true));
+    }
+    if let Some(value) = parse_long_option_value("--hostlist-exclude", token, tokens) {
+        let value = value?;
+        config.hostlist_exclude = parse_hostlist(&value)?;
+        return Ok(Some(true));
+    }
+    if let Some(value) = parse_long_option_value("--ipset", token, tokens) {
+        let value = value?;
+        config.ipset = parse_ipset(&value)?;
+        return Ok(Some(true));
+    }
+    if let Some(value) = parse_long_option_value("--ipset-exclude", token, tokens) {
+        let value = value?;
+        config.ipset_exclude = parse_ipset(&value)?;
+        return Ok(Some(true));
+    }
+    if let Some(value) = parse_long_option_value("--fake-quic", token, tokens) {
+        let value = value?;
+        config.fake_profiles.quic = Some(load_fake_payload(&value)?);
+        return Ok(Some(true));
+    }
+    if let Some(value) = parse_long_option_value("--fake-discord", token, tokens) {
+        let value = value?;
+        config.fake_profiles.discord = Some(load_fake_payload(&value)?);
+        return Ok(Some(true));
+    }
+    if let Some(value) = parse_long_option_value("--fake-stun", token, tokens) {
+        let value = value?;
+        config.fake_profiles.stun = Some(load_fake_payload(&value)?);
+        return Ok(Some(true));
+    }
     Ok(None)
+}
+
+fn load_fake_payload(path: &str) -> Result<Vec<u8>> {
+    const MAX_FAKE_PROFILE_SIZE: usize = 64 * 1024;
+
+    let bytes = std::fs::read(path)
+        .with_context(|| format!("Failed to read fake payload file '{}'", path))?;
+    if bytes.is_empty() {
+        return Err(anyhow!("Fake payload file '{}' is empty", path));
+    }
+    if bytes.len() > MAX_FAKE_PROFILE_SIZE {
+        return Err(anyhow!(
+            "Fake payload file '{}' is too large: {} bytes (max {})",
+            path,
+            bytes.len(),
+            MAX_FAKE_PROFILE_SIZE
+        ));
+    }
+    Ok(bytes)
 }
 
 fn parse_legacy_token(token: &str, config: &mut DpiConfig) -> Result<()> {
@@ -270,8 +367,8 @@ fn parse_legacy_token(token: &str, config: &mut DpiConfig) -> Result<()> {
         _ => {
             return Err(anyhow!(
                 "Unknown option '{}' in token '{}'. \
-                 Valid options: s (split), o (oob), f (fake), r (tlsrec), g (fragment), d (disorder), -A (auto), --new/--proto/--ports/--action/--repeats. \
-                 Example: 's1 -o1 -Ar -f-1 -r1+s -g8 -d --new --proto=tcp --ports=443 --action=split --repeats=2'",
+                 Valid options: s (split), o (oob), f (fake), r (tlsrec), g (fragment), d (disorder), -A (auto), --new/--proto/--ports/--action/--repeats, --filter-tcp/--filter-udp, --hostlist/--hostlist-exclude, --ipset/--ipset-exclude, --fake-quic/--fake-discord/--fake-stun. \
+                 Example: 's1 -o1 -Ar -f-1 -r1+s -g8 -d --filter-tcp=443 --hostlist=googlevideo.com --fake-quic=/path/fake.bin --new --proto=tcp --ports=443 --action=split --repeats=2'",
                 prefix, token
             ))
         }
@@ -617,6 +714,11 @@ mod tests {
         assert_eq!(cloned.bpf_printk, cfg.bpf_printk);
         assert_eq!(cloned.filter_tcp, cfg.filter_tcp);
         assert_eq!(cloned.filter_udp, cfg.filter_udp);
+        assert_eq!(cloned.hostlist, cfg.hostlist);
+        assert_eq!(cloned.hostlist_exclude, cfg.hostlist_exclude);
+        assert_eq!(cloned.ipset, cfg.ipset);
+        assert_eq!(cloned.ipset_exclude, cfg.ipset_exclude);
+        assert_eq!(cloned.fake_profiles, cfg.fake_profiles);
         assert_eq!(cloned.rules, cfg.rules);
     }
 
@@ -794,5 +896,79 @@ mod tests {
 
         assert!(cfg.udp_port_allowed(53));
         assert!(!cfg.udp_port_allowed(443));
+    }
+
+    #[test]
+    fn test_parse_hostlist_and_ipset() {
+        let cfg = DpiConfig::parse(
+            "--hostlist=googlevideo.com,*.youtube.com --hostlist-exclude=blocked.youtube.com \
+             --ipset=1.1.1.1,10.0.0.0/8 --ipset-exclude=10.10.10.10,2001:db8::/32",
+        )
+        .unwrap();
+        assert_eq!(cfg.hostlist.len(), 2);
+        assert_eq!(cfg.hostlist_exclude.len(), 1);
+        assert_eq!(cfg.ipset.len(), 2);
+        assert_eq!(cfg.ipset_exclude.len(), 2);
+    }
+
+    #[test]
+    fn test_target_allow_semantics_from_lists() {
+        let cfg = DpiConfig::parse("--hostlist=example.com --ipset=10.0.0.0/8").unwrap();
+
+        let mut event = Event::default();
+        event.payload_len = 100;
+        event.sni_offset = 10;
+        event.sni_length = 11;
+        event.payload[10..21].copy_from_slice(b"example.com");
+        event.dst_ip[0] = u32::from(std::net::Ipv4Addr::new(192, 0, 2, 10)).to_be();
+
+        assert!(cfg.target_allowed(&event));
+
+        let mut cfg_ex = cfg.clone();
+        cfg_ex.hostlist_exclude = parse_hostlist("example.com").unwrap();
+        assert!(!cfg_ex.target_allowed(&event));
+    }
+
+    #[test]
+    fn test_parse_fake_profiles_from_files() {
+        let tmp = std::env::temp_dir();
+        let pid = std::process::id();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+
+        let quic_path = tmp.join(format!("gdb-fake-quic-{pid}-{nanos}.bin"));
+        let discord_path = tmp.join(format!("gdb-fake-discord-{pid}-{nanos}.bin"));
+        let stun_path = tmp.join(format!("gdb-fake-stun-{pid}-{nanos}.bin"));
+
+        std::fs::write(&quic_path, [0xc3, 0xff, 0x00, 0x01]).unwrap();
+        std::fs::write(&discord_path, b"discord-fake").unwrap();
+        std::fs::write(&stun_path, [0x00, 0x01, 0x00, 0x20]).unwrap();
+
+        let cfg = DpiConfig::parse(&format!(
+            "--fake-quic={} --fake-discord={} --fake-stun={}",
+            quic_path.display(),
+            discord_path.display(),
+            stun_path.display()
+        ))
+        .unwrap();
+
+        assert_eq!(
+            cfg.fake_profiles.quic.as_deref(),
+            Some(&[0xc3, 0xff, 0x00, 0x01][..])
+        );
+        assert_eq!(
+            cfg.fake_profiles.discord.as_deref(),
+            Some(&b"discord-fake"[..])
+        );
+        assert_eq!(
+            cfg.fake_profiles.stun.as_deref(),
+            Some(&[0x00, 0x01, 0x00, 0x20][..])
+        );
+
+        let _ = std::fs::remove_file(quic_path);
+        let _ = std::fs::remove_file(discord_path);
+        let _ = std::fs::remove_file(stun_path);
     }
 }

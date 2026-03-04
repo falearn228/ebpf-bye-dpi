@@ -9,8 +9,10 @@ mod auto_logic;
 mod bpf;
 mod config;
 mod injector;
+mod l7;
 mod metrics;
 mod ringbuf;
+mod rules;
 mod state;
 mod tc;
 

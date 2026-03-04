@@ -12,6 +12,8 @@ use tokio::sync::RwLock;
 use crate::auto_logic::{AutoLogic, ConfigRecommendations, Strategy};
 use crate::config::DpiConfig;
 use crate::injector::RawInjector;
+use crate::l7::{detect_l7, L7Protocol};
+use crate::rules::extract_target_host;
 use goodbyedpi_proto::{event_types, ConnKey, Event, RuleAction, MAX_PAYLOAD_SIZE};
 
 // Special flags from eBPF
@@ -169,6 +171,19 @@ impl EventProcessor {
         allowed
     }
 
+    /// Check host/ip targeting lists before injection.
+    fn target_filter_allows(&self, config: &DpiConfig, event: &Event, action: RuleAction) -> bool {
+        let allowed = config.target_allowed(event);
+        if !allowed {
+            let host = extract_target_host(event).unwrap_or_else(|| "<none>".to_string());
+            debug!(
+                "[FILTER] Skip action {:?} for host='{}' dst_port={} (host/ip targeting mismatch)",
+                action, host, event.dst_port
+            );
+        }
+        allowed
+    }
+
     /// Process a single event
     async fn process_event(&self, event: &Event, config: &mut DpiConfig) {
         let (src_ip, dst_ip) = event.format_ips();
@@ -232,6 +247,9 @@ impl EventProcessor {
         dst_ip: &str,
     ) {
         if !self.port_filter_allows(config, event, RuleAction::Split) {
+            return;
+        }
+        if !self.target_filter_allows(config, event, RuleAction::Split) {
             return;
         }
 
@@ -397,6 +415,9 @@ impl EventProcessor {
                 // Inject fake packet if fake_offset is configured
                 if config.fake_offset.is_some() {
                     if !self.port_filter_allows(config, event, RuleAction::Fake) {
+                        return;
+                    }
+                    if !self.target_filter_allows(config, event, RuleAction::Fake) {
                         return;
                     }
                     let repeats = self.repeats_for_action(config, event, RuleAction::Fake);
@@ -639,6 +660,9 @@ impl EventProcessor {
         // If the strategy uses fake and we have a fake_offset, inject a fake packet
         if recs.use_fake && recs.fake_offset.is_some() {
             if self.port_filter_allows(config, event, RuleAction::Fake) {
+                if !self.target_filter_allows(config, event, RuleAction::Fake) {
+                    return;
+                }
                 let repeats = self.repeats_for_action(config, event, RuleAction::Fake);
                 for attempt in 1..=repeats {
                     if let Err(e) = self.inject_fake_packet(event, config).await {
@@ -679,6 +703,9 @@ impl EventProcessor {
         dst_ip: &str,
     ) {
         if !self.port_filter_allows(config, event, RuleAction::Disorder) {
+            return;
+        }
+        if !self.target_filter_allows(config, event, RuleAction::Disorder) {
             return;
         }
 
@@ -801,6 +828,9 @@ impl EventProcessor {
         if !self.port_filter_allows(config, event, RuleAction::Oob) {
             return;
         }
+        if !self.target_filter_allows(config, event, RuleAction::Oob) {
+            return;
+        }
 
         // Get payload from event
         let payload_len = event.payload_len as usize;
@@ -902,6 +932,9 @@ impl EventProcessor {
         if !self.port_filter_allows(config, event, RuleAction::Frag) {
             return;
         }
+        if !self.target_filter_allows(config, event, RuleAction::Frag) {
+            return;
+        }
 
         info!(
             "[QUIC FRAG] Fragmentation triggered for {}:{} -> {}:{}, payload_len={}",
@@ -996,6 +1029,9 @@ impl EventProcessor {
         dst_ip: &str,
     ) {
         if !self.port_filter_allows(config, event, RuleAction::Tlsrec) {
+            return;
+        }
+        if !self.target_filter_allows(config, event, RuleAction::Tlsrec) {
             return;
         }
 
@@ -1134,22 +1170,37 @@ impl EventProcessor {
 
         // Get payload from event (clamped to MAX_PAYLOAD_SIZE for safety)
         let payload_len = (event.payload_len as usize).min(MAX_PAYLOAD_SIZE);
-        let payload = if payload_len > 0 {
+        let event_payload = if payload_len > 0 {
             &event.payload[..payload_len]
         } else {
             // Default fake payload for HTTP
-            b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n"
+            b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n" as &[u8]
+        };
+        let detected_l7 = detect_l7(event_payload);
+        let (payload, profile_name): (&[u8], Option<&str>) =
+            if let Some(profile) = self.select_fake_profile_payload(config, event, detected_l7) {
+                profile
+            } else {
+                (event_payload, None)
+            };
+
+        let l7_name = match detected_l7 {
+            L7Protocol::Unknown => "unknown",
+            L7Protocol::Stun => "stun",
+            L7Protocol::Discord => "discord",
         };
 
         info!(
-            "[FAKE] Injecting fake packet: {}:{} -> {}:{}, seq={}, offset={}, payload_len={}",
+            "[FAKE] Injecting fake packet: {}:{} -> {}:{}, seq={}, offset={}, payload_len={}, l7={}, profile={}",
             src_ip,
             event.src_port,
             dst_ip,
             event.dst_port,
             event.seq,
             fake_offset,
-            payload.len()
+            payload.len(),
+            l7_name,
+            profile_name.unwrap_or("event/default")
         );
 
         // Use the new inject_fake_with_offset method
@@ -1183,6 +1234,45 @@ impl EventProcessor {
 
         info!("[FAKE] Fake packet injected successfully");
         Ok(())
+    }
+
+    fn select_fake_profile_payload<'a>(
+        &self,
+        config: &'a DpiConfig,
+        event: &Event,
+        detected_l7: L7Protocol,
+    ) -> Option<(&'a [u8], Option<&'static str>)> {
+        match detected_l7 {
+            L7Protocol::Stun => {
+                if let Some(payload) = config.fake_profiles.stun.as_ref() {
+                    return Some((payload.as_slice(), Some("fake-stun")));
+                }
+            }
+            L7Protocol::Discord => {
+                if let Some(payload) = config.fake_profiles.discord.as_ref() {
+                    return Some((payload.as_slice(), Some("fake-discord")));
+                }
+            }
+            L7Protocol::Unknown => {}
+        }
+
+        // Keep host-based fallback for Discord HTTPS/API flows where payload
+        // signature is not enough at this stage.
+        if let Some(host) = extract_target_host(event) {
+            if host.contains("discord") {
+                if let Some(payload) = config.fake_profiles.discord.as_ref() {
+                    return Some((payload.as_slice(), Some("fake-discord")));
+                }
+            }
+        }
+
+        if event.dst_port == 443 {
+            if let Some(payload) = config.fake_profiles.quic.as_ref() {
+                return Some((payload.as_slice(), Some("fake-quic")));
+            }
+        }
+
+        None
     }
 
     /// Get auto-logic reference
@@ -1597,5 +1687,24 @@ mod tests {
         let split_pos = 10;
         let second_seq = seq_host.wrapping_add(split_pos as u32);
         assert_eq!(second_seq, 1010);
+    }
+
+    #[test]
+    fn test_looks_like_stun_positive() {
+        let mut payload = [0u8; 20];
+        payload[0] = 0x00;
+        payload[1] = 0x01;
+        payload[4..8].copy_from_slice(&[0x21, 0x12, 0xA4, 0x42]);
+        assert!(crate::l7::looks_like_stun(&payload));
+    }
+
+    #[test]
+    fn test_looks_like_stun_negative() {
+        let payload = [0u8; 10];
+        assert!(!crate::l7::looks_like_stun(&payload));
+
+        let mut payload2 = [0u8; 20];
+        payload2[4..8].copy_from_slice(&[0x00, 0x00, 0x00, 0x00]);
+        assert!(!crate::l7::looks_like_stun(&payload2));
     }
 }

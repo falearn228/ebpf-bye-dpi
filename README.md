@@ -110,6 +110,15 @@ sudo ./target/release/goodbyedpi-daemon -i eth0 -c "s1 -o1 -g8 -Ar -At -As"
 # Ограничить инъекции только нужными портами (Stage 2: Port filters)
 sudo ./target/release/goodbyedpi-daemon -i eth0 -c "s1 -o1 -g8 --filter-tcp=443,2053 --filter-udp=443,1024-65535"
 
+# Таргетинг по host/ip спискам (Stage 3: Host/IP lists)
+sudo ./target/release/goodbyedpi-daemon -i eth0 -c "s1 -o1 --hostlist=googlevideo.com,*.youtube.com --hostlist-exclude=music.youtube.com --ipset=142.250.0.0/15 --ipset-exclude=142.250.10.10"
+
+# Fake profiles из файлов (Stage 4: Repeats + fake profiles)
+sudo ./target/release/goodbyedpi-daemon -i eth0 -c "s1 -f-1 --fake-quic=/etc/goodbyedpi/fake-quic.bin --fake-discord=/etc/goodbyedpi/fake-discord.bin --fake-stun=/etc/goodbyedpi/fake-stun.bin --new --action=fake --ports=443 --repeats=3"
+
+# Stage 5: L7 filters (минимум) включены автоматически
+# Детектируются сигнатуры STUN/Discord по первым байтам payload для выбора fake-профиля.
+
 # Экспорт метрик Prometheus (по умолчанию http://127.0.0.1:9877/metrics)
 sudo ./target/release/goodbyedpi-daemon -i eth0 -c "s1 -o1" --metrics-bind 0.0.0.0:9877
 
