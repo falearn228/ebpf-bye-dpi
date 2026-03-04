@@ -5,7 +5,6 @@
 
 use anyhow::{Context, Result};
 use log::{debug, info, warn};
-use std::net::Ipv4Addr;
 use std::sync::Arc;
 use tokio::sync::mpsc::Receiver;
 use tokio::sync::RwLock;
@@ -13,7 +12,7 @@ use tokio::sync::RwLock;
 use crate::auto_logic::{AutoLogic, ConfigRecommendations, Strategy};
 use crate::config::DpiConfig;
 use crate::injector::RawInjector;
-use goodbyedpi_proto::{event_types, ConnKey, Event, MAX_PAYLOAD_SIZE};
+use goodbyedpi_proto::{event_types, ConnKey, Event, RuleAction, MAX_PAYLOAD_SIZE};
 
 // Special flags from eBPF
 const FLAG_DISORDER: u8 = 0xFE;
@@ -140,6 +139,36 @@ impl EventProcessor {
         }
     }
 
+    /// Resolve repeats from rule engine for specific action and event
+    fn repeats_for_action(&self, config: &DpiConfig, event: &Event, action: RuleAction) -> u8 {
+        let proto = action.default_protocol();
+
+        let repeats = config
+            .rules
+            .iter()
+            .find(|rule| rule.matches(proto, event.dst_port, action))
+            .map(|rule| rule.repeats)
+            .unwrap_or(1);
+
+        repeats.max(1)
+    }
+
+    /// Check global port filter (`--filter-tcp/--filter-udp`) before injection.
+    fn port_filter_allows(&self, config: &DpiConfig, event: &Event, action: RuleAction) -> bool {
+        let allowed = match action.default_protocol() {
+            goodbyedpi_proto::RuleProtocol::Tcp => config.tcp_port_allowed(event.dst_port),
+            goodbyedpi_proto::RuleProtocol::Udp => config.udp_port_allowed(event.dst_port),
+        };
+
+        if !allowed {
+            debug!(
+                "[FILTER] Skip action {:?} for dst_port {} (filtered)",
+                action, event.dst_port
+            );
+        }
+        allowed
+    }
+
     /// Process a single event
     async fn process_event(&self, event: &Event, config: &mut DpiConfig) {
         let (src_ip, dst_ip) = event.format_ips();
@@ -153,6 +182,9 @@ impl EventProcessor {
             event_types::SPLIT_TRIGGERED => {
                 self.handle_split_triggered(event, config, &src_ip, &dst_ip)
                     .await;
+            }
+            event_types::TLSREC_TRIGGERED => {
+                self.handle_tls_split(event, config, &src_ip, &dst_ip).await;
             }
             event_types::FAKE_TRIGGERED => {
                 self.handle_fake_triggered(event, config, &src_ip, &dst_ip)
@@ -179,7 +211,8 @@ impl EventProcessor {
                     .await;
             }
             event_types::OOB_TRIGGERED => {
-                self.handle_oob_triggered(event, &src_ip, &dst_ip).await;
+                self.handle_oob_triggered(event, config, &src_ip, &dst_ip)
+                    .await;
             }
             _ => {
                 debug!("Unknown event type: {}", event.event_type);
@@ -198,19 +231,14 @@ impl EventProcessor {
         src_ip: &str,
         dst_ip: &str,
     ) {
+        if !self.port_filter_allows(config, event, RuleAction::Split) {
+            return;
+        }
+
         info!(
             "[SPLIT] handle_split_triggered called for {}:{} -> {}:{}, event_type={}",
             src_ip, event.src_port, dst_ip, event.dst_port, event.event_type
         );
-
-        // Only IPv4 supported for now
-        if event.is_ipv6 != 0 {
-            warn!(
-                "[SPLIT] IPv6 split not yet implemented for {}:{} -> {}:{}",
-                src_ip, event.src_port, dst_ip, event.dst_port
-            );
-            return;
-        }
 
         // Get split position from config (or from event.reserved field)
         let split_pos = match config.split_pos {
@@ -251,41 +279,60 @@ impl EventProcessor {
             event.seq, split_pos, payload_len, payload_preview
         );
 
-        // Get IP addresses
-        let src_ipv4 = event.src_ip_v4();
-        let dst_ipv4 = event.dst_ip_v4();
-
         // Extract actual payload (already clamped to MAX_PAYLOAD_SIZE)
         let payload = &event.payload[..payload_len];
+        let repeats = self.repeats_for_action(config, event, RuleAction::Split);
+        for attempt in 1..=repeats {
+            let (first_result, second_result) = if event.is_ipv6 != 0 {
+                self.injector.inject_split_packets_v6(
+                    event.src_ip_v6(),
+                    event.dst_ip_v6(),
+                    event.src_port,
+                    event.dst_port,
+                    event.seq,
+                    event.ack,
+                    event.flags,
+                    payload,
+                    split_pos,
+                )
+            } else {
+                self.injector.inject_split_packets(
+                    event.src_ip_v4(),
+                    event.dst_ip_v4(),
+                    event.src_port,
+                    event.dst_port,
+                    event.seq,
+                    event.ack,
+                    event.flags,
+                    payload,
+                    split_pos,
+                )
+            };
 
-        // Inject split packets
-        let (first_result, second_result) = self.injector.inject_split_packets(
-            src_ipv4,
-            dst_ipv4,
-            event.src_port,
-            event.dst_port,
-            event.seq,
-            event.ack,
-            event.flags,
-            payload,
-            split_pos,
-        );
+            // Log results
+            match first_result {
+                Ok(_) => info!(
+                    "[SPLIT] First packet sent successfully ({} bytes), attempt {}/{}",
+                    split_pos, attempt, repeats
+                ),
+                Err(e) => warn!(
+                    "[SPLIT] Failed to send first packet on attempt {}/{}: {}",
+                    attempt, repeats, e
+                ),
+            }
 
-        // Log results
-        match first_result {
-            Ok(_) => info!(
-                "[SPLIT] First packet sent successfully ({} bytes)",
-                split_pos
-            ),
-            Err(e) => warn!("[SPLIT] Failed to send first packet: {}", e),
-        }
-
-        match second_result {
-            Ok(_) => info!(
-                "[SPLIT] Second packet sent successfully ({} bytes)",
-                payload_len - split_pos
-            ),
-            Err(e) => warn!("[SPLIT] Failed to send second packet: {}", e),
+            match second_result {
+                Ok(_) => info!(
+                    "[SPLIT] Second packet sent successfully ({} bytes), attempt {}/{}",
+                    payload_len - split_pos,
+                    attempt,
+                    repeats
+                ),
+                Err(e) => warn!(
+                    "[SPLIT] Failed to send second packet on attempt {}/{}: {}",
+                    attempt, repeats, e
+                ),
+            }
         }
     }
 
@@ -349,8 +396,17 @@ impl EventProcessor {
 
                 // Inject fake packet if fake_offset is configured
                 if config.fake_offset.is_some() {
-                    if let Err(e) = self.inject_fake_packet(event, config).await {
-                        warn!("Failed to inject fake packet: {}", e);
+                    if !self.port_filter_allows(config, event, RuleAction::Fake) {
+                        return;
+                    }
+                    let repeats = self.repeats_for_action(config, event, RuleAction::Fake);
+                    for attempt in 1..=repeats {
+                        if let Err(e) = self.inject_fake_packet(event, config).await {
+                            warn!(
+                                "[FAKE] Failed to inject fake packet on attempt {}/{}: {}",
+                                attempt, repeats, e
+                            );
+                        }
                     }
                 }
             }
@@ -384,6 +440,10 @@ impl EventProcessor {
 
         // Use auto-logic if available
         if let Some(ref auto_logic) = self.auto_logic {
+            if event.is_ipv6 != 0 {
+                info!("[AUTO-RST] IPv6 flow detected, auto-logic currently applies only to IPv4");
+                return;
+            }
             let key = self.build_conn_key(event);
             let src_ip = event.src_ip_v4();
             let dst_ip = event.dst_ip_v4();
@@ -428,6 +488,12 @@ impl EventProcessor {
 
         // Use auto-logic if available
         if let Some(ref auto_logic) = self.auto_logic {
+            if event.is_ipv6 != 0 {
+                info!(
+                    "[AUTO-REDIRECT] IPv6 flow detected, auto-logic currently applies only to IPv4"
+                );
+                return;
+            }
             let key = self.build_conn_key(event);
             let src_ip = event.src_ip_v4();
             let dst_ip = event.dst_ip_v4();
@@ -476,6 +542,10 @@ impl EventProcessor {
 
         // Use auto-logic if available
         if let Some(ref auto_logic) = self.auto_logic {
+            if event.is_ipv6 != 0 {
+                info!("[AUTO-SSL] IPv6 flow detected, auto-logic currently applies only to IPv4");
+                return;
+            }
             let key = self.build_conn_key(event);
             let src_ip = event.src_ip_v4();
             let dst_ip = event.dst_ip_v4();
@@ -568,8 +638,16 @@ impl EventProcessor {
 
         // If the strategy uses fake and we have a fake_offset, inject a fake packet
         if recs.use_fake && recs.fake_offset.is_some() {
-            if let Err(e) = self.inject_fake_packet(event, config).await {
-                warn!("[AUTO] Failed to inject fake packet for strategy: {}", e);
+            if self.port_filter_allows(config, event, RuleAction::Fake) {
+                let repeats = self.repeats_for_action(config, event, RuleAction::Fake);
+                for attempt in 1..=repeats {
+                    if let Err(e) = self.inject_fake_packet(event, config).await {
+                        warn!(
+                            "[AUTO] Failed to inject fake packet for strategy on attempt {}/{}: {}",
+                            attempt, repeats, e
+                        );
+                    }
+                }
             }
         }
 
@@ -600,12 +678,7 @@ impl EventProcessor {
         src_ip: &str,
         dst_ip: &str,
     ) {
-        // Only IPv4 supported for now
-        if event.is_ipv6 != 0 {
-            warn!(
-                "[DISORDER] IPv6 disorder not yet implemented for {}:{} -> {}:{}",
-                src_ip, event.src_port, dst_ip, event.dst_port
-            );
+        if !self.port_filter_allows(config, event, RuleAction::Disorder) {
             return;
         }
 
@@ -655,35 +728,58 @@ impl EventProcessor {
             event.seq, split_pos, payload_len, payload_preview
         );
 
-        // Get IP addresses
-        let src_ipv4 = event.src_ip_v4();
-        let dst_ipv4 = event.dst_ip_v4();
-
         // Extract actual payload
         let payload = &event.payload[..payload_len];
+        let repeats = self.repeats_for_action(config, event, RuleAction::Disorder);
+        for attempt in 1..=repeats {
+            let (second_result, first_result) = if event.is_ipv6 != 0 {
+                self.injector.inject_disorder_packets_v6(
+                    event.src_ip_v6(),
+                    event.dst_ip_v6(),
+                    event.src_port,
+                    event.dst_port,
+                    event.seq,
+                    event.ack,
+                    event.flags,
+                    payload,
+                    split_pos,
+                )
+            } else {
+                self.injector.inject_disorder_packets(
+                    event.src_ip_v4(),
+                    event.dst_ip_v4(),
+                    event.src_port,
+                    event.dst_port,
+                    event.seq,
+                    event.ack,
+                    event.flags,
+                    payload,
+                    split_pos,
+                )
+            };
 
-        // Inject packets in disorder (second part first, then first part)
-        let (second_result, first_result) = self.injector.inject_disorder_packets(
-            src_ipv4,
-            dst_ipv4,
-            event.src_port,
-            event.dst_port,
-            event.seq,
-            event.ack,
-            event.flags,
-            payload,
-            split_pos,
-        );
+            // Log results
+            match second_result {
+                Ok(_) => info!(
+                    "[DISORDER] Out-of-order packet (second part) sent successfully, attempt {}/{}",
+                    attempt, repeats
+                ),
+                Err(e) => warn!(
+                    "[DISORDER] Failed to send out-of-order packet on attempt {}/{}: {}",
+                    attempt, repeats, e
+                ),
+            }
 
-        // Log results
-        match second_result {
-            Ok(_) => info!("[DISORDER] Out-of-order packet (second part) sent successfully"),
-            Err(e) => warn!("[DISORDER] Failed to send out-of-order packet: {}", e),
-        }
-
-        match first_result {
-            Ok(_) => info!("[DISORDER] In-order packet (first part) sent successfully"),
-            Err(e) => warn!("[DISORDER] Failed to send in-order packet: {}", e),
+            match first_result {
+                Ok(_) => info!(
+                    "[DISORDER] In-order packet (first part) sent successfully, attempt {}/{}",
+                    attempt, repeats
+                ),
+                Err(e) => warn!(
+                    "[DISORDER] Failed to send in-order packet on attempt {}/{}: {}",
+                    attempt, repeats, e
+                ),
+            }
         }
     }
 
@@ -695,13 +791,14 @@ impl EventProcessor {
     /// Event fields used:
     /// - `reserved` - contains the OOB position (urgent pointer value)
     /// - `flags` - contains original TCP flags plus URG flag
-    async fn handle_oob_triggered(&self, event: &Event, src_ip: &str, dst_ip: &str) {
-        // Only IPv4 supported for now
-        if event.is_ipv6 != 0 {
-            warn!(
-                "[OOB] IPv6 OOB not yet implemented for {}:{} -> {}:{}",
-                src_ip, event.src_port, dst_ip, event.dst_port
-            );
+    async fn handle_oob_triggered(
+        &self,
+        event: &Event,
+        config: &DpiConfig,
+        src_ip: &str,
+        dst_ip: &str,
+    ) {
+        if !self.port_filter_allows(config, event, RuleAction::Oob) {
             return;
         }
 
@@ -743,33 +840,49 @@ impl EventProcessor {
             event.seq, oob_pos, payload_len, payload_preview
         );
 
-        // Get IP addresses
-        let src_ipv4 = event.src_ip_v4();
-        let dst_ipv4 = event.dst_ip_v4();
-
         // Extract actual payload (up to payload_len bytes, limited by MAX_PAYLOAD_SIZE)
         let actual_len = payload_len.min(MAX_PAYLOAD_SIZE);
         let payload = &event.payload[..actual_len];
 
-        // Inject OOB packet with URG flag
-        match self.injector.inject_oob_packet(
-            src_ipv4,
-            dst_ipv4,
-            event.src_port,
-            event.dst_port,
-            event.seq,
-            event.ack,
-            oob_pos,
-            payload,
-        ) {
-            Ok(_) => {
-                info!(
-                    "[OOB] OOB packet sent successfully with URG flag, urgent_ptr={}",
-                    oob_pos
-                );
-            }
-            Err(e) => {
-                warn!("[OOB] Failed to inject OOB packet: {}", e);
+        let repeats = self.repeats_for_action(config, event, RuleAction::Oob);
+        for attempt in 1..=repeats {
+            // Inject OOB packet with URG flag
+            let inject_result = if event.is_ipv6 != 0 {
+                self.injector.inject_oob_packet_v6(
+                    event.src_ip_v6(),
+                    event.dst_ip_v6(),
+                    event.src_port,
+                    event.dst_port,
+                    event.seq,
+                    event.ack,
+                    oob_pos,
+                    payload,
+                )
+            } else {
+                self.injector.inject_oob_packet(
+                    event.src_ip_v4(),
+                    event.dst_ip_v4(),
+                    event.src_port,
+                    event.dst_port,
+                    event.seq,
+                    event.ack,
+                    oob_pos,
+                    payload,
+                )
+            };
+            match inject_result {
+                Ok(_) => {
+                    info!(
+                        "[OOB] OOB packet sent successfully with URG flag, urgent_ptr={}, attempt {}/{}",
+                        oob_pos, attempt, repeats
+                    );
+                }
+                Err(e) => {
+                    warn!(
+                        "[OOB] Failed to inject OOB packet on attempt {}/{}: {}",
+                        attempt, repeats, e
+                    );
+                }
             }
         }
     }
@@ -786,19 +899,14 @@ impl EventProcessor {
         dst_ip: &str,
         config: &DpiConfig,
     ) {
+        if !self.port_filter_allows(config, event, RuleAction::Frag) {
+            return;
+        }
+
         info!(
             "[QUIC FRAG] Fragmentation triggered for {}:{} -> {}:{}, payload_len={}",
             src_ip, event.src_port, dst_ip, event.dst_port, event.payload_len
         );
-
-        // Only IPv4 supported for now
-        if event.is_ipv6 != 0 {
-            warn!(
-                "[QUIC FRAG] IPv6 fragmentation not yet implemented for {}:{} -> {}:{}",
-                src_ip, event.src_port, dst_ip, event.dst_port
-            );
-            return;
-        }
 
         // Get payload from event (clamped to MAX_PAYLOAD_SIZE for safety)
         let payload_len = (event.payload_len as usize).min(MAX_PAYLOAD_SIZE);
@@ -827,28 +935,44 @@ impl EventProcessor {
             payload_len, frag_size, payload_preview
         );
 
-        // Get IP addresses
-        let src_ipv4 = event.src_ip_v4();
-        let dst_ipv4 = event.dst_ip_v4();
-
         // Extract actual payload (up to payload_len bytes, limited by MAX_PAYLOAD_SIZE)
         let actual_len = payload_len.min(MAX_PAYLOAD_SIZE);
         let payload = &event.payload[..actual_len];
-
-        // Inject fragmented UDP packets
-        match self.injector.udp_injector().inject_fragmented_udp(
-            src_ipv4,
-            dst_ipv4,
-            event.src_port,
-            event.dst_port,
-            payload,
-            frag_size,
-        ) {
-            Ok(num_frags) => {
-                info!("[QUIC FRAG] Successfully sent {} fragments", num_frags);
-            }
-            Err(e) => {
-                warn!("[QUIC FRAG] Failed to inject fragmented UDP: {}", e);
+        let repeats = self.repeats_for_action(config, event, RuleAction::Frag);
+        for attempt in 1..=repeats {
+            // Inject fragmented UDP packets
+            let inject_result = if event.is_ipv6 != 0 {
+                self.injector.udp_injector().inject_fragmented_udp_v6(
+                    event.src_ip_v6(),
+                    event.dst_ip_v6(),
+                    event.src_port,
+                    event.dst_port,
+                    payload,
+                    frag_size,
+                )
+            } else {
+                self.injector.udp_injector().inject_fragmented_udp(
+                    event.src_ip_v4(),
+                    event.dst_ip_v4(),
+                    event.src_port,
+                    event.dst_port,
+                    payload,
+                    frag_size,
+                )
+            };
+            match inject_result {
+                Ok(num_frags) => {
+                    info!(
+                        "[QUIC FRAG] Successfully sent {} fragments, attempt {}/{}",
+                        num_frags, attempt, repeats
+                    );
+                }
+                Err(e) => {
+                    warn!(
+                        "[QUIC FRAG] Failed to inject fragmented UDP on attempt {}/{}: {}",
+                        attempt, repeats, e
+                    );
+                }
             }
         }
     }
@@ -867,16 +991,11 @@ impl EventProcessor {
     async fn handle_tls_split(
         &self,
         event: &Event,
-        _config: &DpiConfig,
+        config: &DpiConfig,
         src_ip: &str,
         dst_ip: &str,
     ) {
-        // Only IPv4 supported for now
-        if event.is_ipv6 != 0 {
-            warn!(
-                "[TLS SPLIT] IPv6 TLS split not yet implemented for {}:{} -> {}:{}",
-                src_ip, event.src_port, dst_ip, event.dst_port
-            );
+        if !self.port_filter_allows(config, event, RuleAction::Tlsrec) {
             return;
         }
 
@@ -949,59 +1068,69 @@ impl EventProcessor {
             event.seq, split_pos, payload_len, payload_preview, sni_info
         );
 
-        // Get IP addresses
-        let src_ipv4 = event.src_ip_v4();
-        let dst_ipv4 = event.dst_ip_v4();
-
         // Extract actual payload (up to payload_len bytes, limited by MAX_PAYLOAD_SIZE)
         let actual_len = payload_len.min(MAX_PAYLOAD_SIZE);
         let payload = &event.payload[..actual_len];
+        let repeats = self.repeats_for_action(config, event, RuleAction::Tlsrec);
+        for attempt in 1..=repeats {
+            let (first_result, second_result) = if event.is_ipv6 != 0 {
+                self.injector.inject_tls_split_packets_v6(
+                    event.src_ip_v6(),
+                    event.dst_ip_v6(),
+                    event.src_port,
+                    event.dst_port,
+                    event.seq,
+                    event.ack,
+                    event.flags,
+                    payload,
+                    split_pos,
+                )
+            } else {
+                self.injector.inject_tls_split_packets(
+                    event.src_ip_v4(),
+                    event.dst_ip_v4(),
+                    event.src_port,
+                    event.dst_port,
+                    event.seq,
+                    event.ack,
+                    event.flags,
+                    payload,
+                    split_pos,
+                )
+            };
 
-        // Inject TLS split packets
-        let (first_result, second_result) = self.injector.inject_tls_split_packets(
-            src_ipv4,
-            dst_ipv4,
-            event.src_port,
-            event.dst_port,
-            event.seq,
-            event.ack,
-            event.flags,
-            payload,
-            split_pos,
-        );
+            // Log results
+            match first_result {
+                Ok(_) => info!(
+                    "[TLS SPLIT] First TLS record sent successfully ({} bytes to split pos), attempt {}/{}",
+                    split_pos, attempt, repeats
+                ),
+                Err(e) => warn!(
+                    "[TLS SPLIT] Failed to send first TLS record on attempt {}/{}: {}",
+                    attempt, repeats, e
+                ),
+            }
 
-        // Log results
-        match first_result {
-            Ok(_) => info!(
-                "[TLS SPLIT] First TLS record sent successfully ({} bytes to split pos)",
-                split_pos
-            ),
-            Err(e) => warn!("[TLS SPLIT] Failed to send first TLS record: {}", e),
-        }
-
-        match second_result {
-            Ok(_) => info!(
-                "[TLS SPLIT] Second TLS record sent successfully ({} bytes remaining)",
-                actual_len - split_pos
-            ),
-            Err(e) => warn!("[TLS SPLIT] Failed to send second TLS record: {}", e),
+            match second_result {
+                Ok(_) => info!(
+                    "[TLS SPLIT] Second TLS record sent successfully ({} bytes remaining), attempt {}/{}",
+                    actual_len - split_pos,
+                    attempt,
+                    repeats
+                ),
+                Err(e) => warn!(
+                    "[TLS SPLIT] Failed to send second TLS record on attempt {}/{}: {}",
+                    attempt, repeats, e
+                ),
+            }
         }
     }
 
     /// Inject a fake packet using the new offset-based method
     async fn inject_fake_packet(&self, event: &Event, config: &DpiConfig) -> Result<()> {
-        // Only IPv4 supported for now
-        if event.is_ipv6 != 0 {
-            return Err(anyhow::anyhow!(
-                "IPv6 fake packet injection not yet supported"
-            ));
-        }
-
-        let src_ip = Ipv4Addr::from(u32::from_be(event.src_ip[0]));
-        let dst_ip = Ipv4Addr::from(u32::from_be(event.dst_ip[0]));
-
         // Convert isize to i32 for the injector method
         let fake_offset: i32 = config.fake_offset.unwrap_or(0) as i32;
+        let (src_ip, dst_ip) = event.format_ips();
 
         // Get payload from event (clamped to MAX_PAYLOAD_SIZE for safety)
         let payload_len = (event.payload_len as usize).min(MAX_PAYLOAD_SIZE);
@@ -1024,16 +1153,33 @@ impl EventProcessor {
         );
 
         // Use the new inject_fake_with_offset method
-        self.injector.inject_fake_with_offset(
-            src_ip,
-            dst_ip,
-            event.src_port,
-            event.dst_port,
-            event.seq,
-            event.ack,
-            fake_offset,
-            payload,
-        )?;
+        if event.is_ipv6 != 0 {
+            let src_ip = event.src_ip_v6();
+            let dst_ip = event.dst_ip_v6();
+            self.injector.inject_fake_with_offset_v6(
+                src_ip,
+                dst_ip,
+                event.src_port,
+                event.dst_port,
+                event.seq,
+                event.ack,
+                fake_offset,
+                payload,
+            )?;
+        } else {
+            let src_ip = event.src_ip_v4();
+            let dst_ip = event.dst_ip_v4();
+            self.injector.inject_fake_with_offset(
+                src_ip,
+                dst_ip,
+                event.src_port,
+                event.dst_port,
+                event.seq,
+                event.ack,
+                fake_offset,
+                payload,
+            )?;
+        }
 
         info!("[FAKE] Fake packet injected successfully");
         Ok(())

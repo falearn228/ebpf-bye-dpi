@@ -2,6 +2,8 @@
 
 Этот документ предназначен для разработки, отладки и безопасного выката изменений.
 
+См. также: `docs/STATE_MACHINE.md` (формальная спецификация переходов, таймаутов и критериев успеха/фейла).
+
 ## 1. Быстрый старт
 
 ```bash
@@ -51,6 +53,25 @@ sudo tc filter show dev eth0 ingress
 
 ```bash
 sudo cat /sys/kernel/debug/tracing/trace_pipe
+```
+
+Отдельная runtime-диагностика IPv6 QUIC fragmentation:
+
+```bash
+# Слушать IPv6 Fragment Header (NH=44) с UDP внутри fragment header
+sudo ./scripts/diag-ipv6-quic-frag.sh eth0 30
+```
+
+Скрипт считает количество увиденных IPv6 UDP fragments и выводит `PASS/FAIL`.
+
+Интеграционный runtime-тест в `ip netns` (event -> inject -> no-loop по mark):
+
+```bash
+# Запускает изолированный стенд: netns + veth + tc clsact + tcpdump
+sudo ./scripts/test-netns-integration.sh
+
+# Через cargo-обёртку (ignored test)
+sudo GBD_RUN_NETNS_TESTS=1 cargo test -p goodbyedpi-daemon --test netns_integration -- --ignored --nocapture
 ```
 
 Pinned maps:

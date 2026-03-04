@@ -37,7 +37,11 @@ async fn main() -> Result<()> {
     let args = Args::parse();
 
     env_logger::Builder::from_default_env()
-        .filter_level(if args.debug { log::LevelFilter::Debug } else { log::LevelFilter::Info })
+        .filter_level(if args.debug {
+            log::LevelFilter::Debug
+        } else {
+            log::LevelFilter::Info
+        })
         .init();
 
     if args.status {
@@ -68,12 +72,12 @@ async fn main() -> Result<()> {
 async fn run_single(interface: &str, config: &str) -> Result<()> {
     info!("Running single-shot mode on {}", interface);
     info!("Config: {}", config);
-    
+
     // Parse and validate config
     let _cfg = goodbyedpi_proto::Config::default();
-    
+
     info!("This would start the daemon in foreground mode");
-    
+
     Ok(())
 }
 

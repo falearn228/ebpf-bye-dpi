@@ -25,7 +25,7 @@
 ///     ip_fragment: 1,     // Enable IP fragmentation for QUIC
 ///     frag_size: 8,       // 8-byte fragments
 ///     disorder: false,    // Disable packet disorder
-///     _pad: [0; 1],       // Explicit padding, must be zeroed
+///     bpf_printk: false,  // bpf_printk disabled by default
 /// };
 /// ```
 #[repr(C)]
@@ -61,8 +61,8 @@ pub struct Config {
     pub frag_size: u16,
     /// Enable packet disorder technique (send packets out of order)
     pub disorder: bool,
-    /// Explicit padding - MUST be zeroed
-    pub _pad: [u8; 1],
+    /// Enable bpf_printk debug logs (writes into trace_pipe)
+    pub bpf_printk: bool,
 }
 
 impl Default for Config {
@@ -78,8 +78,101 @@ impl Default for Config {
             ip_fragment: 0,
             frag_size: 0,
             disorder: false,
-            _pad: [0; 1],
+            bpf_printk: false,
         }
+    }
+}
+
+/// L4 protocol selector for rule engine
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuleProtocol {
+    Tcp,
+    Udp,
+}
+
+impl RuleProtocol {
+    /// Parse protocol from CLI string (`tcp` or `udp`)
+    pub fn from_cli(value: &str) -> Option<Self> {
+        match value.to_ascii_lowercase().as_str() {
+            "tcp" => Some(Self::Tcp),
+            "udp" => Some(Self::Udp),
+            _ => None,
+        }
+    }
+}
+
+/// Action selector for rule engine
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuleAction {
+    Split,
+    Oob,
+    Fake,
+    Tlsrec,
+    Disorder,
+    Frag,
+}
+
+impl RuleAction {
+    /// Parse action from CLI string
+    pub fn from_cli(value: &str) -> Option<Self> {
+        match value.to_ascii_lowercase().as_str() {
+            "split" => Some(Self::Split),
+            "oob" => Some(Self::Oob),
+            "fake" => Some(Self::Fake),
+            "tlsrec" | "tls-split" => Some(Self::Tlsrec),
+            "disorder" => Some(Self::Disorder),
+            "frag" | "quic-frag" | "quic_frag" => Some(Self::Frag),
+            _ => None,
+        }
+    }
+
+    /// Default L4 protocol for action when rule protocol is omitted
+    pub fn default_protocol(self) -> RuleProtocol {
+        match self {
+            Self::Frag => RuleProtocol::Udp,
+            _ => RuleProtocol::Tcp,
+        }
+    }
+}
+
+/// Inclusive destination port range for rule matching
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PortRange {
+    pub start: u16,
+    pub end: u16,
+}
+
+impl PortRange {
+    pub fn new(start: u16, end: u16) -> Self {
+        Self { start, end }
+    }
+
+    pub fn contains(&self, port: u16) -> bool {
+        self.start <= port && port <= self.end
+    }
+}
+
+/// Rule engine item (zapret-like section)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Rule {
+    pub proto: RuleProtocol,
+    pub ports: Vec<PortRange>,
+    pub action: RuleAction,
+    pub repeats: u8,
+}
+
+impl Rule {
+    /// Match by protocol, destination port and action
+    pub fn matches(&self, proto: RuleProtocol, dst_port: u16, action: RuleAction) -> bool {
+        if self.proto != proto || self.action != action {
+            return false;
+        }
+
+        if self.ports.is_empty() {
+            return true;
+        }
+
+        self.ports.iter().any(|range| range.contains(dst_port))
     }
 }
 
@@ -292,47 +385,23 @@ impl Event {
 
     /// Get source IP as Ipv6Addr (only valid if is_ipv6 == 1)
     pub fn src_ip_v6(&self) -> std::net::Ipv6Addr {
-        let bytes: [u8; 16] = [
-            (self.src_ip[0] >> 24) as u8,
-            (self.src_ip[0] >> 16) as u8,
-            (self.src_ip[0] >> 8) as u8,
-            self.src_ip[0] as u8,
-            (self.src_ip[1] >> 24) as u8,
-            (self.src_ip[1] >> 16) as u8,
-            (self.src_ip[1] >> 8) as u8,
-            self.src_ip[1] as u8,
-            (self.src_ip[2] >> 24) as u8,
-            (self.src_ip[2] >> 16) as u8,
-            (self.src_ip[2] >> 8) as u8,
-            self.src_ip[2] as u8,
-            (self.src_ip[3] >> 24) as u8,
-            (self.src_ip[3] >> 16) as u8,
-            (self.src_ip[3] >> 8) as u8,
-            self.src_ip[3] as u8,
-        ];
+        // eBPF copies raw IPv6 bytes into src_ip[4] via memcpy. Preserve native
+        // in-memory byte layout of each u32 word to reconstruct original bytes.
+        let mut bytes = [0u8; 16];
+        for i in 0..4 {
+            let word = self.src_ip[i].to_ne_bytes();
+            bytes[i * 4..(i + 1) * 4].copy_from_slice(&word);
+        }
         std::net::Ipv6Addr::from(bytes)
     }
 
     /// Get destination IP as Ipv6Addr (only valid if is_ipv6 == 1)
     pub fn dst_ip_v6(&self) -> std::net::Ipv6Addr {
-        let bytes: [u8; 16] = [
-            (self.dst_ip[0] >> 24) as u8,
-            (self.dst_ip[0] >> 16) as u8,
-            (self.dst_ip[0] >> 8) as u8,
-            self.dst_ip[0] as u8,
-            (self.dst_ip[1] >> 24) as u8,
-            (self.dst_ip[1] >> 16) as u8,
-            (self.dst_ip[1] >> 8) as u8,
-            self.dst_ip[1] as u8,
-            (self.dst_ip[2] >> 24) as u8,
-            (self.dst_ip[2] >> 16) as u8,
-            (self.dst_ip[2] >> 8) as u8,
-            self.dst_ip[2] as u8,
-            (self.dst_ip[3] >> 24) as u8,
-            (self.dst_ip[3] >> 16) as u8,
-            (self.dst_ip[3] >> 8) as u8,
-            self.dst_ip[3] as u8,
-        ];
+        let mut bytes = [0u8; 16];
+        for i in 0..4 {
+            let word = self.dst_ip[i].to_ne_bytes();
+            bytes[i * 4..(i + 1) * 4].copy_from_slice(&word);
+        }
         std::net::Ipv6Addr::from(bytes)
     }
 
@@ -545,6 +614,7 @@ impl AutoLogicState {
 #[cfg(test)]
 mod size_tests {
     use super::*;
+    use std::net::Ipv6Addr;
 
     #[test]
     fn test_conn_key_size() {
@@ -595,5 +665,25 @@ mod size_tests {
             8,
             "ConnState must be 8-byte aligned (due to u64 timestamp)"
         );
+    }
+
+    #[test]
+    fn test_event_ipv6_conversion_roundtrip() {
+        let src = Ipv6Addr::new(0xfd00, 0x0001, 0, 0, 0, 0, 0, 1).octets();
+        let dst = Ipv6Addr::new(0xfd00, 0x0001, 0, 0, 0, 0, 0, 2).octets();
+
+        let mut event = Event::default();
+        event.is_ipv6 = 1;
+        for i in 0..4 {
+            event.src_ip[i] =
+                u32::from_ne_bytes([src[i * 4], src[i * 4 + 1], src[i * 4 + 2], src[i * 4 + 3]]);
+            event.dst_ip[i] =
+                u32::from_ne_bytes([dst[i * 4], dst[i * 4 + 1], dst[i * 4 + 2], dst[i * 4 + 3]]);
+        }
+
+        assert_eq!(event.src_ip_v6(), Ipv6Addr::from(src));
+        assert_eq!(event.dst_ip_v6(), Ipv6Addr::from(dst));
+        assert_eq!(event.format_ips().0, "[fd00:1::1]");
+        assert_eq!(event.format_ips().1, "[fd00:1::2]");
     }
 }

@@ -29,18 +29,8 @@
 #define TC_ACT_REDIRECT 7
 #endif
 
-/* Enable debug logging */
-#define DEBUG_LOG 1
-
-/* Helper for debug logging - uses newer bpf_printk API */
-#define bpf_dbg_printk(fmt, ...)                           \
-    ({                                                      \
-        if (DEBUG_LOG)                                      \
-            bpf_printk(fmt, ##__VA_ARGS__);                \
-    })
-
 /* Config structure shared with userspace
- * Total size: 24 bytes (22 data + 2 padding)
+ * Total size: 24 bytes
  */
 struct config {
     __s32 split_pos;
@@ -53,7 +43,7 @@ struct config {
     __u8 ip_fragment;      /* Enable IP fragmentation for QUIC/UDP */
     __u16 frag_size;       /* Fragment size (0 = default 8 bytes) */
     __u8 disorder;         /* Enable packet disorder technique */
-    __u8 pad[1];           /* Explicit padding, MUST be zeroed */
+    __u8 bpf_printk;       /* Enable bpf_printk debug logs */
 };
 
 /* Default fragment size for QUIC */
@@ -220,6 +210,14 @@ static __always_inline struct stats *get_stats(void)
     __u32 key = 0;
     return bpf_map_lookup_elem(&stats_map, &key);
 }
+
+/* Helper for debug logging (runtime toggle via config_map.bpf_printk) */
+#define bpf_dbg_printk(fmt, ...)                           \
+    ({                                                      \
+        struct config *cfg = get_config();                  \
+        if (cfg && cfg->bpf_printk)                         \
+            bpf_printk(fmt, ##__VA_ARGS__);                 \
+    })
 
 /* Helper to initialize conn_key - MUST be called before using key for map lookup
  * Ensures padding fields are zeroed to avoid garbage key mismatches

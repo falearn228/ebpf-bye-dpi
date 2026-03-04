@@ -15,7 +15,7 @@ fn main() {
 
     // Check if tools are available
     let make_check = Command::new("which").arg("make").output();
-    let has_make = make_check.is_ok_and(|o| o.status.success()); 
+    let has_make = make_check.is_ok_and(|o| o.status.success());
     let bpftool_check = Command::new("which").arg("bpftool").output();
     let has_bpftool = bpftool_check.is_ok_and(|o| o.status.success());
 
@@ -25,7 +25,7 @@ fn main() {
     // Compile eBPF using Makefile if available
     if src_file.exists() && has_make {
         println!("cargo:warning=Compiling eBPF using Makefile...");
-        
+
         let make_status = Command::new("make")
             .current_dir(&bpf_dir)
             .arg("goodbyedpi.bpf.o")
@@ -37,8 +37,10 @@ fn main() {
                 if bpf_obj_src.exists() {
                     match std::fs::copy(&bpf_obj_src, &bpf_obj_out) {
                         Ok(_) => {
-                            println!("cargo:warning=eBPF object compiled and copied to: {}", 
-                                     bpf_obj_out.display());
+                            println!(
+                                "cargo:warning=eBPF object compiled and copied to: {}",
+                                bpf_obj_out.display()
+                            );
                             obj_compiled = true;
                         }
                         Err(e) => {
@@ -46,8 +48,10 @@ fn main() {
                         }
                     }
                 } else {
-                    println!("cargo:warning=Compiled object not found at: {}", 
-                             bpf_obj_src.display());
+                    println!(
+                        "cargo:warning=Compiled object not found at: {}",
+                        bpf_obj_src.display()
+                    );
                 }
             }
             Ok(s) => {
@@ -60,21 +64,23 @@ fn main() {
     } else if !has_make {
         println!("cargo:warning=make not found");
     } else if !src_file.exists() {
-        println!("cargo:warning=eBPF source not found: {}", src_file.display());
+        println!(
+            "cargo:warning=eBPF source not found: {}",
+            src_file.display()
+        );
     }
 
     // Generate skeleton if bpftool is available
     if obj_compiled && has_bpftool {
         println!("cargo:warning=Generating BPF skeleton with bpftool...");
-        
+
         let skeleton = Command::new("bpftool")
             .args(["gen", "skeleton", bpf_obj_out.to_str().unwrap()])
             .output();
 
         match skeleton {
             Ok(out) if out.status.success() => {
-                std::fs::write(&skel_out, out.stdout)
-                    .expect("Failed to write skeleton");
+                std::fs::write(&skel_out, out.stdout).expect("Failed to write skeleton");
                 println!("cargo:warning=Successfully generated BPF skeleton");
             }
             Ok(out) => {

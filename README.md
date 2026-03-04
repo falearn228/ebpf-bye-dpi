@@ -101,9 +101,36 @@ sudo ./target/release/goodbyedpi-daemon -i eth0 -c "s1 -r-2 -Ar"
 # Режим отладки
 sudo ./target/release/goodbyedpi-daemon -i eth0 -c "s1 -o1" --debug
 
+# Включить eBPF trace_printk для диагностики (по умолчанию выключен)
+sudo ./target/release/goodbyedpi-daemon -i eth0 -c "s1 -o1" --bpf-printk
+
 # YouTube/QUIC режим (с IP фрагментацией)
 sudo ./target/release/goodbyedpi-daemon -i eth0 -c "s1 -o1 -g8 -Ar -At -As"
+
+# Ограничить инъекции только нужными портами (Stage 2: Port filters)
+sudo ./target/release/goodbyedpi-daemon -i eth0 -c "s1 -o1 -g8 --filter-tcp=443,2053 --filter-udp=443,1024-65535"
+
+# Экспорт метрик Prometheus (по умолчанию http://127.0.0.1:9877/metrics)
+sudo ./target/release/goodbyedpi-daemon -i eth0 -c "s1 -o1" --metrics-bind 0.0.0.0:9877
+
+# Отключить endpoint метрик
+sudo ./target/release/goodbyedpi-daemon -i eth0 -c "s1 -o1" --no-metrics
 ```
+
+### Метрики
+
+Демон экспортирует `/metrics` в формате Prometheus (text exposition):
+
+- `goodbyedpi_packets_total`
+- `goodbyedpi_packets_tcp`
+- `goodbyedpi_packets_udp`
+- `goodbyedpi_packets_tls`
+- `goodbyedpi_packets_quic`
+- `goodbyedpi_events_sent`
+- `goodbyedpi_errors`
+- `goodbyedpi_packets_ipv6`
+- `goodbyedpi_packets_http`
+- `goodbyedpi_packets_modified`
 
 ### CLI утилита
 
@@ -189,7 +216,8 @@ injector.inject_fake_packet(
 ├── proto/                   # Общие структуры
 │   └── src/lib.rs           # Config, Event, ConnKey, ConnState
 ├── docs/
-│   └── DEVELOPMENT.md       # Runbook для разработки и эксплуатации
+│   ├── DEVELOPMENT.md       # Runbook для разработки и эксплуатации
+│   └── STATE_MACHINE.md     # Формальная спецификация state machine
 └── systemd/                 # Файлы systemd
     └── goodbyedpi.service
 ```
@@ -197,6 +225,7 @@ injector.inject_fake_packet(
 ## Документация разработчика
 
 - `docs/DEVELOPMENT.md` — практический runbook: сборка, запуск, диагностика, откат, планы.
+- `docs/STATE_MACHINE.md` — спецификация state machine: переходы `STAGE_*`, `EVENT_*`, таймауты, success/fail semantics.
 
 ## Диагностика и устранение неполадок
 

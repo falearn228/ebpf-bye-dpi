@@ -25,10 +25,12 @@ fn cleanup_qdisc(interface: &str) -> Result<()> {
     let output = Command::new("tc")
         .args(["qdisc", "del", "dev", interface, "clsact"])
         .output()
-        .with_context(|| format!(
-            "Failed to execute 'tc qdisc del' for interface '{}'",
-            interface
-        ))?;
+        .with_context(|| {
+            format!(
+                "Failed to execute 'tc qdisc del' for interface '{}'",
+                interface
+            )
+        })?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);

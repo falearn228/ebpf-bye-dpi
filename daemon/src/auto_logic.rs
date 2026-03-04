@@ -15,12 +15,12 @@
 //! On SSL Error: Switch to TLS-focused strategies
 //! ```
 
-use goodbyedpi_proto::{AutoLogicState, ConnKey, strategy_types};
 use dashmap::DashMap;
+use goodbyedpi_proto::{strategy_types, AutoLogicState, ConnKey};
+use log::{debug, info};
 use std::net::Ipv4Addr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use log::{debug, info};
 
 /// Strategy configuration for a connection
 #[derive(Debug, Clone)]
@@ -32,7 +32,10 @@ pub enum Strategy {
     /// Out-of-order packet delivery
     Disorder,
     /// Fake packet combined with split
-    FakeWithSplit { split_pos: usize, fake_offset: isize },
+    FakeWithSplit {
+        split_pos: usize,
+        fake_offset: isize,
+    },
 }
 
 impl Strategy {
@@ -42,8 +45,14 @@ impl Strategy {
             Strategy::TcpSplit(pos) => format!("TCP split at position {}", pos),
             Strategy::TlsRecordSplit => "TLS record split".to_string(),
             Strategy::Disorder => "Out-of-order delivery".to_string(),
-            Strategy::FakeWithSplit { split_pos, fake_offset } => {
-                format!("Fake packet (offset={}) + split at {}", fake_offset, split_pos)
+            Strategy::FakeWithSplit {
+                split_pos,
+                fake_offset,
+            } => {
+                format!(
+                    "Fake packet (offset={}) + split at {}",
+                    fake_offset, split_pos
+                )
             }
         }
     }
@@ -71,7 +80,7 @@ impl Strategy {
 impl From<&AutoLogicState> for Strategy {
     fn from(state: &AutoLogicState) -> Self {
         let split_pos = state.get_split_position();
-        
+
         match state.strategy {
             strategy_types::TCP_SPLIT => Strategy::TcpSplit(split_pos),
             strategy_types::TLS_RECORD_SPLIT => Strategy::TlsRecordSplit,
@@ -111,7 +120,7 @@ impl AutoConnectionState {
     pub fn new() -> Self {
         let auto_state = AutoLogicState::new();
         let strategy = Strategy::from(&auto_state);
-        
+
         Self {
             auto_state,
             strategy,
@@ -133,18 +142,18 @@ impl AutoConnectionState {
     pub fn handle_rst(&mut self) -> &Strategy {
         self.rst_count += 1;
         self.last_activity = Instant::now();
-        
+
         let old_strategy = self.strategy.description();
         self.auto_state.next_strategy_on_rst();
         self.update_strategy();
-        
+
         info!(
             "[AUTO] RST #{}: switching strategy '{}' -> '{}'",
             self.rst_count,
             old_strategy,
             self.strategy.description()
         );
-        
+
         &self.strategy
     }
 
@@ -152,18 +161,18 @@ impl AutoConnectionState {
     pub fn handle_redirect(&mut self) -> &Strategy {
         self.redirect_count += 1;
         self.last_activity = Instant::now();
-        
+
         let old_strategy = self.strategy.description();
         self.auto_state.strengthen_on_redirect();
         self.update_strategy();
-        
+
         info!(
             "[AUTO] Redirect #{}: strengthening '{}' -> '{}'",
             self.redirect_count,
             old_strategy,
             self.strategy.description()
         );
-        
+
         &self.strategy
     }
 
@@ -171,14 +180,14 @@ impl AutoConnectionState {
     pub fn handle_ssl_error(&mut self) -> &Strategy {
         self.ssl_error_count += 1;
         self.last_activity = Instant::now();
-        
+
         // For SSL errors, prefer TLS record split
         if !matches!(self.strategy, Strategy::TlsRecordSplit) {
             let old_strategy = self.strategy.description();
             self.auto_state.strategy = strategy_types::TLS_RECORD_SPLIT;
             self.auto_state.attempts = 0;
             self.update_strategy();
-            
+
             info!(
                 "[AUTO] SSL error #{}: switching to TLS strategy '{}' -> '{}'",
                 self.ssl_error_count,
@@ -186,7 +195,7 @@ impl AutoConnectionState {
                 self.strategy.description()
             );
         }
-        
+
         &self.strategy
     }
 
@@ -252,7 +261,10 @@ impl From<&Strategy> for ConfigRecommendations {
                 use_tlsrec: false,
                 use_disorder: true,
             },
-            Strategy::FakeWithSplit { split_pos, fake_offset } => Self {
+            Strategy::FakeWithSplit {
+                split_pos,
+                fake_offset,
+            } => Self {
                 split_pos: Some(*split_pos),
                 use_fake: true,
                 fake_offset: Some(*fake_offset),
@@ -291,7 +303,8 @@ impl AutoLogic {
 
     /// Get or create connection state
     pub async fn get_or_create(&self, key: &ConnKey) -> AutoConnectionState {
-        self.states.entry(*key)
+        self.states
+            .entry(*key)
             .or_insert_with(AutoConnectionState::new)
             .clone()
     }
@@ -302,58 +315,76 @@ impl AutoLogic {
     }
 
     /// Handle RST event for a connection
-    pub async fn handle_rst(&self, key: &ConnKey, src_ip: Ipv4Addr, dst_ip: Ipv4Addr, 
-                           src_port: u16, dst_port: u16) -> Option<Strategy> {
+    pub async fn handle_rst(
+        &self,
+        key: &ConnKey,
+        src_ip: Ipv4Addr,
+        dst_ip: Ipv4Addr,
+        src_port: u16,
+        dst_port: u16,
+    ) -> Option<Strategy> {
         if !self.enabled_rst {
             return None;
         }
 
         let entry = self.states.entry(*key);
         let mut state = entry.or_insert_with(AutoConnectionState::new);
-        
+
         debug!(
             "[AUTO-RST] {}:{} -> {}:{}",
             src_ip, src_port, dst_ip, dst_port
         );
-        
+
         let strategy = state.handle_rst().clone();
         Some(strategy)
     }
 
     /// Handle Redirect event for a connection
-    pub async fn handle_redirect(&self, key: &ConnKey, src_ip: Ipv4Addr, dst_ip: Ipv4Addr,
-                                  src_port: u16, dst_port: u16) -> Option<Strategy> {
+    pub async fn handle_redirect(
+        &self,
+        key: &ConnKey,
+        src_ip: Ipv4Addr,
+        dst_ip: Ipv4Addr,
+        src_port: u16,
+        dst_port: u16,
+    ) -> Option<Strategy> {
         if !self.enabled_redirect {
             return None;
         }
 
         let entry = self.states.entry(*key);
         let mut state = entry.or_insert_with(AutoConnectionState::new);
-        
+
         debug!(
             "[AUTO-REDIRECT] {}:{} -> {}:{}",
             src_ip, src_port, dst_ip, dst_port
         );
-        
+
         let strategy = state.handle_redirect().clone();
         Some(strategy)
     }
 
     /// Handle SSL error event for a connection
-    pub async fn handle_ssl_error(&self, key: &ConnKey, src_ip: Ipv4Addr, dst_ip: Ipv4Addr,
-                                   src_port: u16, dst_port: u16) -> Option<Strategy> {
+    pub async fn handle_ssl_error(
+        &self,
+        key: &ConnKey,
+        src_ip: Ipv4Addr,
+        dst_ip: Ipv4Addr,
+        src_port: u16,
+        dst_port: u16,
+    ) -> Option<Strategy> {
         if !self.enabled_ssl {
             return None;
         }
 
         let entry = self.states.entry(*key);
         let mut state = entry.or_insert_with(AutoConnectionState::new);
-        
+
         debug!(
             "[AUTO-SSL] {}:{} -> {}:{}",
             src_ip, src_port, dst_ip, dst_port
         );
-        
+
         let strategy = state.handle_ssl_error().clone();
         Some(strategy)
     }
@@ -376,18 +407,18 @@ impl AutoLogic {
         let before = self.states.len();
         self.states.retain(|_, state| !state.is_expired(self.ttl));
         let removed = before - self.states.len();
-        
+
         if removed > 0 {
             debug!("[AUTO] Cleaned up {} expired connection states", removed);
         }
-        
+
         removed
     }
 
     /// Get statistics
     pub async fn get_stats(&self) -> AutoLogicStats {
         let total = self.states.len() as u32;
-        
+
         let (rst_total, redirect_total, ssl_total, success_total) = self.states.iter().fold(
             (0u32, 0u32, 0u32, 0u32),
             |(rst, redirect, ssl, success), entry| {
@@ -398,9 +429,9 @@ impl AutoLogic {
                     ssl + state.ssl_error_count,
                     success + if state.success { 1 } else { 0 },
                 )
-            }
+            },
         );
-        
+
         AutoLogicStats {
             total_connections: total,
             total_rst_events: rst_total,
@@ -457,21 +488,21 @@ mod tests {
     #[test]
     fn test_strategy_state_machine_rst() {
         let mut state = AutoConnectionState::new();
-        
+
         // Initial state should be TCP split
         assert!(matches!(state.strategy, Strategy::TcpSplit(_)));
-        
+
         // After 3 RSTs, should move to TLS
         state.handle_rst();
         state.handle_rst();
         state.handle_rst();
-        
+
         assert!(matches!(state.strategy, Strategy::TlsRecordSplit));
-        
+
         // After 1 more RST, should move to Disorder
         state.handle_rst();
         assert!(matches!(state.strategy, Strategy::Disorder));
-        
+
         // After 1 more RST, should cycle back to TCP split with new param
         state.handle_rst();
         assert!(matches!(state.strategy, Strategy::TcpSplit(_)));
@@ -480,10 +511,10 @@ mod tests {
     #[test]
     fn test_strategy_strengthen_on_redirect() {
         let mut state = AutoConnectionState::new();
-        
+
         // Initial state
         assert!(!state.strategy.uses_fake());
-        
+
         // After redirect, should enable fake
         state.handle_redirect();
         assert!(state.strategy.uses_fake());
@@ -493,11 +524,11 @@ mod tests {
     #[test]
     fn test_ssl_error_switch_to_tls() {
         let mut state = AutoConnectionState::new();
-        
+
         // Start with TCP split
         state.auto_state.strategy = strategy_types::TCP_SPLIT;
         state.update_strategy();
-        
+
         // After SSL error, should switch to TLS
         state.handle_ssl_error();
         assert!(matches!(state.strategy, Strategy::TlsRecordSplit));
@@ -507,13 +538,16 @@ mod tests {
     fn test_config_recommendations() {
         let strategy = Strategy::TcpSplit(5);
         let recs = ConfigRecommendations::from(&strategy);
-        
+
         assert_eq!(recs.split_pos, Some(5));
         assert!(!recs.use_fake);
-        
-        let strategy = Strategy::FakeWithSplit { split_pos: 2, fake_offset: -1 };
+
+        let strategy = Strategy::FakeWithSplit {
+            split_pos: 2,
+            fake_offset: -1,
+        };
         let recs = ConfigRecommendations::from(&strategy);
-        
+
         assert_eq!(recs.split_pos, Some(2));
         assert!(recs.use_fake);
         assert_eq!(recs.fake_offset, Some(-1));
@@ -522,7 +556,7 @@ mod tests {
     #[tokio::test]
     async fn test_auto_logic_manager() {
         let auto = AutoLogic::new(true, true, true);
-        
+
         let key = ConnKey {
             src_ip: [192, 168, 1, 1].map(u32::from_be),
             dst_ip: [10, 0, 0, 1].map(u32::from_be),
@@ -532,18 +566,20 @@ mod tests {
             proto: 6,
             _pad: [0; 2],
         };
-        
+
         // Test RST handling
-        let strategy = auto.handle_rst(
-            &key,
-            Ipv4Addr::new(192, 168, 1, 1),
-            Ipv4Addr::new(10, 0, 0, 1),
-            12345,
-            443,
-        ).await;
-        
+        let strategy = auto
+            .handle_rst(
+                &key,
+                Ipv4Addr::new(192, 168, 1, 1),
+                Ipv4Addr::new(10, 0, 0, 1),
+                12345,
+                443,
+            )
+            .await;
+
         assert!(strategy.is_some());
-        
+
         // Test stats
         let stats = auto.get_stats().await;
         assert_eq!(stats.total_connections, 1);

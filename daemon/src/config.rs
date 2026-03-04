@@ -1,5 +1,15 @@
 use anyhow::{anyhow, Context, Result};
-use goodbyedpi_proto::Config as ProtoConfig;
+use goodbyedpi_proto::{
+    Config as ProtoConfig, PortRange, Rule as RuleConfig, RuleAction, RuleProtocol,
+};
+
+#[derive(Debug, Clone, Default)]
+struct RuleDraft {
+    proto: Option<RuleProtocol>,
+    ports: Vec<PortRange>,
+    action: Option<RuleAction>,
+    repeats: Option<u8>,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DpiConfig {
@@ -13,6 +23,10 @@ pub struct DpiConfig {
     pub ip_fragment: bool,  /* Enable IP fragmentation for QUIC/UDP */
     pub frag_size: u16,     /* Fragment size (0 = default 8 bytes) */
     pub use_disorder: bool, /* Enable packet disorder technique */
+    pub bpf_printk: bool,   /* Enable bpf_printk debug logs */
+    pub filter_tcp: Vec<PortRange>,
+    pub filter_udp: Vec<PortRange>,
+    pub rules: Vec<RuleConfig>,
 }
 
 impl DpiConfig {
@@ -28,113 +42,45 @@ impl DpiConfig {
             ip_fragment: false,
             frag_size: 0,
             use_disorder: false,
+            bpf_printk: false,
+            filter_tcp: Vec::new(),
+            filter_udp: Vec::new(),
+            rules: Vec::new(),
         };
 
-        let tokens = s.split_whitespace();
+        let mut tokens = s.split_whitespace().peekable();
+        let mut current_rule: Option<RuleDraft> = None;
 
-        for token in tokens {
+        while let Some(token) = tokens.next() {
             if token.is_empty() {
                 continue;
             }
 
-            // Handle short form without dash (e.g., "s1", "o1")
-            let (prefix, rest) = if token.starts_with('-') {
-                (&token[..2], &token[2..])
-            } else {
-                (&token[..1], &token[1..])
-            };
-
-            match prefix {
-                "s" | "-s" => {
-                    let pos: usize = rest.parse()
-                        .with_context(|| format!(
-                            "Invalid split position in token '{}'. \
-                             Expected a positive number (e.g., 's1' or '-s10'), got '{}'.",
-                            token, rest
-                        ))?;
-                    config.split_pos = Some(pos);
+            if token == "--new" {
+                if let Some(draft) = current_rule.take() {
+                    config.rules.push(finalize_rule(draft)?);
                 }
-                "o" | "-o" => {
-                    let pos: usize = rest.parse()
-                        .with_context(|| format!(
-                            "Invalid OOB (Out-of-Band) position in token '{}'. \
-                             Expected a positive number (e.g., 'o1' or '-o5'), got '{}'.",
-                            token, rest
-                        ))?;
-                    config.oob_positions.push(pos);
-                }
-                "f" | "-f" => {
-                    let offset: isize = rest.parse()
-                        .with_context(|| format!(
-                            "Invalid fake offset in token '{}'. \
-                             Expected a number (e.g., 'f-1' or '-f10'), got '{}'.",
-                            token, rest
-                        ))?;
-                    config.fake_offset = Some(offset);
-                }
-                "r" | "-r" => {
-                    // TLS record split:
-                    //   rN+s  -> offset from SNI start (legacy syntax)
-                    //   rN    -> signed offset (negative means from SNI end)
-                    if rest.contains("+s") {
-                        let num: i32 = rest.split("+s").next().unwrap().parse()
-                            .with_context(|| format!(
-                                "Invalid TLS record position in token '{}'. \
-                                 Expected format 'N+s' where N is a signed number (e.g., 'r1+s' or 'r-2+s'), got '{}'.",
-                                token, rest
-                            ))?;
-                        config.tlsrec_pos = Some(num);
-                    } else {
-                        let pos: i32 = rest.parse()
-                            .with_context(|| format!(
-                                "Invalid TLS record position in token '{}'. \
-                                 Expected a signed number or 'N+s' format (e.g., 'r1', 'r-2', or 'r1+s'), got '{}'.",
-                                token, rest
-                            ))?;
-                        config.tlsrec_pos = Some(pos);
-                    }
-                }
-                "-A" => {
-                    match rest {
-                        "r" | "rst" => config.auto_rst = true,
-                        "t" | "redirect" => config.auto_redirect = true,
-                        "s" | "ssl" => config.auto_ssl = true,
-                        _ => return Err(anyhow!(
-                            "Unknown auto flag '{}' in token '{}'. \
-                             Valid flags are: 'r' (rst), 't' (redirect), 's' (ssl). \
-                             Example: -Ar -At -As",
-                            rest, token
-                        )),
-                    }
-                }
-                "g" | "-g" => {
-                    /* IP Fragmentation for QUIC/UDP - format: g or g8 for 8-byte fragments */
-                    if rest.is_empty() {
-                        config.ip_fragment = true;
-                        config.frag_size = 8; /* Default 8 bytes */
-                    } else {
-                        let size: u16 = rest.parse()
-                            .with_context(|| format!(
-                                "Invalid fragment size in token '{}'. \
-                                 Expected a positive number (e.g., 'g8' or '-g16'), got '{}'.",
-                                token, rest
-                            ))?;
-                        config.ip_fragment = true;
-                        /* Minimum 8 bytes, maximum 1500 to avoid issues */
-                        config.frag_size = size.clamp(8, 1500);
-                    }
-                }
-                "d" | "-d" => {
-                    /* Packet disorder - enable sending packets out of order */
-                    config.use_disorder = true;
-                }
-                _ => return Err(anyhow!(
-                    "Unknown option '{}' in token '{}'. \
-                     Valid options: s (split), o (oob), f (fake), r (tlsrec), g (fragment), d (disorder), -A (auto). \
-                     Example: 's1 -o1 -Ar -f-1 -r1+s -g8 -d'",
-                    prefix, token
-                )),
+                current_rule = Some(RuleDraft::default());
+                continue;
             }
+
+            if let Some(consumed) = parse_global_filter_token(token, &mut tokens, &mut config)? {
+                if consumed {
+                    continue;
+                }
+            }
+
+            if let Some(ref mut draft) = current_rule {
+                if parse_rule_token(token, &mut tokens, draft)? {
+                    continue;
+                }
+            }
+
+            parse_legacy_token(token, &mut config)?;
+        }
+
+        if let Some(draft) = current_rule.take() {
+            config.rules.push(finalize_rule(draft)?);
         }
 
         Ok(config)
@@ -152,7 +98,7 @@ impl DpiConfig {
             ip_fragment: self.ip_fragment as u8,
             frag_size: self.frag_size,
             disorder: self.use_disorder,
-            _pad: [0; 1],
+            bpf_printk: self.bpf_printk,
         }
     }
 
@@ -174,6 +120,287 @@ impl DpiConfig {
         let bytes = unsafe { std::slice::from_raw_parts(&proto as *const _ as *const u8, size) };
         Ok(bytes.to_vec())
     }
+
+    /// Returns true when destination TCP port passes global filter.
+    /// Empty filter means allow all.
+    pub fn tcp_port_allowed(&self, port: u16) -> bool {
+        port_allowed(&self.filter_tcp, port)
+    }
+
+    /// Returns true when destination UDP port passes global filter.
+    /// Empty filter means allow all.
+    pub fn udp_port_allowed(&self, port: u16) -> bool {
+        port_allowed(&self.filter_udp, port)
+    }
+}
+
+fn port_allowed(ranges: &[PortRange], port: u16) -> bool {
+    if ranges.is_empty() {
+        return true;
+    }
+    ranges.iter().any(|range| range.contains(port))
+}
+
+fn parse_global_filter_token<'a, I>(
+    token: &str,
+    tokens: &mut std::iter::Peekable<I>,
+    config: &mut DpiConfig,
+) -> Result<Option<bool>>
+where
+    I: Iterator<Item = &'a str>,
+{
+    if let Some(value) = parse_long_option_value("--filter-tcp", token, tokens) {
+        let value = value?;
+        config.filter_tcp = parse_ports(&value)?;
+        return Ok(Some(true));
+    }
+    if let Some(value) = parse_long_option_value("--filter-udp", token, tokens) {
+        let value = value?;
+        config.filter_udp = parse_ports(&value)?;
+        return Ok(Some(true));
+    }
+    Ok(None)
+}
+
+fn parse_legacy_token(token: &str, config: &mut DpiConfig) -> Result<()> {
+    // Handle short form without dash (e.g., "s1", "o1")
+    let (prefix, rest) = if token.starts_with('-') {
+        if token.len() < 2 {
+            return Err(anyhow!("Invalid option '{}'", token));
+        }
+        (&token[..2], &token[2..])
+    } else {
+        if token.is_empty() {
+            return Ok(());
+        }
+        (&token[..1], &token[1..])
+    };
+
+    match prefix {
+        "s" | "-s" => {
+            let pos: usize = rest.parse().with_context(|| {
+                format!(
+                    "Invalid split position in token '{}'. \
+                     Expected a positive number (e.g., 's1' or '-s10'), got '{}'.",
+                    token, rest
+                )
+            })?;
+            config.split_pos = Some(pos);
+        }
+        "o" | "-o" => {
+            let pos: usize = rest.parse().with_context(|| {
+                format!(
+                    "Invalid OOB (Out-of-Band) position in token '{}'. \
+                     Expected a positive number (e.g., 'o1' or '-o5'), got '{}'.",
+                    token, rest
+                )
+            })?;
+            config.oob_positions.push(pos);
+        }
+        "f" | "-f" => {
+            let offset: isize = rest.parse().with_context(|| {
+                format!(
+                    "Invalid fake offset in token '{}'. \
+                     Expected a number (e.g., 'f-1' or '-f10'), got '{}'.",
+                    token, rest
+                )
+            })?;
+            config.fake_offset = Some(offset);
+        }
+        "r" | "-r" => {
+            // TLS record split:
+            //   rN+s  -> offset from SNI start (legacy syntax)
+            //   rN    -> signed offset (negative means from SNI end)
+            if rest.contains("+s") {
+                let num: i32 = rest.split("+s").next().unwrap().parse().with_context(|| {
+                    format!(
+                        "Invalid TLS record position in token '{}'. \
+                         Expected format 'N+s' where N is a signed number (e.g., 'r1+s' or 'r-2+s'), got '{}'.",
+                        token, rest
+                    )
+                })?;
+                config.tlsrec_pos = Some(num);
+            } else {
+                let pos: i32 = rest.parse().with_context(|| {
+                    format!(
+                        "Invalid TLS record position in token '{}'. \
+                         Expected a signed number or 'N+s' format (e.g., 'r1', 'r-2', or 'r1+s'), got '{}'.",
+                        token, rest
+                    )
+                })?;
+                config.tlsrec_pos = Some(pos);
+            }
+        }
+        "-A" => match rest {
+            "r" | "rst" => config.auto_rst = true,
+            "t" | "redirect" => config.auto_redirect = true,
+            "s" | "ssl" => config.auto_ssl = true,
+            _ => {
+                return Err(anyhow!(
+                    "Unknown auto flag '{}' in token '{}'. \
+                     Valid flags are: 'r' (rst), 't' (redirect), 's' (ssl). \
+                     Example: -Ar -At -As",
+                    rest,
+                    token
+                ))
+            }
+        },
+        "g" | "-g" => {
+            /* IP Fragmentation for QUIC/UDP - format: g or g8 for 8-byte fragments */
+            if rest.is_empty() {
+                config.ip_fragment = true;
+                config.frag_size = 8; /* Default 8 bytes */
+            } else {
+                let size: u16 = rest.parse().with_context(|| {
+                    format!(
+                        "Invalid fragment size in token '{}'. \
+                         Expected a positive number (e.g., 'g8' or '-g16'), got '{}'.",
+                        token, rest
+                    )
+                })?;
+                config.ip_fragment = true;
+                /* Minimum 8 bytes, maximum 1500 to avoid issues */
+                config.frag_size = size.clamp(8, 1500);
+            }
+        }
+        "d" | "-d" => {
+            /* Packet disorder - enable sending packets out of order */
+            config.use_disorder = true;
+        }
+        _ => {
+            return Err(anyhow!(
+                "Unknown option '{}' in token '{}'. \
+                 Valid options: s (split), o (oob), f (fake), r (tlsrec), g (fragment), d (disorder), -A (auto), --new/--proto/--ports/--action/--repeats. \
+                 Example: 's1 -o1 -Ar -f-1 -r1+s -g8 -d --new --proto=tcp --ports=443 --action=split --repeats=2'",
+                prefix, token
+            ))
+        }
+    }
+
+    Ok(())
+}
+
+fn parse_rule_token<'a, I>(
+    token: &str,
+    tokens: &mut std::iter::Peekable<I>,
+    rule: &mut RuleDraft,
+) -> Result<bool>
+where
+    I: Iterator<Item = &'a str>,
+{
+    if let Some(value) = parse_long_option_value("--proto", token, tokens) {
+        let value = value?;
+        rule.proto = Some(
+            RuleProtocol::from_cli(&value)
+                .ok_or_else(|| anyhow!("Invalid --proto '{}'. Expected 'tcp' or 'udp'", value))?,
+        );
+        return Ok(true);
+    }
+
+    if let Some(value) = parse_long_option_value("--ports", token, tokens) {
+        let value = value?;
+        rule.ports = parse_ports(&value)?;
+        return Ok(true);
+    }
+
+    if let Some(value) = parse_long_option_value("--action", token, tokens) {
+        let value = value?;
+        rule.action = Some(RuleAction::from_cli(&value).ok_or_else(|| {
+            anyhow!(
+                "Invalid --action '{}'. Expected one of: split,oob,fake,tlsrec,disorder,frag",
+                value
+            )
+        })?);
+        return Ok(true);
+    }
+
+    if let Some(value) = parse_long_option_value("--repeats", token, tokens) {
+        let value = value?;
+        let repeats: u8 = value.parse().with_context(|| {
+            format!("Invalid --repeats '{}'. Expected integer in 1..=255", value)
+        })?;
+        if repeats == 0 {
+            return Err(anyhow!("Invalid --repeats '{}'. Value must be >= 1", value));
+        }
+        rule.repeats = Some(repeats);
+        return Ok(true);
+    }
+
+    Ok(false)
+}
+
+fn finalize_rule(draft: RuleDraft) -> Result<RuleConfig> {
+    let action = draft
+        .action
+        .ok_or_else(|| anyhow!("Rule after --new must include --action"))?;
+    let proto = draft.proto.unwrap_or_else(|| action.default_protocol());
+    let repeats = draft.repeats.unwrap_or(1);
+
+    Ok(RuleConfig {
+        proto,
+        ports: draft.ports,
+        action,
+        repeats,
+    })
+}
+
+fn parse_ports(raw: &str) -> Result<Vec<PortRange>> {
+    let mut ranges = Vec::new();
+
+    for chunk in raw.split(',') {
+        let part = chunk.trim();
+        if part.is_empty() {
+            continue;
+        }
+
+        if let Some((start_s, end_s)) = part.split_once('-') {
+            let start: u16 = start_s
+                .parse()
+                .with_context(|| format!("Invalid port range start '{}'", start_s))?;
+            let end: u16 = end_s
+                .parse()
+                .with_context(|| format!("Invalid port range end '{}'", end_s))?;
+            if start > end {
+                return Err(anyhow!(
+                    "Invalid port range '{}': start must be <= end",
+                    part
+                ));
+            }
+            ranges.push(PortRange::new(start, end));
+        } else {
+            let port: u16 = part
+                .parse()
+                .with_context(|| format!("Invalid port '{}'", part))?;
+            ranges.push(PortRange::new(port, port));
+        }
+    }
+
+    Ok(ranges)
+}
+
+fn parse_long_option_value<'a, I>(
+    option: &str,
+    token: &str,
+    tokens: &mut std::iter::Peekable<I>,
+) -> Option<Result<String>>
+where
+    I: Iterator<Item = &'a str>,
+{
+    if token == option {
+        return Some(
+            tokens
+                .next()
+                .map(std::string::ToString::to_string)
+                .ok_or_else(|| anyhow!("Option '{}' requires a value", option)),
+        );
+    }
+
+    let prefix = format!("{option}=");
+    if let Some(value) = token.strip_prefix(&prefix) {
+        return Some(Ok(value.to_string()));
+    }
+
+    None
 }
 
 #[cfg(test)]
@@ -216,6 +443,7 @@ mod tests {
         assert!(!cfg.auto_rst);
         assert!(!cfg.auto_redirect);
         assert!(!cfg.auto_ssl);
+        assert!(!cfg.bpf_printk);
     }
 
     #[test]
@@ -364,6 +592,7 @@ mod tests {
         assert!(!proto.auto_rst);
         assert!(!proto.auto_redirect);
         assert!(!proto.auto_ssl);
+        assert!(!proto.bpf_printk);
     }
 
     #[test]
@@ -385,6 +614,10 @@ mod tests {
         assert_eq!(cloned.auto_rst, cfg.auto_rst);
         assert_eq!(cloned.auto_redirect, cfg.auto_redirect);
         assert_eq!(cloned.auto_ssl, cfg.auto_ssl);
+        assert_eq!(cloned.bpf_printk, cfg.bpf_printk);
+        assert_eq!(cloned.filter_tcp, cfg.filter_tcp);
+        assert_eq!(cloned.filter_udp, cfg.filter_udp);
+        assert_eq!(cloned.rules, cfg.rules);
     }
 
     #[test]
@@ -476,5 +709,90 @@ mod tests {
         let cfg = DpiConfig::parse("s1 -o1 -Ar").unwrap();
         let proto = cfg.to_proto();
         assert!(!proto.disorder);
+    }
+
+    #[test]
+    fn test_parse_rule_engine_single_rule() {
+        let cfg = DpiConfig::parse(
+            "--new --proto=tcp --ports=443,2053,1024-2048 --action=split --repeats=3",
+        )
+        .unwrap();
+        assert_eq!(cfg.rules.len(), 1);
+        let rule = &cfg.rules[0];
+        assert_eq!(rule.proto, RuleProtocol::Tcp);
+        assert_eq!(rule.action, RuleAction::Split);
+        assert_eq!(rule.repeats, 3);
+        assert_eq!(
+            rule.ports,
+            vec![
+                PortRange::new(443, 443),
+                PortRange::new(2053, 2053),
+                PortRange::new(1024, 2048)
+            ]
+        );
+    }
+
+    #[test]
+    fn test_parse_rule_engine_multiple_rules() {
+        let cfg = DpiConfig::parse(
+            "s1 -o1 --new --action=split --ports=443 --repeats=2 --new --proto=udp --action=frag --ports=443",
+        )
+        .unwrap();
+        assert_eq!(cfg.rules.len(), 2);
+        assert_eq!(cfg.split_pos, Some(1));
+        assert_eq!(cfg.oob_positions, vec![1]);
+        assert_eq!(cfg.rules[0].proto, RuleProtocol::Tcp);
+        assert_eq!(cfg.rules[0].repeats, 2);
+        assert_eq!(cfg.rules[1].proto, RuleProtocol::Udp);
+        assert_eq!(cfg.rules[1].action, RuleAction::Frag);
+    }
+
+    #[test]
+    fn test_parse_rule_engine_default_protocol_for_frag() {
+        let cfg = DpiConfig::parse("--new --action=frag").unwrap();
+        assert_eq!(cfg.rules.len(), 1);
+        assert_eq!(cfg.rules[0].proto, RuleProtocol::Udp);
+    }
+
+    #[test]
+    fn test_parse_rule_engine_requires_action() {
+        let err = DpiConfig::parse("--new --proto=tcp").unwrap_err();
+        assert!(err.to_string().contains("must include --action"));
+    }
+
+    #[test]
+    fn test_parse_rule_engine_invalid_repeats() {
+        let err = DpiConfig::parse("--new --action=split --repeats=0").unwrap_err();
+        assert!(err.to_string().contains("Value must be >= 1"));
+    }
+
+    #[test]
+    fn test_parse_filter_tcp_udp() {
+        let cfg = DpiConfig::parse("--filter-tcp=443,2053,1024-65535 --filter-udp 443,50000-50010")
+            .unwrap();
+        assert_eq!(
+            cfg.filter_tcp,
+            vec![
+                PortRange::new(443, 443),
+                PortRange::new(2053, 2053),
+                PortRange::new(1024, 65535)
+            ]
+        );
+        assert_eq!(
+            cfg.filter_udp,
+            vec![PortRange::new(443, 443), PortRange::new(50000, 50010)]
+        );
+    }
+
+    #[test]
+    fn test_filter_port_allowed_semantics() {
+        let cfg = DpiConfig::parse("--filter-tcp=443,8443-8444 --filter-udp=53").unwrap();
+
+        assert!(cfg.tcp_port_allowed(443));
+        assert!(cfg.tcp_port_allowed(8443));
+        assert!(!cfg.tcp_port_allowed(80));
+
+        assert!(cfg.udp_port_allowed(53));
+        assert!(!cfg.udp_port_allowed(443));
     }
 }

@@ -1,5 +1,5 @@
-use goodbyedpi_proto::{ConnKey, ConnState};
 use dashmap::DashMap;
+use goodbyedpi_proto::{ConnKey, ConnState};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -82,4 +82,4 @@ impl Default for ConnectionState {
 }
 
 // Re-export auto_logic types for convenience
-pub use crate::auto_logic::{Strategy, ConfigRecommendations, AutoLogicStats};
+pub use crate::auto_logic::{AutoLogicStats, ConfigRecommendations, Strategy};
