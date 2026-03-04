@@ -1,10 +1,11 @@
 use anyhow::{anyhow, Context, Result};
-use goodbyedpi_proto::Event;
 use goodbyedpi_proto::{
     Config as ProtoConfig, PortRange, Rule as RuleConfig, RuleAction, RuleProtocol,
 };
+use goodbyedpi_proto::{Event, MAX_PAYLOAD_SIZE};
 use std::fmt;
 
+use crate::l7::{detect_l7, L7Protocol};
 use crate::rules::{parse_hostlist, parse_ipset, target_lists_allow_event, HostPattern, IpNetwork};
 
 #[derive(Clone, Default, PartialEq, Eq)]
@@ -32,6 +33,72 @@ struct RuleDraft {
     repeats: Option<u8>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum L7Filter {
+    Stun,
+    Discord,
+}
+
+impl L7Filter {
+    fn from_cli(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "stun" => Some(Self::Stun),
+            "discord" => Some(Self::Discord),
+            _ => None,
+        }
+    }
+
+    fn matches(self, detected: L7Protocol) -> bool {
+        matches!(
+            (self, detected),
+            (Self::Stun, L7Protocol::Stun) | (Self::Discord, L7Protocol::Discord)
+        )
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DpiDesyncFooling {
+    Ts,
+    Md5Sig,
+}
+
+impl DpiDesyncFooling {
+    fn from_cli(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "ts" => Some(Self::Ts),
+            "md5sig" => Some(Self::Md5Sig),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DpiDesyncMode {
+    Fake,
+    Disorder,
+    Split,
+    HostFakeSplit,
+}
+
+impl DpiDesyncMode {
+    fn from_cli(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "fake" => Some(Self::Fake),
+            "disorder" => Some(Self::Disorder),
+            "split" => Some(Self::Split),
+            "hostfakesplit" => Some(Self::HostFakeSplit),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct LegacyOverrides {
+    split_pos: bool,
+    fake_offset: bool,
+    disorder: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DpiConfig {
     pub split_pos: Option<usize>,
@@ -47,11 +114,15 @@ pub struct DpiConfig {
     pub bpf_printk: bool,   /* Enable bpf_printk debug logs */
     pub filter_tcp: Vec<PortRange>,
     pub filter_udp: Vec<PortRange>,
+    pub filter_l7: Vec<L7Filter>,
     pub hostlist: Vec<HostPattern>,
     pub hostlist_exclude: Vec<HostPattern>,
     pub ipset: Vec<IpNetwork>,
     pub ipset_exclude: Vec<IpNetwork>,
     pub fake_profiles: FakeProfiles,
+    pub dpi_desync_actions: Vec<RuleAction>,
+    pub dpi_desync_repeats: Option<u8>,
+    pub dpi_desync_fooling: Vec<DpiDesyncFooling>,
     pub rules: Vec<RuleConfig>,
 }
 
@@ -71,16 +142,21 @@ impl DpiConfig {
             bpf_printk: false,
             filter_tcp: Vec::new(),
             filter_udp: Vec::new(),
+            filter_l7: Vec::new(),
             hostlist: Vec::new(),
             hostlist_exclude: Vec::new(),
             ipset: Vec::new(),
             ipset_exclude: Vec::new(),
             fake_profiles: FakeProfiles::default(),
+            dpi_desync_actions: Vec::new(),
+            dpi_desync_repeats: None,
+            dpi_desync_fooling: Vec::new(),
             rules: Vec::new(),
         };
 
         let mut tokens = s.split_whitespace().peekable();
         let mut current_rule: Option<RuleDraft> = None;
+        let mut legacy_overrides = LegacyOverrides::default();
 
         while let Some(token) = tokens.next() {
             if token.is_empty() {
@@ -95,7 +171,9 @@ impl DpiConfig {
                 continue;
             }
 
-            if let Some(consumed) = parse_global_filter_token(token, &mut tokens, &mut config)? {
+            if let Some(consumed) =
+                parse_global_filter_token(token, &mut tokens, &mut config, &legacy_overrides)?
+            {
                 if consumed {
                     continue;
                 }
@@ -107,7 +185,7 @@ impl DpiConfig {
                 }
             }
 
-            parse_legacy_token(token, &mut config)?;
+            parse_legacy_token(token, &mut config, &mut legacy_overrides)?;
         }
 
         if let Some(draft) = current_rule.take() {
@@ -164,6 +242,18 @@ impl DpiConfig {
         port_allowed(&self.filter_udp, port)
     }
 
+    /// Returns true when L7 filter allows this event.
+    /// Empty filter means allow all.
+    pub fn l7_allowed(&self, event: &Event) -> bool {
+        if self.filter_l7.is_empty() {
+            return true;
+        }
+        let payload_len = (event.payload_len as usize).min(MAX_PAYLOAD_SIZE);
+        let payload = &event.payload[..payload_len];
+        let detected = detect_l7(payload);
+        self.filter_l7.iter().copied().any(|f| f.matches(detected))
+    }
+
     /// Returns true when host/ip list targeting allows this event.
     /// If all include-lists are empty, event is allowed by default.
     pub fn target_allowed(&self, event: &Event) -> bool {
@@ -188,6 +278,7 @@ fn parse_global_filter_token<'a, I>(
     token: &str,
     tokens: &mut std::iter::Peekable<I>,
     config: &mut DpiConfig,
+    legacy_overrides: &LegacyOverrides,
 ) -> Result<Option<bool>>
 where
     I: Iterator<Item = &'a str>,
@@ -202,24 +293,34 @@ where
         config.filter_udp = parse_ports(&value)?;
         return Ok(Some(true));
     }
+    if let Some(value) = parse_long_option_value("--filter-l7", token, tokens) {
+        let value = value?;
+        config.filter_l7 = parse_l7_filters(&value)?;
+        return Ok(Some(true));
+    }
     if let Some(value) = parse_long_option_value("--hostlist", token, tokens) {
         let value = value?;
-        config.hostlist = parse_hostlist(&value)?;
+        config.hostlist.extend(parse_hostlist(&value)?);
+        return Ok(Some(true));
+    }
+    if let Some(value) = parse_long_option_value("--hostlist-domains", token, tokens) {
+        let value = value?;
+        config.hostlist.extend(parse_hostlist(&value)?);
         return Ok(Some(true));
     }
     if let Some(value) = parse_long_option_value("--hostlist-exclude", token, tokens) {
         let value = value?;
-        config.hostlist_exclude = parse_hostlist(&value)?;
+        config.hostlist_exclude.extend(parse_hostlist(&value)?);
         return Ok(Some(true));
     }
     if let Some(value) = parse_long_option_value("--ipset", token, tokens) {
         let value = value?;
-        config.ipset = parse_ipset(&value)?;
+        config.ipset.extend(parse_ipset(&value)?);
         return Ok(Some(true));
     }
     if let Some(value) = parse_long_option_value("--ipset-exclude", token, tokens) {
         let value = value?;
-        config.ipset_exclude = parse_ipset(&value)?;
+        config.ipset_exclude.extend(parse_ipset(&value)?);
         return Ok(Some(true));
     }
     if let Some(value) = parse_long_option_value("--fake-quic", token, tokens) {
@@ -237,7 +338,136 @@ where
         config.fake_profiles.stun = Some(load_fake_payload(&value)?);
         return Ok(Some(true));
     }
+    if let Some(value) = parse_long_option_value("--dpi-desync", token, tokens) {
+        let value = value?;
+        let modes = parse_dpi_desync_modes(&value)?;
+        apply_dpi_desync_modes(config, legacy_overrides, &modes);
+        return Ok(Some(true));
+    }
+    if let Some(value) = parse_long_option_value("--dpi-desync-repeats", token, tokens) {
+        let value = value?;
+        let repeats: u8 = value.parse().with_context(|| {
+            format!(
+                "Invalid --dpi-desync-repeats '{}'. Expected integer in 1..=255",
+                value
+            )
+        })?;
+        if repeats == 0 {
+            return Err(anyhow!(
+                "Invalid --dpi-desync-repeats '{}'. Value must be >= 1",
+                value
+            ));
+        }
+        config.dpi_desync_repeats = Some(repeats);
+        return Ok(Some(true));
+    }
+    if let Some(value) = parse_long_option_value("--dpi-desync-fooling", token, tokens) {
+        let value = value?;
+        config.dpi_desync_fooling = parse_dpi_desync_fooling(&value)?;
+        return Ok(Some(true));
+    }
     Ok(None)
+}
+
+fn parse_csv_or_plus_values(raw: &str) -> impl Iterator<Item = &str> {
+    raw.split([',', '+'])
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+}
+
+fn parse_dpi_desync_modes(raw: &str) -> Result<Vec<DpiDesyncMode>> {
+    const SUPPORTED: &str = "fake,disorder,split,hostfakesplit";
+
+    let mut out = Vec::new();
+    for value in parse_csv_or_plus_values(raw) {
+        let mode = DpiDesyncMode::from_cli(value).ok_or_else(|| {
+            anyhow!(
+                "unsupported value '{}' for --dpi-desync, supported: {}",
+                value,
+                SUPPORTED
+            )
+        })?;
+        if !out.contains(&mode) {
+            out.push(mode);
+        }
+    }
+    if out.is_empty() {
+        return Err(anyhow!(
+            "unsupported value '' for --dpi-desync, supported: {}",
+            SUPPORTED
+        ));
+    }
+    Ok(out)
+}
+
+fn parse_dpi_desync_fooling(raw: &str) -> Result<Vec<DpiDesyncFooling>> {
+    const SUPPORTED: &str = "ts,md5sig";
+
+    let mut out = Vec::new();
+    for value in parse_csv_or_plus_values(raw) {
+        let item = DpiDesyncFooling::from_cli(value).ok_or_else(|| {
+            anyhow!(
+                "unsupported value '{}' for --dpi-desync-fooling, supported: {}",
+                value,
+                SUPPORTED
+            )
+        })?;
+        if !out.contains(&item) {
+            out.push(item);
+        }
+    }
+    if out.is_empty() {
+        return Err(anyhow!(
+            "unsupported value '' for --dpi-desync-fooling, supported: {}",
+            SUPPORTED
+        ));
+    }
+    Ok(out)
+}
+
+fn ensure_desync_action(actions: &mut Vec<RuleAction>, action: RuleAction) {
+    if !actions.contains(&action) {
+        actions.push(action);
+    }
+}
+
+fn apply_dpi_desync_modes(
+    config: &mut DpiConfig,
+    legacy_overrides: &LegacyOverrides,
+    modes: &[DpiDesyncMode],
+) {
+    for mode in modes {
+        match mode {
+            DpiDesyncMode::Fake => {
+                ensure_desync_action(&mut config.dpi_desync_actions, RuleAction::Fake);
+                if !legacy_overrides.fake_offset && config.fake_offset.is_none() {
+                    config.fake_offset = Some(-1);
+                }
+            }
+            DpiDesyncMode::Disorder => {
+                ensure_desync_action(&mut config.dpi_desync_actions, RuleAction::Disorder);
+                if !legacy_overrides.disorder {
+                    config.use_disorder = true;
+                }
+            }
+            DpiDesyncMode::Split => {
+                ensure_desync_action(&mut config.dpi_desync_actions, RuleAction::Split);
+                if !legacy_overrides.split_pos && config.split_pos.is_none() {
+                    config.split_pos = Some(1);
+                }
+            }
+            DpiDesyncMode::HostFakeSplit => {
+                ensure_desync_action(&mut config.dpi_desync_actions, RuleAction::Split);
+                ensure_desync_action(&mut config.dpi_desync_actions, RuleAction::Fake);
+                if !legacy_overrides.split_pos && config.split_pos.is_none() {
+                    config.split_pos = Some(1);
+                }
+                if !legacy_overrides.fake_offset && config.fake_offset.is_none() {
+                    config.fake_offset = Some(-1);
+                }
+            }
+        }
+    }
 }
 
 fn load_fake_payload(path: &str) -> Result<Vec<u8>> {
@@ -259,7 +489,29 @@ fn load_fake_payload(path: &str) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
-fn parse_legacy_token(token: &str, config: &mut DpiConfig) -> Result<()> {
+fn parse_l7_filters(raw: &str) -> Result<Vec<L7Filter>> {
+    let mut out = Vec::new();
+    for chunk in raw.split(',') {
+        let value = chunk.trim();
+        if value.is_empty() {
+            continue;
+        }
+        let filter = L7Filter::from_cli(value).ok_or_else(|| {
+            anyhow!(
+                "Invalid --filter-l7 value '{}'. Expected comma-separated 'stun,discord'",
+                value
+            )
+        })?;
+        out.push(filter);
+    }
+    Ok(out)
+}
+
+fn parse_legacy_token(
+    token: &str,
+    config: &mut DpiConfig,
+    legacy_overrides: &mut LegacyOverrides,
+) -> Result<()> {
     // Handle short form without dash (e.g., "s1", "o1")
     let (prefix, rest) = if token.starts_with('-') {
         if token.len() < 2 {
@@ -283,6 +535,7 @@ fn parse_legacy_token(token: &str, config: &mut DpiConfig) -> Result<()> {
                 )
             })?;
             config.split_pos = Some(pos);
+            legacy_overrides.split_pos = true;
         }
         "o" | "-o" => {
             let pos: usize = rest.parse().with_context(|| {
@@ -303,6 +556,7 @@ fn parse_legacy_token(token: &str, config: &mut DpiConfig) -> Result<()> {
                 )
             })?;
             config.fake_offset = Some(offset);
+            legacy_overrides.fake_offset = true;
         }
         "r" | "-r" => {
             // TLS record split:
@@ -363,12 +617,13 @@ fn parse_legacy_token(token: &str, config: &mut DpiConfig) -> Result<()> {
         "d" | "-d" => {
             /* Packet disorder - enable sending packets out of order */
             config.use_disorder = true;
+            legacy_overrides.disorder = true;
         }
         _ => {
             return Err(anyhow!(
                 "Unknown option '{}' in token '{}'. \
-                 Valid options: s (split), o (oob), f (fake), r (tlsrec), g (fragment), d (disorder), -A (auto), --new/--proto/--ports/--action/--repeats, --filter-tcp/--filter-udp, --hostlist/--hostlist-exclude, --ipset/--ipset-exclude, --fake-quic/--fake-discord/--fake-stun. \
-                 Example: 's1 -o1 -Ar -f-1 -r1+s -g8 -d --filter-tcp=443 --hostlist=googlevideo.com --fake-quic=/path/fake.bin --new --proto=tcp --ports=443 --action=split --repeats=2'",
+                 Valid options: s (split), o (oob), f (fake), r (tlsrec), g (fragment), d (disorder), -A (auto), --new/--proto/--ports/--action/--repeats, --filter-tcp/--filter-udp/--filter-l7, --hostlist/--hostlist-domains/--hostlist-exclude, --ipset/--ipset-exclude, --fake-quic/--fake-discord/--fake-stun, --dpi-desync/--dpi-desync-repeats/--dpi-desync-fooling. \
+                 Example: 's1 -o1 -Ar -f-1 -r1+s -g8 -d --dpi-desync=hostfakesplit,disorder --dpi-desync-repeats=2 --dpi-desync-fooling=ts,md5sig --filter-tcp=443 --filter-l7=stun,discord --hostlist=googlevideo.com --fake-quic=/path/fake.bin --new --proto=tcp --ports=443 --action=split --repeats=2'",
                 prefix, token
             ))
         }
@@ -714,6 +969,7 @@ mod tests {
         assert_eq!(cloned.bpf_printk, cfg.bpf_printk);
         assert_eq!(cloned.filter_tcp, cfg.filter_tcp);
         assert_eq!(cloned.filter_udp, cfg.filter_udp);
+        assert_eq!(cloned.filter_l7, cfg.filter_l7);
         assert_eq!(cloned.hostlist, cfg.hostlist);
         assert_eq!(cloned.hostlist_exclude, cfg.hostlist_exclude);
         assert_eq!(cloned.ipset, cfg.ipset);
@@ -887,6 +1143,29 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_filter_l7() {
+        let cfg = DpiConfig::parse("--filter-l7=discord,stun").unwrap();
+        assert_eq!(cfg.filter_l7, vec![L7Filter::Discord, L7Filter::Stun]);
+    }
+
+    #[test]
+    fn test_filter_l7_allowed_semantics() {
+        let cfg = DpiConfig::parse("--filter-l7=stun").unwrap();
+
+        let mut stun_event = Event::default();
+        stun_event.payload_len = 20;
+        stun_event.payload[0] = 0x00;
+        stun_event.payload[1] = 0x01;
+        stun_event.payload[4..8].copy_from_slice(&[0x21, 0x12, 0xA4, 0x42]);
+        assert!(cfg.l7_allowed(&stun_event));
+
+        let mut unknown_event = Event::default();
+        unknown_event.payload_len = 10;
+        unknown_event.payload[..10].copy_from_slice(b"GET / HTTP");
+        assert!(!cfg.l7_allowed(&unknown_event));
+    }
+
+    #[test]
     fn test_filter_port_allowed_semantics() {
         let cfg = DpiConfig::parse("--filter-tcp=443,8443-8444 --filter-udp=53").unwrap();
 
@@ -909,6 +1188,27 @@ mod tests {
         assert_eq!(cfg.hostlist_exclude.len(), 1);
         assert_eq!(cfg.ipset.len(), 2);
         assert_eq!(cfg.ipset_exclude.len(), 2);
+    }
+
+    #[test]
+    fn test_parse_repeated_lists_are_appended() {
+        let cfg = DpiConfig::parse(
+            "--hostlist=example.com --hostlist=example.org \
+             --hostlist-exclude=blocked.example --hostlist-exclude=blocked2.example \
+             --ipset=10.0.0.0/8 --ipset=1.1.1.1 \
+             --ipset-exclude=10.10.10.10 --ipset-exclude=8.8.8.8",
+        )
+        .unwrap();
+        assert_eq!(cfg.hostlist.len(), 2);
+        assert_eq!(cfg.hostlist_exclude.len(), 2);
+        assert_eq!(cfg.ipset.len(), 2);
+        assert_eq!(cfg.ipset_exclude.len(), 2);
+    }
+
+    #[test]
+    fn test_parse_hostlist_domains_alias() {
+        let cfg = DpiConfig::parse("--hostlist-domains=discord.media,*.discord.gg").unwrap();
+        assert_eq!(cfg.hostlist.len(), 2);
     }
 
     #[test]
@@ -970,5 +1270,108 @@ mod tests {
         let _ = std::fs::remove_file(quic_path);
         let _ = std::fs::remove_file(discord_path);
         let _ = std::fs::remove_file(stun_path);
+    }
+
+    #[test]
+    fn test_parse_dpi_desync_basic_mapping() {
+        let cfg = DpiConfig::parse("--dpi-desync=fake,disorder,split").unwrap();
+        assert_eq!(cfg.split_pos, Some(1));
+        assert_eq!(cfg.fake_offset, Some(-1));
+        assert!(cfg.use_disorder);
+        assert_eq!(
+            cfg.dpi_desync_actions,
+            vec![RuleAction::Fake, RuleAction::Disorder, RuleAction::Split]
+        );
+    }
+
+    #[test]
+    fn test_parse_dpi_desync_hostfakesplit() {
+        let cfg = DpiConfig::parse("--dpi-desync=hostfakesplit").unwrap();
+        assert_eq!(cfg.split_pos, Some(1));
+        assert_eq!(cfg.fake_offset, Some(-1));
+        assert_eq!(
+            cfg.dpi_desync_actions,
+            vec![RuleAction::Split, RuleAction::Fake]
+        );
+    }
+
+    #[test]
+    fn test_parse_dpi_desync_case_and_dedup() {
+        let cfg = DpiConfig::parse("--dpi-desync=Split+FAKE,split").unwrap();
+        assert_eq!(cfg.split_pos, Some(1));
+        assert_eq!(cfg.fake_offset, Some(-1));
+        assert_eq!(
+            cfg.dpi_desync_actions,
+            vec![RuleAction::Split, RuleAction::Fake]
+        );
+    }
+
+    #[test]
+    fn test_parse_dpi_desync_invalid_value() {
+        let err = DpiConfig::parse("--dpi-desync=fake,unknown").unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "unsupported value 'unknown' for --dpi-desync, supported: fake,disorder,split,hostfakesplit"
+        );
+    }
+
+    #[test]
+    fn test_parse_dpi_desync_legacy_split_priority() {
+        let cfg = DpiConfig::parse("-s10 --dpi-desync=split").unwrap();
+        assert_eq!(cfg.split_pos, Some(10));
+    }
+
+    #[test]
+    fn test_parse_dpi_desync_legacy_fake_priority() {
+        let cfg = DpiConfig::parse("-f-9 --dpi-desync=fake").unwrap();
+        assert_eq!(cfg.fake_offset, Some(-9));
+    }
+
+    #[test]
+    fn test_parse_dpi_desync_repeats() {
+        let cfg = DpiConfig::parse("--dpi-desync=split,fake --dpi-desync-repeats=3").unwrap();
+        assert_eq!(cfg.dpi_desync_repeats, Some(3));
+        assert_eq!(
+            cfg.dpi_desync_actions,
+            vec![RuleAction::Split, RuleAction::Fake]
+        );
+    }
+
+    #[test]
+    fn test_parse_dpi_desync_repeats_invalid_zero() {
+        let err = DpiConfig::parse("--dpi-desync-repeats=0").unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("Invalid --dpi-desync-repeats '0'. Value must be >= 1"));
+    }
+
+    #[test]
+    fn test_parse_dpi_desync_fooling() {
+        let cfg = DpiConfig::parse("--dpi-desync-fooling=ts+md5sig").unwrap();
+        assert_eq!(
+            cfg.dpi_desync_fooling,
+            vec![DpiDesyncFooling::Ts, DpiDesyncFooling::Md5Sig]
+        );
+    }
+
+    #[test]
+    fn test_parse_dpi_desync_fooling_invalid() {
+        let err = DpiConfig::parse("--dpi-desync-fooling=ts,bad").unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "unsupported value 'bad' for --dpi-desync-fooling, supported: ts,md5sig"
+        );
+    }
+
+    #[test]
+    fn test_parse_legacy_and_desync_compatibility() {
+        let legacy = DpiConfig::parse("s1 -f-1 -d").unwrap();
+        let desync = DpiConfig::parse("--dpi-desync=hostfakesplit,disorder").unwrap();
+        assert_eq!(legacy.split_pos, desync.split_pos);
+        assert_eq!(legacy.fake_offset, desync.fake_offset);
+        assert_eq!(legacy.use_disorder, desync.use_disorder);
+        assert_eq!(legacy.to_proto().split_pos, desync.to_proto().split_pos);
+        assert_eq!(legacy.to_proto().fake_offset, desync.to_proto().fake_offset);
+        assert_eq!(legacy.to_proto().disorder, desync.to_proto().disorder);
     }
 }

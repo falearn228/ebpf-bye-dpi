@@ -119,6 +119,9 @@ sudo ./target/release/goodbyedpi-daemon -i eth0 -c "s1 -f-1 --fake-quic=/etc/goo
 # Stage 5: L7 filters (минимум) включены автоматически
 # Детектируются сигнатуры STUN/Discord по первым байтам payload для выбора fake-профиля.
 
+# Stage 7: явный L7-фильтр + алиас доменного списка
+sudo ./target/release/goodbyedpi-daemon -i eth0 -c "s1 -f-1 --filter-l7=discord,stun --hostlist-domains=discord.media,*.discord.gg"
+
 # Экспорт метрик Prometheus (по умолчанию http://127.0.0.1:9877/metrics)
 sudo ./target/release/goodbyedpi-daemon -i eth0 -c "s1 -o1" --metrics-bind 0.0.0.0:9877
 

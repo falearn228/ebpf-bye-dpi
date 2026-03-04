@@ -181,6 +181,17 @@ cargo test --workspace
 - Минимальный target:
 - `fake`, `disorder`, `split`, `hostfakesplit`
 - Ошибки парсинга должны явно сообщать, какие значения поддержаны
+- Scope реализации:
+- Парсер в `daemon/src/config.rs`: разбор CSV/`+`-комбинаций, нормализация регистра, дедупликация значений
+- Canonical mapping (единая точка преобразования): `dpi_desync -> internal action flags`
+- Правила приоритета: явные legacy-флаги (`s1`, `-o1`, `-d`, `-g*`) имеют приоритет над алиасами только при конфликте одного и того же поля
+- Формат ошибок: `unsupported value '<x>' for --dpi-desync, supported: fake,disorder,split,hostfakesplit`
+- Тесты:
+- unit-тесты парсинга (валидные/невалидные комбинации)
+- regression-тесты совместимости: одинаковый `Config` для эквивалентных old/new ключей
+- Документация:
+- примеры эквивалентных команд `old flags <-> --dpi-desync*`
+- таблица соответствий в `docs/DEVELOPMENT.md` и `README.md`
 
 ### Этап 9: Расширенные десинк-параметры
 

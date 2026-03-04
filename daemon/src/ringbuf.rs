@@ -150,6 +150,11 @@ impl EventProcessor {
             .iter()
             .find(|rule| rule.matches(proto, event.dst_port, action))
             .map(|rule| rule.repeats)
+            .or_else(|| {
+                config
+                    .dpi_desync_repeats
+                    .filter(|_| config.dpi_desync_actions.contains(&action))
+            })
             .unwrap_or(1);
 
         repeats.max(1)
@@ -166,6 +171,20 @@ impl EventProcessor {
             debug!(
                 "[FILTER] Skip action {:?} for dst_port {} (filtered)",
                 action, event.dst_port
+            );
+        }
+        allowed
+    }
+
+    /// Check L7 filter (`--filter-l7`) before injection.
+    fn l7_filter_allows(&self, config: &DpiConfig, event: &Event, action: RuleAction) -> bool {
+        let allowed = config.l7_allowed(event);
+        if !allowed {
+            let payload_len = (event.payload_len as usize).min(MAX_PAYLOAD_SIZE);
+            let detected = detect_l7(&event.payload[..payload_len]);
+            debug!(
+                "[FILTER] Skip action {:?} for dst_port {} (l7 mismatch: detected={:?})",
+                action, event.dst_port, detected
             );
         }
         allowed
@@ -247,6 +266,9 @@ impl EventProcessor {
         dst_ip: &str,
     ) {
         if !self.port_filter_allows(config, event, RuleAction::Split) {
+            return;
+        }
+        if !self.l7_filter_allows(config, event, RuleAction::Split) {
             return;
         }
         if !self.target_filter_allows(config, event, RuleAction::Split) {
@@ -415,6 +437,9 @@ impl EventProcessor {
                 // Inject fake packet if fake_offset is configured
                 if config.fake_offset.is_some() {
                     if !self.port_filter_allows(config, event, RuleAction::Fake) {
+                        return;
+                    }
+                    if !self.l7_filter_allows(config, event, RuleAction::Fake) {
                         return;
                     }
                     if !self.target_filter_allows(config, event, RuleAction::Fake) {
@@ -660,6 +685,9 @@ impl EventProcessor {
         // If the strategy uses fake and we have a fake_offset, inject a fake packet
         if recs.use_fake && recs.fake_offset.is_some() {
             if self.port_filter_allows(config, event, RuleAction::Fake) {
+                if !self.l7_filter_allows(config, event, RuleAction::Fake) {
+                    return;
+                }
                 if !self.target_filter_allows(config, event, RuleAction::Fake) {
                     return;
                 }
@@ -703,6 +731,9 @@ impl EventProcessor {
         dst_ip: &str,
     ) {
         if !self.port_filter_allows(config, event, RuleAction::Disorder) {
+            return;
+        }
+        if !self.l7_filter_allows(config, event, RuleAction::Disorder) {
             return;
         }
         if !self.target_filter_allows(config, event, RuleAction::Disorder) {
@@ -828,6 +859,9 @@ impl EventProcessor {
         if !self.port_filter_allows(config, event, RuleAction::Oob) {
             return;
         }
+        if !self.l7_filter_allows(config, event, RuleAction::Oob) {
+            return;
+        }
         if !self.target_filter_allows(config, event, RuleAction::Oob) {
             return;
         }
@@ -932,6 +966,9 @@ impl EventProcessor {
         if !self.port_filter_allows(config, event, RuleAction::Frag) {
             return;
         }
+        if !self.l7_filter_allows(config, event, RuleAction::Frag) {
+            return;
+        }
         if !self.target_filter_allows(config, event, RuleAction::Frag) {
             return;
         }
@@ -1029,6 +1066,9 @@ impl EventProcessor {
         dst_ip: &str,
     ) {
         if !self.port_filter_allows(config, event, RuleAction::Tlsrec) {
+            return;
+        }
+        if !self.l7_filter_allows(config, event, RuleAction::Tlsrec) {
             return;
         }
         if !self.target_filter_allows(config, event, RuleAction::Tlsrec) {
