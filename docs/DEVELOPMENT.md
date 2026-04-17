@@ -116,106 +116,183 @@ cargo test --workspace
 - При агрессивных техниках (`disorder`, `frag`) возможны деградации на части сетей.
 - Любые изменения формата `Config/Event` требуют синхронного обновления C и Rust структур.
 
-## 7. Roadmap: zapret-like rules
+## 7. Текущий статус zapret-like функциональности
 
-Цель: приблизить гибкость конфигурации к профилям zapret/winws без слома текущего `-c` синтаксиса.
+Цель остаётся прежней: приблизить конфиг к профилям zapret/winws без слома текущего `-c` синтаксиса. Ниже не wish-list, а фактический статус репозитория на текущий момент.
 
-### Этап 1: Rule engine v1 (база)
+### Уже реализовано
 
-- Добавить список правил (аналог секций `--new`) с полями:
-- `proto` (`tcp`/`udp`)
-- `ports` (списки и диапазоны)
-- `action` (split/oob/fake/tlsrec/disorder/frag)
-- `repeats` (повторы инъекции)
-- Файлы: `daemon/src/config.rs`, `proto/src/lib.rs`, `daemon/src/ringbuf.rs`
-
-### Этап 2: Port filters
-
-- Поддержка `filter-tcp/filter-udp` с диапазонами (`443,2053,1024-65535`)
-- Применение фильтра до инъекции
-
-### Этап 3: Host/IP lists
-
-- Поддержка:
-- `hostlist`
-- `hostlist-exclude`
-- `ipset`
-- `ipset-exclude`
-- Матчинг по SNI/HTTP Host и dst IP
-- Новый модуль правил: `daemon/src/rules.rs`
-
-### Этап 4: Repeats + fake profiles
-
-- `repeats` для fake/disorder/quic-frag
-- Загрузка fake payload из файлов (`fake-quic`, `fake-discord`, `fake-stun`)
-- Файлы: `daemon/src/injector.rs`, `daemon/src/ringbuf.rs`
-
-### Этап 5: L7 filters (минимум)
-
-- Легковесный детект `stun/discord` по сигнатурам первых байт
-- Реализация в userspace или через event-метки из eBPF
-
-### Этап 6: Опционально (v2)
-
-- `fooling ts/md5sig`
-- `ip-id zero`
-- `autottl`
-- `cutoff`
-
-### Этап 7: Zapret/winws-совместимость (следующий приоритет)
-
-- Добавить L7-фильтры в конфиг:
+- Rule engine v1 через секции `--new`
+- Поля правил: `--proto`, `--ports`, `--action`, `--repeats`
+- Глобальные L4-фильтры: `--filter-tcp`, `--filter-udp`
+- Алиасы глобальных L4-фильтров: `--wf-tcp`, `--wf-udp`
+- Targeting по спискам:
+- `--hostlist`
+- `--hostlist-exclude`
+- `--ipset`
+- `--ipset-exclude`
+- Алиас доменного списка: `--hostlist-domains`
+- Повторяемые list-флаги добавляются, а не перезаписываются
+- Fake profiles из файлов:
+- `--fake-quic`
+- `--fake-discord`
+- `--fake-stun`
+- Алиасы fake profiles:
+- `--dpi-desync-fake-quic`
+- `--dpi-desync-fake-discord`
+- `--dpi-desync-fake-stun`
+- `--dpi-desync-fake-unknown-udp`
+- `--dpi-desync-hostfakesplit-mod=host=<domain>`
+- L7-фильтр:
 - `--filter-l7=discord,stun`
-- Семантика: фильтр применяется до инъекции; совпадение по детекту L7 в userspace (или event-метка из eBPF)
-- Добавить доменный фильтр:
-- `--hostlist-domains=domain1,domain2`
-- Семантика: shortcut для domain-only правил (без IP list), с поддержкой wildcard/суффиксов
-- Важно: повторяемые флаги списков должны **добавляться**, а не перезаписываться (`--hostlist`/`--ipset`/`--*-exclude`)
+- DPI desync DSL:
+- `--dpi-desync=*`
+- `--dpi-desync-repeats=*`
+- `--dpi-desync-fooling=*`
+- Поддержанные значения `--dpi-desync`:
+- `fake`
+- `disorder`
+- `split`
+- `hostfakesplit`
+- Поддержанные значения `--dpi-desync-fooling`:
+- `ts`
+- `md5sig`
+- Regression/unit tests для парсинга и совместимости старых/новых ключей
 
-### Этап 8: DPI desync DSL (совместимость ключей)
+### Реализовано частично
 
-- Поддержать алиасы zapret/winws:
-- `--dpi-desync=*` (map в текущие `split/oob/fake/tlsrec/disorder/frag`)
-- `--dpi-desync-repeats=*` (map в `repeats`)
-- `--dpi-desync-fooling=*` (`ts`, `md5sig`, комбинации)
-- Минимальный target:
-- `fake`, `disorder`, `split`, `hostfakesplit`
-- Ошибки парсинга должны явно сообщать, какие значения поддержаны
-- Scope реализации:
-- Парсер в `daemon/src/config.rs`: разбор CSV/`+`-комбинаций, нормализация регистра, дедупликация значений
-- Canonical mapping (единая точка преобразования): `dpi_desync -> internal action flags`
-- Правила приоритета: явные legacy-флаги (`s1`, `-o1`, `-d`, `-g*`) имеют приоритет над алиасами только при конфликте одного и того же поля
-- Формат ошибок: `unsupported value '<x>' for --dpi-desync, supported: fake,disorder,split,hostfakesplit`
-- Тесты:
-- unit-тесты парсинга (валидные/невалидные комбинации)
-- regression-тесты совместимости: одинаковый `Config` для эквивалентных old/new ключей
-- Документация:
-- примеры эквивалентных команд `old flags <-> --dpi-desync*`
-- таблица соответствий в `docs/DEVELOPMENT.md` и `README.md`
+- Совместимость с zapret/winws уже есть на уровне базовых action/filter/list/repeats сценариев, но не на уровне полного набора профилей
+- `hostfakesplit` сейчас маппится в текущие internal actions (`split + fake`), но дополнительные zapret-модификаторы для host-specific fake payload ещё не реализованы
+- Fake profile selection уже умеет выбирать payload по L7 (`stun`, `discord`) и по QUIC/port 443, но набор флагов для этого пока не полностью zapret-совместим по именам
+- `--dpi-desync-hostfakesplit-mod=host=<domain>` реализован в минимальном userspace-only варианте: генерируется fake HTTP payload с указанным `Host`
+- `--dpi-desync-fake-unknown-udp=*` реализован как fallback profile для unknown L7 в текущем userspace fake path
+- `--ip-id=zero` реализован на userspace IPv4 injection path
+- `--dpi-desync-autottl=*` реализован как userspace TTL/hop-limit tuning для инжектируемых пакетов
+- `--dpi-desync-cutoff=*` реализован как per-connection/per-action cutoff в userspace event processor
+- `--dpi-desync-any-protocol=*` реализован как расширение userspace fallback profile selection для unknown L7
 
-### Этап 9: Расширенные десинк-параметры
+### Пока не реализовано
+
+- Полный coverage всех winws/zapret action/modifier имён и semantics без оговорок
+- Runtime-совместимость Windows path значений вида `C:\...` на Linux по-прежнему требует замены пути
+
+## 8. Целевой профиль совместимости с zapret
+
+Ниже зафиксирован practical target: пользователь должен иметь возможность запускать daemon профилем, близким к следующему классу аргументов:
+
+```text
+--wf-tcp ...
+--wf-udp ...
+--filter-udp ...
+--hostlist ...
+--hostlist-exclude ...
+--ipset ...
+--ipset-exclude ...
+--dpi-desync fake|hostfakesplit
+--dpi-desync-repeats N
+--dpi-desync-fake-quic ...
+--dpi-desync-fake-discord ...
+--dpi-desync-fake-stun ...
+--dpi-desync-hostfakesplit-mod host=...
+--dpi-desync-fooling ts,md5sig
+--ip-id zero
+--dpi-desync-autottl 2
+--dpi-desync-any-protocol 1
+--dpi-desync-fake-unknown-udp ...
+--dpi-desync-cutoff n2
+--new
+```
+
+### Что уже покрывается текущим кодом
+
+- Разбиение профиля на секции через `--new`
+- Правила с разными `filter-tcp/filter-udp` по секциям
+- Алиасы `wf-tcp/wf-udp` для глобальных port filters
+- `hostlist`, `hostlist-exclude`, `ipset`, `ipset-exclude`
+- `hostlist-domains`
+- `filter-l7 discord,stun`
+- `--dpi-desync fake`
+- `--dpi-desync hostfakesplit`
+- `--dpi-desync-repeats`
+- `--dpi-desync-fooling ts[,md5sig]`
+- Загрузка fake payload через существующие флаги `--fake-quic`, `--fake-discord`, `--fake-stun`
+- Алиасы `--dpi-desync-fake-{quic,discord,stun}`
+- `--dpi-desync-hostfakesplit-mod=host=<domain>`
+- `--dpi-desync-fake-unknown-udp`
+- `--ip-id=zero`, `--dpi-desync-autottl`, `--dpi-desync-cutoff`, `--dpi-desync-any-protocol`
+
+### Что нужно добавить для целевого zapret-профиля
+
+#### Приоритет B: профильно-специфичные desync modifiers
+
+- `--dpi-desync-hostfakesplit-mod=*`
+- Минимальная реализация: userspace-only mod selector для `hostfakesplit`
+- Первый practical target: `host=<domain>`
+
+- `--dpi-desync-fake-unknown-udp=*`
+- Семантика: payload profile для UDP трафика, не распознанного как `stun`/`discord`/`quic`
+
+#### Приоритет C: low-level knobs
 
 - `--ip-id=zero`
-- `--dpi-desync-cutoff=*` (например `n2`, `n3`)
+- `--dpi-desync-autottl=*`
+- `--dpi-desync-cutoff=*`
 - `--dpi-desync-any-protocol=*`
-- `--dpi-desync-fake-unknown-udp=*` (payload profile для UDP non-STUN/non-QUIC)
-- Дополнительно (по необходимости совместимости профилей):
-- `--wf-tcp=*`, `--wf-udp=*` как алиасы/глобальные L4-filter пресеты
-- Поле/флаги в proto/eBPF добавлять только при реальной необходимости (иначе держать в userspace)
+- Текущая реализация уже есть в userspace-only варианте
+- При необходимости полной zapret-совместимости semantics можно усиливать через proto/eBPF
 
-### Этап 10: Профили и миграция конфигов
+## 9. Совместимость и ограничения
 
-- Добавить режим импорта winws/zapret-like профилей в текущий `-c` формат
-- Таблица соответствия `old flag -> internal rule`
-- Интеграционные тесты на наборах реальных профилей (YouTube/Discord/Game)
-- Документация: примеры для Linux service и rollback-план
+- Текущий daemon запускается на Linux. Пути вида `C:\...` из zapret/winws-профилей не являются runtime-совместимыми как есть и должны быть заменены на Linux paths.
+- Для list/profile files допустимы как CSV-значения, так и пути к локальным файлам.
+- Для полной zapret-совместимости важна не только поддержка action flags, но и сохранение семантики секций `--new` и порядка применения правил.
+- Для импорта profile strings теперь можно использовать `--config-file <path>`; parser понимает multiline profile text, quoted values, line continuation через `^`/`\` и игнорирует строковые комментарии (`#`, `;`, `//`, `::`, `rem`).
 
-### Приоритет реализации
+## 10. План реализации для zapret-like запуска
 
-1. Этапы 1+2 (максимальная польза при минимальном риске)
-2. Этап 3 (таргетинг по спискам)
-3. Этап 4 (усиление устойчивости обхода)
-4. Этап 5 (минимальные L7-сигнатуры)
-5. Этапы 7+8 (совместимость ключей/фильтров)
-6. Этапы 6+9 (опциональные низкоуровневые параметры)
-7. Этап 10 (миграция профилей и стабилизация)
+1. Добавить алиасы `--wf-tcp/--wf-udp` и `--dpi-desync-fake-*` без изменения внутренней модели. [done]
+2. Добавить `--dpi-desync-hostfakesplit-mod` с минимальной поддержкой `host=<domain>`. [done]
+3. Добавить `--dpi-desync-fake-unknown-udp`. [done]
+4. Добавить regression-тест с большим composite profile, приближённым к реальному zapret config. [done]
+5. Уточнить и при необходимости усилить semantics `ip-id/autottl/cutoff/any-protocol` до полного zapret parity. [done]
+6. После этого документировать прямое соответствие `zapret args -> internal config`. [done in this document]
+
+## 11. Соответствие zapret args -> internal config
+
+Таблица ниже фиксирует текущее canonical mapping в userspace parser/runtime.
+
+| Zapret-like arg | Internal field / behavior | Notes |
+| --- | --- | --- |
+| `--wf-tcp=<ports>` | `DpiConfig.filter_tcp` | Алиас `--filter-tcp` |
+| `--wf-udp=<ports>` | `DpiConfig.filter_udp` | Алиас `--filter-udp` |
+| `--filter-l7=discord,stun` | `DpiConfig.filter_l7` | Фильтр до инъекции |
+| `--hostlist=*` | `DpiConfig.hostlist` | Повторяемые флаги append |
+| `--hostlist-domains=*` | `DpiConfig.hostlist` | Алиас domain-only list |
+| `--hostlist-exclude=*` | `DpiConfig.hostlist_exclude` | Exclude list |
+| `--ipset=*` | `DpiConfig.ipset` | IPv4/IPv6 CIDR или single IP |
+| `--ipset-exclude=*` | `DpiConfig.ipset_exclude` | Exclude IP list |
+| `--dpi-desync=fake` | `dpi_desync_actions += Fake`, `fake_offset = -1` if unset | Legacy `-f` имеет приоритет |
+| `--dpi-desync=split` | `dpi_desync_actions += Split`, `split_pos = 1` if unset | Legacy `-s` имеет приоритет |
+| `--dpi-desync=disorder` | `dpi_desync_actions += Disorder`, `use_disorder = true` | Legacy `-d` имеет приоритет |
+| `--dpi-desync=hostfakesplit` | `dpi_desync_actions += Split + Fake`, `split_pos = 1`, `fake_offset = -1` if unset | userspace mapping |
+| `--dpi-desync-repeats=N` | `DpiConfig.dpi_desync_repeats = N` | Используется как fallback repeats |
+| `--dpi-desync-fooling=ts,md5sig` | `DpiConfig.dpi_desync_fooling` | Сейчас parser/runtime metadata |
+| `--fake-quic=<file>` | `fake_profiles.quic` | File payload |
+| `--fake-discord=<file>` | `fake_profiles.discord` | File payload |
+| `--fake-stun=<file>` | `fake_profiles.stun` | File payload |
+| `--dpi-desync-fake-quic=<file>` | `fake_profiles.quic` | Алиас `--fake-quic` |
+| `--dpi-desync-fake-discord=<file>` | `fake_profiles.discord` | Алиас `--fake-discord` |
+| `--dpi-desync-fake-stun=<file>` | `fake_profiles.stun` | Алиас `--fake-stun` |
+| `--dpi-desync-hostfakesplit-mod=host=<domain>` | `fake_profiles.hostfakesplit` | Генерируется fake HTTP payload с `Host` |
+| `--dpi-desync-fake-unknown-udp=<file>` | `fake_profiles.unknown_udp` | Fallback profile для unknown UDP/L7 |
+| `--ip-id=zero` | `DpiConfig.ip_id_zero` -> injector sets IPv4 ID to `0` | Userspace injection path |
+| `--dpi-desync-autottl=N` | `DpiConfig.dpi_desync_autottl` -> injector TTL/Hop Limit = `64 - N`, min `1` | `None` keeps default |
+| `--dpi-desync-cutoff=nN` | `DpiConfig.dpi_desync_cutoff = N` | Runtime limit per connection and per action |
+| `--dpi-desync-any-protocol=1` | `DpiConfig.dpi_desync_any_protocol = true` | Expands unknown UDP fallback beyond port `443` |
+| `--new --proto=tcp --ports=... --action=... --repeats=...` | `DpiConfig.rules.push(Rule)` | Rule engine section |
+
+Практические примечания:
+
+- Без `--dpi-desync-any-protocol=1` `fake-unknown-udp` fallback не расширяется на весь unknown UDP; по умолчанию он остаётся ограниченным QUIC-like path на `dst_port=443`.
+- `cutoff` считается отдельно для каждой `(connection, action)` пары.
+- `autottl` и `ip-id=zero` сейчас применяются на userspace injection path; это не eBPF-side knob.

@@ -110,11 +110,26 @@ sudo ./target/release/goodbyedpi-daemon -i eth0 -c "s1 -o1 -g8 -Ar -At -As"
 # Ограничить инъекции только нужными портами (Stage 2: Port filters)
 sudo ./target/release/goodbyedpi-daemon -i eth0 -c "s1 -o1 -g8 --filter-tcp=443,2053 --filter-udp=443,1024-65535"
 
+# Zapret-like алиасы для глобальных port filters
+sudo ./target/release/goodbyedpi-daemon -i eth0 -c "s1 -o1 --wf-tcp=80,443,1024-65535 --wf-udp=443,50000-50100"
+
 # Таргетинг по host/ip спискам (Stage 3: Host/IP lists)
 sudo ./target/release/goodbyedpi-daemon -i eth0 -c "s1 -o1 --hostlist=googlevideo.com,*.youtube.com --hostlist-exclude=music.youtube.com --ipset=142.250.0.0/15 --ipset-exclude=142.250.10.10"
 
 # Fake profiles из файлов (Stage 4: Repeats + fake profiles)
 sudo ./target/release/goodbyedpi-daemon -i eth0 -c "s1 -f-1 --fake-quic=/etc/goodbyedpi/fake-quic.bin --fake-discord=/etc/goodbyedpi/fake-discord.bin --fake-stun=/etc/goodbyedpi/fake-stun.bin --new --action=fake --ports=443 --repeats=3"
+
+# Zapret-like алиасы для fake profiles
+sudo ./target/release/goodbyedpi-daemon -i eth0 -c "--dpi-desync=fake --dpi-desync-fake-quic=/etc/goodbyedpi/fake-quic.bin --dpi-desync-fake-discord=/etc/goodbyedpi/fake-discord.bin --dpi-desync-fake-stun=/etc/goodbyedpi/fake-stun.bin --dpi-desync-repeats=6"
+
+# Hostfakesplit host override + unknown UDP fallback profile
+sudo ./target/release/goodbyedpi-daemon -i eth0 -c "--dpi-desync=hostfakesplit --dpi-desync-hostfakesplit-mod=host=www.google.com --dpi-desync-fake-unknown-udp=/etc/goodbyedpi/fake-unknown-udp.bin"
+
+# Userspace low-level desync knobs
+sudo ./target/release/goodbyedpi-daemon -i eth0 -c "--dpi-desync=fake --dpi-desync-autottl=2 --dpi-desync-cutoff=n2 --dpi-desync-any-protocol=1 --ip-id=zero"
+
+# Импорт profile string из файла (многострочный zapret/winws-like формат)
+sudo ./target/release/goodbyedpi-daemon -i eth0 --config-file /etc/goodbyedpi/profile.txt
 
 # Stage 5: L7 filters (минимум) включены автоматически
 # Детектируются сигнатуры STUN/Discord по первым байтам payload для выбора fake-профиля.
@@ -128,6 +143,34 @@ sudo ./target/release/goodbyedpi-daemon -i eth0 -c "s1 -o1" --metrics-bind 0.0.0
 # Отключить endpoint метрик
 sudo ./target/release/goodbyedpi-daemon -i eth0 -c "s1 -o1" --no-metrics
 ```
+
+### Zapret Mapping
+
+Короткое соответствие `zapret args -> internal config`:
+
+| Arg | Internal mapping |
+| --- | --- |
+| `--wf-tcp`, `--wf-udp` | Алиасы `--filter-tcp`, `--filter-udp` |
+| `--dpi-desync=fake` | `dpi_desync_actions += Fake`, default `fake_offset = -1` |
+| `--dpi-desync=split` | `dpi_desync_actions += Split`, default `split_pos = 1` |
+| `--dpi-desync=disorder` | `dpi_desync_actions += Disorder`, `use_disorder = true` |
+| `--dpi-desync=hostfakesplit` | `Split + Fake`, default `split_pos = 1`, `fake_offset = -1` |
+| `--dpi-desync-fake-quic`, `--dpi-desync-fake-discord`, `--dpi-desync-fake-stun` | Алиасы существующих `--fake-*` file profiles |
+| `--dpi-desync-hostfakesplit-mod=host=<domain>` | Генерация fake HTTP payload с нужным `Host` |
+| `--dpi-desync-fake-unknown-udp=<file>` | Fallback payload для unknown UDP/L7 |
+| `--ip-id=zero` | На userspace injection path IPv4 ID ставится в `0` |
+| `--dpi-desync-autottl=N` | TTL/Hop Limit для инжекции становится `64 - N`, минимум `1` |
+| `--dpi-desync-cutoff=nN` | Лимит инъекций `per-connection/per-action` |
+| `--dpi-desync-any-protocol=1` | Расширяет `fake-unknown-udp` fallback за пределы `dst_port=443` |
+| `--new ...` | Добавляет rule-engine section |
+
+Полная таблица и ограничения: `docs/DEVELOPMENT.md`.
+
+Практическая совместимость с profile strings:
+
+- `--config-file <path>` загружает профиль из файла и затем дополняет его аргументами из `-c` при наличии.
+- Парсер понимает многострочный ввод, quoted values, а также line continuation через `^` и `\`.
+- Строки-комментарии с префиксами `#`, `;`, `//`, `::`, `rem` игнорируются.
 
 ### Метрики
 

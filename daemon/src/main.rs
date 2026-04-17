@@ -33,6 +33,10 @@ struct Args {
     #[arg(short, long, default_value = "")]
     config: String,
 
+    /// Path to a config/profile file with multiline zapret/winws-like arguments
+    #[arg(long)]
+    config_file: Option<String>,
+
     /// Enable debug logging
     #[arg(short, long)]
     debug: bool,
@@ -65,6 +69,9 @@ async fn main() -> Result<()> {
     info!("Starting GoodByeDPI eBPF daemon");
     info!("Interface: {}", args.interface);
     info!("Config: {}", args.config);
+    if let Some(path) = &args.config_file {
+        info!("Config file: {}", path);
+    }
     info!(
         "Metrics endpoint: {}",
         if args.no_metrics {
@@ -83,8 +90,10 @@ async fn main() -> Result<()> {
     );
 
     // Parse configuration
-    let mut parsed_config = DpiConfig::parse(&args.config)
-        .with_context(|| format!("Failed to parse DPI configuration: '{}'", args.config))?;
+    let merged_config = load_merged_config(&args)
+        .with_context(|| "Failed to load CLI/profile configuration".to_string())?;
+    let mut parsed_config = DpiConfig::parse(&merged_config)
+        .with_context(|| format!("Failed to parse DPI configuration: '{}'", merged_config))?;
     parsed_config.bpf_printk = args.bpf_printk;
 
     // Check if any auto-logic is enabled
@@ -231,4 +240,22 @@ async fn main() -> Result<()> {
 
     info!("Goodbye!");
     Ok(())
+}
+
+fn load_merged_config(args: &Args) -> Result<String> {
+    let mut chunks = Vec::new();
+
+    if let Some(path) = &args.config_file {
+        let from_file = std::fs::read_to_string(path)
+            .with_context(|| format!("Failed to read config file '{}'", path))?;
+        if !from_file.trim().is_empty() {
+            chunks.push(from_file);
+        }
+    }
+
+    if !args.config.trim().is_empty() {
+        chunks.push(args.config.clone());
+    }
+
+    Ok(chunks.join("\n"))
 }

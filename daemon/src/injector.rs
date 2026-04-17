@@ -4,7 +4,7 @@ use nix::sys::socket::{socket, AddressFamily, SockFlag, SockType};
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::os::fd::IntoRawFd;
 use std::os::unix::io::RawFd;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
 
 /* IP header flags */
 const IP_MF: u16 = 0x2000; // More Fragments flag
@@ -20,12 +20,20 @@ const IPV6_FRAGMENT_NEXT_HEADER: u8 = 44;
 
 static IPV6_FRAGMENT_ID: AtomicU32 = AtomicU32::new(1);
 static IPV4_FRAGMENT_ID: AtomicU32 = AtomicU32::new(1);
+const DEFAULT_TTL: u8 = 64;
+
+#[derive(Default)]
+struct InjectorTuning {
+    ip_id_zero: AtomicBool,
+    ttl_override: AtomicU8, // 0 => use default TTL/Hop Limit
+}
 
 /// Raw socket injector for fake packets and UDP fragmentation
 pub struct RawInjector {
     sock_v4: RawFd,
     sock_v6: RawFd,
     udp_injector: UdpFragmentInjector,
+    tuning: InjectorTuning,
 }
 
 impl RawInjector {
@@ -129,7 +137,49 @@ impl RawInjector {
             sock_v4: raw_fd_v4,
             sock_v6: raw_fd_v6,
             udp_injector,
+            tuning: InjectorTuning::default(),
         })
+    }
+
+    pub fn set_tuning(&self, ip_id_zero: bool, autottl: Option<u8>) {
+        self.tuning.ip_id_zero.store(ip_id_zero, Ordering::Relaxed);
+        let ttl = compute_ttl_override(autottl);
+        self.tuning.ttl_override.store(ttl, Ordering::Relaxed);
+        self.udp_injector.set_tuning(ip_id_zero, autottl);
+
+        let hop_limit: i32 = if ttl == 0 { -1 } else { i32::from(ttl) };
+        unsafe {
+            let ret = libc::setsockopt(
+                self.sock_v6,
+                libc::IPPROTO_IPV6,
+                libc::IPV6_UNICAST_HOPS,
+                &hop_limit as *const _ as *const libc::c_void,
+                std::mem::size_of::<i32>() as libc::socklen_t,
+            );
+            if ret < 0 {
+                let err = std::io::Error::last_os_error();
+                debug!(
+                    "Failed to set IPV6_UNICAST_HOPS on raw TCP socket: {} (os error {})",
+                    err,
+                    err.raw_os_error().unwrap_or(-1)
+                );
+            }
+        }
+    }
+
+    fn current_ttl(&self) -> u8 {
+        match self.tuning.ttl_override.load(Ordering::Relaxed) {
+            0 => DEFAULT_TTL,
+            value => value,
+        }
+    }
+
+    fn current_ipv4_identification(&self) -> u16 {
+        if self.tuning.ip_id_zero.load(Ordering::Relaxed) {
+            0
+        } else {
+            next_ipv4_fragment_id()
+        }
     }
 
     /// Get reference to UDP fragment injector
@@ -168,7 +218,12 @@ impl RawInjector {
         );
 
         // Build IP header
-        let ip_header = build_ip_header(src_ip, dst_ip);
+        let ip_header = build_ip_header(
+            src_ip,
+            dst_ip,
+            self.current_ipv4_identification(),
+            self.current_ttl(),
+        );
 
         // Build TCP header with checksum
         let tcp_header = build_tcp_header(src_port, dst_port, seq, ack, flags, payload);
@@ -1096,7 +1151,12 @@ impl RawInjector {
         let flags = 0x38; // URG (0x20) | PSH (0x08) | ACK (0x10)
 
         // Build IP header
-        let ip_header = build_ip_header(src_ip, dst_ip);
+        let ip_header = build_ip_header(
+            src_ip,
+            dst_ip,
+            self.current_ipv4_identification(),
+            self.current_ttl(),
+        );
 
         // Build TCP header with urgent pointer
         let tcp_header = build_tcp_header_with_urgent(
@@ -1257,6 +1317,7 @@ impl RawInjector {
 pub struct UdpFragmentInjector {
     sock_v4: RawFd,
     sock_v6: RawFd,
+    tuning: InjectorTuning,
 }
 
 impl UdpFragmentInjector {
@@ -1355,7 +1416,29 @@ impl UdpFragmentInjector {
         Ok(Self {
             sock_v4: raw_fd_v4,
             sock_v6: raw_fd_v6,
+            tuning: InjectorTuning::default(),
         })
+    }
+
+    pub fn set_tuning(&self, ip_id_zero: bool, autottl: Option<u8>) {
+        self.tuning.ip_id_zero.store(ip_id_zero, Ordering::Relaxed);
+        let ttl = compute_ttl_override(autottl);
+        self.tuning.ttl_override.store(ttl, Ordering::Relaxed);
+    }
+
+    fn current_ttl(&self) -> u8 {
+        match self.tuning.ttl_override.load(Ordering::Relaxed) {
+            0 => DEFAULT_TTL,
+            value => value,
+        }
+    }
+
+    fn current_ipv4_identification(&self) -> u16 {
+        if self.tuning.ip_id_zero.load(Ordering::Relaxed) {
+            0
+        } else {
+            next_ipv4_fragment_id()
+        }
     }
 
     /// Fragment and inject UDP payload as IP fragments
@@ -1417,7 +1500,7 @@ impl UdpFragmentInjector {
         let num_frags = total_len.div_ceil(frag_payload_size);
         let mut frags_sent = 0;
         // Identification must be the same for all IPv4 fragments of one datagram.
-        let identification = next_ipv4_fragment_id();
+        let identification = self.current_ipv4_identification();
 
         // Fragment offset is measured in 8-byte units
         let frag_unit: usize = 8;
@@ -1445,6 +1528,7 @@ impl UdpFragmentInjector {
                 frag_data.len() as u16 + 20, // IP header + fragment data
                 identification,              // Identification (same for all fragments)
                 flags_offset,
+                self.current_ttl(),
             );
 
             // Build complete packet
@@ -1562,6 +1646,7 @@ impl UdpFragmentInjector {
                 dst_ip,
                 (8 + frag_data.len()) as u16,
                 IPV6_FRAGMENT_NEXT_HEADER,
+                self.current_ttl(),
             );
             let frag_header = build_ipv6_fragment_header(
                 libc::IPPROTO_UDP as u8,
@@ -1629,8 +1714,9 @@ impl UdpFragmentInjector {
             src_ip,
             dst_ip,
             udp_len + 20, // IP header + UDP packet
-            0,            // Identification
-            IP_DF,        // Don't Fragment flag
+            self.current_ipv4_identification(),
+            IP_DF, // Don't Fragment flag
+            self.current_ttl(),
         );
 
         // Combine IP + UDP
@@ -1690,6 +1776,7 @@ impl UdpFragmentInjector {
             dst_ip,
             udp_packet.len() as u16,
             libc::IPPROTO_UDP as u8,
+            self.current_ttl(),
         );
         let packet = [&ipv6_header[..], &udp_packet[..]].concat();
 
@@ -1749,6 +1836,7 @@ fn build_fragment_ip_header(
     total_len: u16,
     identification: u16,
     flags_offset: u16,
+    ttl: u8,
 ) -> Vec<u8> {
     let mut header = vec![0u8; 20];
 
@@ -1760,7 +1848,7 @@ fn build_fragment_ip_header(
     // Flags and Fragment Offset (3 bits flags + 13 bits offset)
     header[6..8].copy_from_slice(&flags_offset.to_be_bytes());
 
-    header[8] = 64; // TTL
+    header[8] = ttl; // TTL
     header[9] = 17; // Protocol: UDP
                     // Header checksum - calculated later (bytes 10-11)
     header[10..12].copy_from_slice(&0u16.to_be_bytes());
@@ -1776,12 +1864,18 @@ fn build_fragment_ip_header(
 }
 
 /// Build IPv6 header
-fn build_ipv6_header(src: Ipv6Addr, dst: Ipv6Addr, payload_len: u16, next_header: u8) -> Vec<u8> {
+fn build_ipv6_header(
+    src: Ipv6Addr,
+    dst: Ipv6Addr,
+    payload_len: u16,
+    next_header: u8,
+    hop_limit: u8,
+) -> Vec<u8> {
     let mut header = vec![0u8; 40];
     header[0] = 0x60; // Version 6
     header[4..6].copy_from_slice(&payload_len.to_be_bytes());
     header[6] = next_header;
-    header[7] = 64; // Hop limit
+    header[7] = hop_limit; // Hop limit
     header[8..24].copy_from_slice(&src.octets());
     header[24..40].copy_from_slice(&dst.octets());
     header
@@ -1810,16 +1904,15 @@ fn build_ipv6_fragment_header(
 }
 
 /// Build IP header for IPv4 packet
-fn build_ip_header(src: Ipv4Addr, dst: Ipv4Addr) -> Vec<u8> {
+fn build_ip_header(src: Ipv4Addr, dst: Ipv4Addr, identification: u16, ttl: u8) -> Vec<u8> {
     let mut header = vec![0u8; 20];
     header[0] = 0x45; // Version 4, IHL 5
     header[1] = 0; // DSCP, ECN
                    // Total length - set later (bytes 2-3)
-    header[4] = 0; // Identification
-    header[5] = 0;
+    header[4..6].copy_from_slice(&identification.to_be_bytes());
     header[6] = 0x40; // Don't fragment
     header[7] = 0;
-    header[8] = 64; // TTL
+    header[8] = ttl; // TTL
     header[9] = 6; // Protocol: TCP
                    // Header checksum - calculated later (bytes 10-11)
     header[12..16].copy_from_slice(&src.octets());
@@ -1968,6 +2061,12 @@ fn next_ipv4_fragment_id() -> u16 {
     (IPV4_FRAGMENT_ID.fetch_add(1, Ordering::Relaxed) & 0xFFFF) as u16
 }
 
+fn compute_ttl_override(autottl: Option<u8>) -> u8 {
+    autottl
+        .map(|delta| DEFAULT_TTL.saturating_sub(delta).max(1))
+        .unwrap_or(0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1984,11 +2083,51 @@ mod tests {
     fn test_build_ip_header() {
         let src = Ipv4Addr::new(192, 168, 1, 1);
         let dst = Ipv4Addr::new(10, 0, 0, 1);
-        let header = build_ip_header(src, dst);
+        let header = build_ip_header(src, dst, 1234, 61);
 
         assert_eq!(header.len(), 20);
         assert_eq!(header[0], 0x45); // IPv4, IHL 5
+        assert_eq!(&header[4..6], &1234u16.to_be_bytes());
+        assert_eq!(header[8], 61);
         assert_eq!(header[9], 6); // TCP protocol
+    }
+
+    #[test]
+    fn test_build_ip_header_with_zero_identification() {
+        let src = Ipv4Addr::new(192, 168, 1, 1);
+        let dst = Ipv4Addr::new(10, 0, 0, 1);
+        let header = build_ip_header(src, dst, 0, DEFAULT_TTL);
+
+        assert_eq!(&header[4..6], &0u16.to_be_bytes());
+        assert_eq!(header[8], DEFAULT_TTL);
+    }
+
+    #[test]
+    fn test_compute_ttl_override_semantics() {
+        assert_eq!(compute_ttl_override(None), 0);
+        assert_eq!(compute_ttl_override(Some(2)), 62);
+        assert_eq!(compute_ttl_override(Some(DEFAULT_TTL)), 1);
+        assert_eq!(compute_ttl_override(Some(255)), 1);
+    }
+
+    #[test]
+    fn test_injector_tuning_current_values() {
+        let tuning = InjectorTuning::default();
+        let ttl_override = compute_ttl_override(Some(2));
+        tuning
+            .ip_id_zero
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        tuning
+            .ttl_override
+            .store(ttl_override, std::sync::atomic::Ordering::Relaxed);
+
+        assert!(tuning.ip_id_zero.load(std::sync::atomic::Ordering::Relaxed));
+        assert_eq!(
+            tuning
+                .ttl_override
+                .load(std::sync::atomic::Ordering::Relaxed),
+            62
+        );
     }
 
     #[test]
@@ -2222,7 +2361,8 @@ mod tests {
         let identification = 12345;
         let flags_offset = 0x2000 | 5; // MF flag set + offset 5 (40 bytes)
 
-        let header = build_fragment_ip_header(src, dst, total_len, identification, flags_offset);
+        let header =
+            build_fragment_ip_header(src, dst, total_len, identification, flags_offset, 63);
 
         assert_eq!(header.len(), 20);
         assert_eq!(header[0], 0x45); // Version 4, IHL 5
@@ -2230,7 +2370,7 @@ mod tests {
         assert_eq!(&header[4..6], &identification.to_be_bytes()); // ID
                                                                   // Flags and offset
         assert_eq!(&header[6..8], &flags_offset.to_be_bytes());
-        assert_eq!(header[8], 64); // TTL
+        assert_eq!(header[8], 63); // TTL
         assert_eq!(header[9], 17); // UDP protocol
         assert_eq!(&header[12..16], &src.octets());
         assert_eq!(&header[16..20], &dst.octets());

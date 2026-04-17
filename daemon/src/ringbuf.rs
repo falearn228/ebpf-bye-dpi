@@ -5,7 +5,9 @@
 
 use anyhow::{Context, Result};
 use log::{debug, info, warn};
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::Mutex;
 use tokio::sync::mpsc::Receiver;
 use tokio::sync::RwLock;
 
@@ -28,6 +30,7 @@ pub struct EventProcessor {
     auto_logic: Option<Arc<AutoLogic>>,
     /// Channel for sending config updates to BPF thread
     config_update_tx: Option<std::sync::mpsc::Sender<Vec<u8>>>,
+    cutoff_counters: Mutex<HashMap<(ConnKey, u8), u8>>,
 }
 
 impl EventProcessor {
@@ -42,6 +45,7 @@ impl EventProcessor {
             injector,
             auto_logic: None,
             config_update_tx: None,
+            cutoff_counters: Mutex::new(HashMap::new()),
         })
     }
 
@@ -56,6 +60,7 @@ impl EventProcessor {
             injector,
             auto_logic: Some(auto_logic),
             config_update_tx: None,
+            cutoff_counters: Mutex::new(HashMap::new()),
         })
     }
 
@@ -78,6 +83,7 @@ impl EventProcessor {
             injector,
             auto_logic: Some(auto_logic),
             config_update_tx: Some(config_update_tx),
+            cutoff_counters: Mutex::new(HashMap::new()),
         })
     }
 
@@ -130,15 +136,56 @@ impl EventProcessor {
 
     /// Build connection key from event
     fn build_conn_key(&self, event: &Event) -> ConnKey {
+        self.build_conn_key_for_action(event, RuleAction::Split)
+    }
+
+    fn build_conn_key_for_action(&self, event: &Event, action: RuleAction) -> ConnKey {
+        let proto = match action.default_protocol() {
+            goodbyedpi_proto::RuleProtocol::Tcp => 6,
+            goodbyedpi_proto::RuleProtocol::Udp => 17,
+        };
         ConnKey {
             src_ip: event.src_ip,
             dst_ip: event.dst_ip,
             src_port: event.src_port,
             dst_port: event.dst_port,
             is_ipv6: event.is_ipv6,
-            proto: 6,     // TCP
+            proto,
             _pad: [0; 2], // Explicit zeroed padding for consistent hashing
         }
+    }
+
+    fn action_cutoff_allows(&self, config: &DpiConfig, event: &Event, action: RuleAction) -> bool {
+        let Some(limit) = config.dpi_desync_cutoff else {
+            return true;
+        };
+
+        let key = (
+            self.build_conn_key_for_action(event, action),
+            action_key(action),
+        );
+        let mut guard = match self.cutoff_counters.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if !consume_cutoff_budget(&mut guard, key, limit) {
+            debug!(
+                "[CUTOFF] Skip action {:?} for {}:{} -> {}:{} (limit {} reached)",
+                action,
+                event.format_ips().0,
+                event.src_port,
+                event.format_ips().1,
+                event.dst_port,
+                limit
+            );
+            return false;
+        }
+        true
+    }
+
+    fn configure_injector(&self, config: &DpiConfig) {
+        self.injector
+            .set_tuning(config.ip_id_zero, config.dpi_desync_autottl);
     }
 
     /// Resolve repeats from rule engine for specific action and event
@@ -274,6 +321,10 @@ impl EventProcessor {
         if !self.target_filter_allows(config, event, RuleAction::Split) {
             return;
         }
+        if !self.action_cutoff_allows(config, event, RuleAction::Split) {
+            return;
+        }
+        self.configure_injector(config);
 
         info!(
             "[SPLIT] handle_split_triggered called for {}:{} -> {}:{}, event_type={}",
@@ -445,6 +496,10 @@ impl EventProcessor {
                     if !self.target_filter_allows(config, event, RuleAction::Fake) {
                         return;
                     }
+                    if !self.action_cutoff_allows(config, event, RuleAction::Fake) {
+                        return;
+                    }
+                    self.configure_injector(config);
                     let repeats = self.repeats_for_action(config, event, RuleAction::Fake);
                     for attempt in 1..=repeats {
                         if let Err(e) = self.inject_fake_packet(event, config).await {
@@ -691,6 +746,10 @@ impl EventProcessor {
                 if !self.target_filter_allows(config, event, RuleAction::Fake) {
                     return;
                 }
+                if !self.action_cutoff_allows(config, event, RuleAction::Fake) {
+                    return;
+                }
+                self.configure_injector(config);
                 let repeats = self.repeats_for_action(config, event, RuleAction::Fake);
                 for attempt in 1..=repeats {
                     if let Err(e) = self.inject_fake_packet(event, config).await {
@@ -739,6 +798,10 @@ impl EventProcessor {
         if !self.target_filter_allows(config, event, RuleAction::Disorder) {
             return;
         }
+        if !self.action_cutoff_allows(config, event, RuleAction::Disorder) {
+            return;
+        }
+        self.configure_injector(config);
 
         // Get payload from event (clamped to MAX_PAYLOAD_SIZE for safety)
         let payload_len = (event.payload_len as usize).min(MAX_PAYLOAD_SIZE);
@@ -865,6 +928,10 @@ impl EventProcessor {
         if !self.target_filter_allows(config, event, RuleAction::Oob) {
             return;
         }
+        if !self.action_cutoff_allows(config, event, RuleAction::Oob) {
+            return;
+        }
+        self.configure_injector(config);
 
         // Get payload from event
         let payload_len = event.payload_len as usize;
@@ -972,6 +1039,10 @@ impl EventProcessor {
         if !self.target_filter_allows(config, event, RuleAction::Frag) {
             return;
         }
+        if !self.action_cutoff_allows(config, event, RuleAction::Frag) {
+            return;
+        }
+        self.configure_injector(config);
 
         info!(
             "[QUIC FRAG] Fragmentation triggered for {}:{} -> {}:{}, payload_len={}",
@@ -1074,6 +1145,10 @@ impl EventProcessor {
         if !self.target_filter_allows(config, event, RuleAction::Tlsrec) {
             return;
         }
+        if !self.action_cutoff_allows(config, event, RuleAction::Tlsrec) {
+            return;
+        }
+        self.configure_injector(config);
 
         // Get payload from event (clamped to MAX_PAYLOAD_SIZE for safety)
         let payload_len = (event.payload_len as usize).min(MAX_PAYLOAD_SIZE);
@@ -1218,7 +1293,7 @@ impl EventProcessor {
         };
         let detected_l7 = detect_l7(event_payload);
         let (payload, profile_name): (&[u8], Option<&str>) =
-            if let Some(profile) = self.select_fake_profile_payload(config, event, detected_l7) {
+            if let Some(profile) = select_fake_profile_payload(config, event, detected_l7) {
                 profile
             } else {
                 (event_payload, None)
@@ -1275,55 +1350,101 @@ impl EventProcessor {
         info!("[FAKE] Fake packet injected successfully");
         Ok(())
     }
-
-    fn select_fake_profile_payload<'a>(
-        &self,
-        config: &'a DpiConfig,
-        event: &Event,
-        detected_l7: L7Protocol,
-    ) -> Option<(&'a [u8], Option<&'static str>)> {
-        match detected_l7 {
-            L7Protocol::Stun => {
-                if let Some(payload) = config.fake_profiles.stun.as_ref() {
-                    return Some((payload.as_slice(), Some("fake-stun")));
-                }
-            }
-            L7Protocol::Discord => {
-                if let Some(payload) = config.fake_profiles.discord.as_ref() {
-                    return Some((payload.as_slice(), Some("fake-discord")));
-                }
-            }
-            L7Protocol::Unknown => {}
-        }
-
-        // Keep host-based fallback for Discord HTTPS/API flows where payload
-        // signature is not enough at this stage.
-        if let Some(host) = extract_target_host(event) {
-            if host.contains("discord") {
-                if let Some(payload) = config.fake_profiles.discord.as_ref() {
-                    return Some((payload.as_slice(), Some("fake-discord")));
-                }
-            }
-        }
-
-        if event.dst_port == 443 {
-            if let Some(payload) = config.fake_profiles.quic.as_ref() {
-                return Some((payload.as_slice(), Some("fake-quic")));
-            }
-        }
-
-        None
-    }
-
     /// Get auto-logic reference
     pub fn auto_logic(&self) -> Option<&Arc<AutoLogic>> {
         self.auto_logic.as_ref()
     }
 }
 
+fn consume_cutoff_budget(
+    counters: &mut HashMap<(ConnKey, u8), u8>,
+    key: (ConnKey, u8),
+    limit: u8,
+) -> bool {
+    let counter = counters.entry(key).or_insert(0);
+    if *counter >= limit {
+        return false;
+    }
+    *counter += 1;
+    true
+}
+
+fn unknown_udp_fallback_allowed(
+    config: &DpiConfig,
+    event: &Event,
+    detected_l7: L7Protocol,
+) -> bool {
+    matches!(detected_l7, L7Protocol::Unknown)
+        && (config.dpi_desync_any_protocol || event.dst_port == 443)
+}
+
+fn select_fake_profile_payload<'a>(
+    config: &'a DpiConfig,
+    event: &Event,
+    detected_l7: L7Protocol,
+) -> Option<(&'a [u8], Option<&'static str>)> {
+    match detected_l7 {
+        L7Protocol::Stun => {
+            if let Some(payload) = config.fake_profiles.stun.as_ref() {
+                return Some((payload.as_slice(), Some("fake-stun")));
+            }
+        }
+        L7Protocol::Discord => {
+            if let Some(payload) = config.fake_profiles.discord.as_ref() {
+                return Some((payload.as_slice(), Some("fake-discord")));
+            }
+        }
+        L7Protocol::Unknown => {}
+    }
+
+    if config.dpi_desync_actions.contains(&RuleAction::Split)
+        && config.dpi_desync_actions.contains(&RuleAction::Fake)
+    {
+        if let Some(payload) = config.fake_profiles.hostfakesplit.as_ref() {
+            return Some((payload.as_slice(), Some("hostfakesplit-mod")));
+        }
+    }
+
+    // Keep host-based fallback for Discord HTTPS/API flows where payload
+    // signature is not enough at this stage.
+    if let Some(host) = extract_target_host(event) {
+        if host.contains("discord") {
+            if let Some(payload) = config.fake_profiles.discord.as_ref() {
+                return Some((payload.as_slice(), Some("fake-discord")));
+            }
+        }
+    }
+
+    if event.dst_port == 443 {
+        if let Some(payload) = config.fake_profiles.quic.as_ref() {
+            return Some((payload.as_slice(), Some("fake-quic")));
+        }
+    }
+
+    if unknown_udp_fallback_allowed(config, event, detected_l7) {
+        if let Some(payload) = config.fake_profiles.unknown_udp.as_ref() {
+            return Some((payload.as_slice(), Some("fake-unknown-udp")));
+        }
+    }
+
+    None
+}
+
+fn action_key(action: RuleAction) -> u8 {
+    match action {
+        RuleAction::Split => 1,
+        RuleAction::Oob => 2,
+        RuleAction::Fake => 3,
+        RuleAction::Tlsrec => 4,
+        RuleAction::Disorder => 5,
+        RuleAction::Frag => 6,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::DpiConfig;
 
     #[test]
     fn test_event_types() {
@@ -1746,5 +1867,117 @@ mod tests {
         let mut payload2 = [0u8; 20];
         payload2[4..8].copy_from_slice(&[0x00, 0x00, 0x00, 0x00]);
         assert!(!crate::l7::looks_like_stun(&payload2));
+    }
+
+    fn make_event(dst_port: u16) -> Event {
+        Event {
+            event_type: event_types::FAKE_TRIGGERED,
+            src_ip: [0x0101A8C0, 0, 0, 0],
+            dst_ip: [0x0100000A, 0, 0, 0],
+            src_port: 12345,
+            dst_port,
+            seq: 1000,
+            ack: 500,
+            flags: 0x18,
+            payload_len: 8,
+            is_ipv6: 0,
+            sni_offset: 0,
+            sni_length: 0,
+            reserved: 0,
+            payload: [0u8; MAX_PAYLOAD_SIZE],
+            _pad: [0; 3],
+        }
+    }
+
+    #[test]
+    fn test_unknown_udp_fallback_requires_any_protocol_for_non_443() {
+        let mut cfg = DpiConfig::parse("").unwrap();
+        cfg.fake_profiles.unknown_udp = Some(vec![0xde, 0xad, 0xbe, 0xef]);
+
+        let event = make_event(3478);
+        assert!(!unknown_udp_fallback_allowed(
+            &cfg,
+            &event,
+            L7Protocol::Unknown
+        ));
+        assert_eq!(
+            select_fake_profile_payload(&cfg, &event, L7Protocol::Unknown),
+            None
+        );
+
+        cfg.dpi_desync_any_protocol = true;
+        let profile = select_fake_profile_payload(&cfg, &event, L7Protocol::Unknown).unwrap();
+        assert_eq!(profile.1, Some("fake-unknown-udp"));
+        assert_eq!(profile.0, &[0xde, 0xad, 0xbe, 0xef]);
+    }
+
+    #[test]
+    fn test_unknown_udp_fallback_allowed_on_port_443_without_any_protocol() {
+        let mut cfg = DpiConfig::parse("").unwrap();
+        cfg.fake_profiles.unknown_udp = Some(vec![0xfa, 0xce]);
+
+        let event = make_event(443);
+        assert!(unknown_udp_fallback_allowed(
+            &cfg,
+            &event,
+            L7Protocol::Unknown
+        ));
+
+        let profile = select_fake_profile_payload(&cfg, &event, L7Protocol::Unknown).unwrap();
+        assert_eq!(profile.1, Some("fake-unknown-udp"));
+        assert_eq!(profile.0, &[0xfa, 0xce]);
+    }
+
+    #[test]
+    fn test_quic_profile_takes_priority_over_unknown_udp_fallback() {
+        let mut cfg = DpiConfig::parse("").unwrap();
+        cfg.fake_profiles.quic = Some(vec![0xc3, 0xff]);
+        cfg.fake_profiles.unknown_udp = Some(vec![0xde, 0xad]);
+
+        let event = make_event(443);
+        let profile = select_fake_profile_payload(&cfg, &event, L7Protocol::Unknown).unwrap();
+        assert_eq!(profile.1, Some("fake-quic"));
+        assert_eq!(profile.0, &[0xc3, 0xff]);
+    }
+
+    #[test]
+    fn test_cutoff_budget_is_per_action_and_connection() {
+        let event_a = make_event(443);
+        let mut event_b = make_event(443);
+        event_b.src_port = 54321;
+
+        let key_a_fake = (
+            ConnKey {
+                src_ip: event_a.src_ip,
+                dst_ip: event_a.dst_ip,
+                src_port: event_a.src_port,
+                dst_port: event_a.dst_port,
+                is_ipv6: event_a.is_ipv6,
+                proto: 6,
+                _pad: [0; 2],
+            },
+            action_key(RuleAction::Fake),
+        );
+        let key_a_split = (key_a_fake.0, action_key(RuleAction::Split));
+        let key_b_fake = (
+            ConnKey {
+                src_ip: event_b.src_ip,
+                dst_ip: event_b.dst_ip,
+                src_port: event_b.src_port,
+                dst_port: event_b.dst_port,
+                is_ipv6: event_b.is_ipv6,
+                proto: 6,
+                _pad: [0; 2],
+            },
+            action_key(RuleAction::Fake),
+        );
+
+        let mut counters = HashMap::new();
+        assert!(consume_cutoff_budget(&mut counters, key_a_fake, 2));
+        assert!(consume_cutoff_budget(&mut counters, key_a_fake, 2));
+        assert!(!consume_cutoff_budget(&mut counters, key_a_fake, 2));
+
+        assert!(consume_cutoff_budget(&mut counters, key_a_split, 2));
+        assert!(consume_cutoff_budget(&mut counters, key_b_fake, 2));
     }
 }

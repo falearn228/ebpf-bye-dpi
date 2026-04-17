@@ -13,6 +13,8 @@ pub struct FakeProfiles {
     pub quic: Option<Vec<u8>>,
     pub discord: Option<Vec<u8>>,
     pub stun: Option<Vec<u8>>,
+    pub unknown_udp: Option<Vec<u8>>,
+    pub hostfakesplit: Option<Vec<u8>>,
 }
 
 impl fmt::Debug for FakeProfiles {
@@ -21,6 +23,11 @@ impl fmt::Debug for FakeProfiles {
             .field("quic_len", &self.quic.as_ref().map(Vec::len))
             .field("discord_len", &self.discord.as_ref().map(Vec::len))
             .field("stun_len", &self.stun.as_ref().map(Vec::len))
+            .field("unknown_udp_len", &self.unknown_udp.as_ref().map(Vec::len))
+            .field(
+                "hostfakesplit_len",
+                &self.hostfakesplit.as_ref().map(Vec::len),
+            )
             .finish()
     }
 }
@@ -123,11 +130,16 @@ pub struct DpiConfig {
     pub dpi_desync_actions: Vec<RuleAction>,
     pub dpi_desync_repeats: Option<u8>,
     pub dpi_desync_fooling: Vec<DpiDesyncFooling>,
+    pub ip_id_zero: bool,
+    pub dpi_desync_autottl: Option<u8>,
+    pub dpi_desync_cutoff: Option<u8>,
+    pub dpi_desync_any_protocol: bool,
     pub rules: Vec<RuleConfig>,
 }
 
 impl DpiConfig {
     pub fn parse(s: &str) -> Result<Self> {
+        let tokens = tokenize_config(s)?;
         let mut config = DpiConfig {
             split_pos: None,
             oob_positions: Vec::new(),
@@ -151,10 +163,14 @@ impl DpiConfig {
             dpi_desync_actions: Vec::new(),
             dpi_desync_repeats: None,
             dpi_desync_fooling: Vec::new(),
+            ip_id_zero: false,
+            dpi_desync_autottl: None,
+            dpi_desync_cutoff: None,
+            dpi_desync_any_protocol: false,
             rules: Vec::new(),
         };
 
-        let mut tokens = s.split_whitespace().peekable();
+        let mut tokens = tokens.iter().map(String::as_str).peekable();
         let mut current_rule: Option<RuleDraft> = None;
         let mut legacy_overrides = LegacyOverrides::default();
 
@@ -283,12 +299,16 @@ fn parse_global_filter_token<'a, I>(
 where
     I: Iterator<Item = &'a str>,
 {
-    if let Some(value) = parse_long_option_value("--filter-tcp", token, tokens) {
+    if let Some(value) = parse_long_option_value("--filter-tcp", token, tokens)
+        .or_else(|| parse_long_option_value("--wf-tcp", token, tokens))
+    {
         let value = value?;
         config.filter_tcp = parse_ports(&value)?;
         return Ok(Some(true));
     }
-    if let Some(value) = parse_long_option_value("--filter-udp", token, tokens) {
+    if let Some(value) = parse_long_option_value("--filter-udp", token, tokens)
+        .or_else(|| parse_long_option_value("--wf-udp", token, tokens))
+    {
         let value = value?;
         config.filter_udp = parse_ports(&value)?;
         return Ok(Some(true));
@@ -323,19 +343,35 @@ where
         config.ipset_exclude.extend(parse_ipset(&value)?);
         return Ok(Some(true));
     }
-    if let Some(value) = parse_long_option_value("--fake-quic", token, tokens) {
+    if let Some(value) = parse_long_option_value("--fake-quic", token, tokens)
+        .or_else(|| parse_long_option_value("--dpi-desync-fake-quic", token, tokens))
+    {
         let value = value?;
         config.fake_profiles.quic = Some(load_fake_payload(&value)?);
         return Ok(Some(true));
     }
-    if let Some(value) = parse_long_option_value("--fake-discord", token, tokens) {
+    if let Some(value) = parse_long_option_value("--fake-discord", token, tokens)
+        .or_else(|| parse_long_option_value("--dpi-desync-fake-discord", token, tokens))
+    {
         let value = value?;
         config.fake_profiles.discord = Some(load_fake_payload(&value)?);
         return Ok(Some(true));
     }
-    if let Some(value) = parse_long_option_value("--fake-stun", token, tokens) {
+    if let Some(value) = parse_long_option_value("--fake-stun", token, tokens)
+        .or_else(|| parse_long_option_value("--dpi-desync-fake-stun", token, tokens))
+    {
         let value = value?;
         config.fake_profiles.stun = Some(load_fake_payload(&value)?);
+        return Ok(Some(true));
+    }
+    if let Some(value) = parse_long_option_value("--dpi-desync-fake-unknown-udp", token, tokens) {
+        let value = value?;
+        config.fake_profiles.unknown_udp = Some(load_fake_payload(&value)?);
+        return Ok(Some(true));
+    }
+    if let Some(value) = parse_long_option_value("--dpi-desync-hostfakesplit-mod", token, tokens) {
+        let value = value?;
+        config.fake_profiles.hostfakesplit = Some(parse_hostfakesplit_mod(&value)?);
         return Ok(Some(true));
     }
     if let Some(value) = parse_long_option_value("--dpi-desync", token, tokens) {
@@ -364,6 +400,47 @@ where
     if let Some(value) = parse_long_option_value("--dpi-desync-fooling", token, tokens) {
         let value = value?;
         config.dpi_desync_fooling = parse_dpi_desync_fooling(&value)?;
+        return Ok(Some(true));
+    }
+    if let Some(value) = parse_long_option_value("--ip-id", token, tokens) {
+        let value = value?;
+        match value.trim().to_ascii_lowercase().as_str() {
+            "zero" => config.ip_id_zero = true,
+            _ => {
+                return Err(anyhow!(
+                    "unsupported value '{}' for --ip-id, supported: zero",
+                    value
+                ))
+            }
+        }
+        return Ok(Some(true));
+    }
+    if let Some(value) = parse_long_option_value("--dpi-desync-autottl", token, tokens) {
+        let value = value?;
+        let autottl: u8 = value.parse().with_context(|| {
+            format!(
+                "Invalid --dpi-desync-autottl '{}'. Expected integer in 1..=255",
+                value
+            )
+        })?;
+        if autottl == 0 {
+            return Err(anyhow!(
+                "Invalid --dpi-desync-autottl '{}'. Value must be >= 1",
+                value
+            ));
+        }
+        config.dpi_desync_autottl = Some(autottl);
+        return Ok(Some(true));
+    }
+    if let Some(value) = parse_long_option_value("--dpi-desync-cutoff", token, tokens) {
+        let value = value?;
+        let cutoff = parse_cutoff_value(&value)?;
+        config.dpi_desync_cutoff = Some(cutoff);
+        return Ok(Some(true));
+    }
+    if let Some(value) = parse_long_option_value("--dpi-desync-any-protocol", token, tokens) {
+        let value = value?;
+        config.dpi_desync_any_protocol = parse_bool_flag(&value, "--dpi-desync-any-protocol")?;
         return Ok(Some(true));
     }
     Ok(None)
@@ -489,6 +566,34 @@ fn load_fake_payload(path: &str) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
+fn parse_hostfakesplit_mod(raw: &str) -> Result<Vec<u8>> {
+    let Some(host) = raw.trim().strip_prefix("host=") else {
+        return Err(anyhow!(
+            "Invalid --dpi-desync-hostfakesplit-mod '{}'. Supported format: host=<domain>",
+            raw
+        ));
+    };
+
+    let host = host.trim().trim_end_matches('.').to_ascii_lowercase();
+    if host.is_empty() {
+        return Err(anyhow!(
+            "Invalid --dpi-desync-hostfakesplit-mod '{}'. Host value must not be empty",
+            raw
+        ));
+    }
+    if host.chars().any(char::is_whitespace) {
+        return Err(anyhow!(
+            "Invalid --dpi-desync-hostfakesplit-mod '{}'. Host value must not contain whitespace",
+            raw
+        ));
+    }
+
+    Ok(
+        format!("GET / HTTP/1.1\r\nHost: {host}\r\nUser-Agent: goodbyedpi\r\nAccept: */*\r\n\r\n")
+            .into_bytes(),
+    )
+}
+
 fn parse_l7_filters(raw: &str) -> Result<Vec<L7Filter>> {
     let mut out = Vec::new();
     for chunk in raw.split(',') {
@@ -505,6 +610,40 @@ fn parse_l7_filters(raw: &str) -> Result<Vec<L7Filter>> {
         out.push(filter);
     }
     Ok(out)
+}
+
+fn parse_cutoff_value(raw: &str) -> Result<u8> {
+    let normalized = raw.trim();
+    let digits = normalized
+        .strip_prefix('n')
+        .or_else(|| normalized.strip_prefix('N'))
+        .unwrap_or(normalized);
+
+    let cutoff: u8 = digits.parse().with_context(|| {
+        format!(
+            "Invalid --dpi-desync-cutoff '{}'. Expected integer like '2' or 'n2'",
+            raw
+        )
+    })?;
+    if cutoff == 0 {
+        return Err(anyhow!(
+            "Invalid --dpi-desync-cutoff '{}'. Value must be >= 1",
+            raw
+        ));
+    }
+    Ok(cutoff)
+}
+
+fn parse_bool_flag(raw: &str, option: &str) -> Result<bool> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "0" | "false" | "no" | "off" => Ok(false),
+        _ => Err(anyhow!(
+            "Invalid {} '{}'. Expected one of: 1,0,true,false,yes,no,on,off",
+            option,
+            raw
+        )),
+    }
 }
 
 fn parse_legacy_token(
@@ -622,8 +761,8 @@ fn parse_legacy_token(
         _ => {
             return Err(anyhow!(
                 "Unknown option '{}' in token '{}'. \
-                 Valid options: s (split), o (oob), f (fake), r (tlsrec), g (fragment), d (disorder), -A (auto), --new/--proto/--ports/--action/--repeats, --filter-tcp/--filter-udp/--filter-l7, --hostlist/--hostlist-domains/--hostlist-exclude, --ipset/--ipset-exclude, --fake-quic/--fake-discord/--fake-stun, --dpi-desync/--dpi-desync-repeats/--dpi-desync-fooling. \
-                 Example: 's1 -o1 -Ar -f-1 -r1+s -g8 -d --dpi-desync=hostfakesplit,disorder --dpi-desync-repeats=2 --dpi-desync-fooling=ts,md5sig --filter-tcp=443 --filter-l7=stun,discord --hostlist=googlevideo.com --fake-quic=/path/fake.bin --new --proto=tcp --ports=443 --action=split --repeats=2'",
+                 Valid options: s (split), o (oob), f (fake), r (tlsrec), g (fragment), d (disorder), -A (auto), --new/--proto/--ports/--action/--repeats, --filter-tcp/--filter-udp/--wf-tcp/--wf-udp/--filter-l7, --hostlist/--hostlist-domains/--hostlist-exclude, --ipset/--ipset-exclude, --fake-quic/--fake-discord/--fake-stun/--dpi-desync-fake-quic/--dpi-desync-fake-discord/--dpi-desync-fake-stun/--dpi-desync-fake-unknown-udp/--dpi-desync-hostfakesplit-mod, --dpi-desync/--dpi-desync-repeats/--dpi-desync-fooling/--dpi-desync-autottl/--dpi-desync-cutoff/--dpi-desync-any-protocol, --ip-id=zero. \
+                 Example: 's1 -o1 -Ar -f-1 -r1+s -g8 -d --dpi-desync=hostfakesplit,disorder --dpi-desync-repeats=2 --dpi-desync-fooling=ts,md5sig --dpi-desync-autottl=2 --dpi-desync-cutoff=n2 --dpi-desync-any-protocol=1 --ip-id=zero --wf-tcp=443 --filter-l7=stun,discord --hostlist=googlevideo.com --dpi-desync-fake-quic=/path/fake.bin --dpi-desync-hostfakesplit-mod=host=example.com --new --proto=tcp --ports=443 --action=split --repeats=2'",
                 prefix, token
             ))
         }
@@ -755,9 +894,111 @@ where
     None
 }
 
+fn tokenize_config(raw: &str) -> Result<Vec<String>> {
+    let normalized = normalize_profile_lines(raw);
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut in_single = false;
+    let mut in_double = false;
+
+    for ch in normalized.chars() {
+        match ch {
+            '\'' if !in_double => in_single = !in_single,
+            '"' if !in_single => in_double = !in_double,
+            c if c.is_whitespace() && !in_single && !in_double => {
+                if !current.is_empty() {
+                    tokens.push(std::mem::take(&mut current));
+                }
+            }
+            _ => current.push(ch),
+        }
+    }
+
+    if in_single || in_double {
+        return Err(anyhow!("Unterminated quoted value in config string"));
+    }
+
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+
+    Ok(tokens)
+}
+
+fn normalize_profile_lines(raw: &str) -> String {
+    let mut out = String::new();
+    let mut continued = String::new();
+
+    for line in raw.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || is_profile_comment(trimmed) {
+            continue;
+        }
+
+        let (segment, joins_next) = strip_line_continuation(trimmed);
+        if !continued.is_empty() {
+            continued.push(' ');
+        }
+        continued.push_str(segment);
+
+        if joins_next {
+            continue;
+        }
+
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(continued.trim());
+        continued.clear();
+    }
+
+    if !continued.trim().is_empty() {
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(continued.trim());
+    }
+
+    out
+}
+
+fn is_profile_comment(line: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    line.starts_with('#')
+        || line.starts_with(';')
+        || line.starts_with("//")
+        || line.starts_with("::")
+        || lower == "rem"
+        || lower.starts_with("rem ")
+}
+
+fn strip_line_continuation(line: &str) -> (&str, bool) {
+    let line = line.trim_end();
+    if let Some(stripped) = line.strip_suffix('^') {
+        return (stripped.trim_end(), true);
+    }
+    if let Some(stripped) = line.strip_suffix('\\') {
+        return (stripped.trim_end(), true);
+    }
+    (line, false)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
+
+    fn write_temp_payload(prefix: &str, bytes: &[u8]) -> PathBuf {
+        let tmp = std::env::temp_dir();
+        let pid = std::process::id();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = tmp.join(format!("{prefix}-{pid}-{nanos}.bin"));
+        std::fs::write(&path, bytes).unwrap();
+        path
+    }
 
     #[test]
     fn test_parse_full() {
@@ -803,6 +1044,46 @@ mod tests {
         let cfg = DpiConfig::parse("   \n\t  ").unwrap();
         assert_eq!(cfg.split_pos, None);
         assert!(cfg.oob_positions.is_empty());
+    }
+
+    #[test]
+    fn test_parse_multiline_profile_with_comments_and_continuations() {
+        let cfg = DpiConfig::parse(
+            r#"
+            rem winws-like profile
+            --wf-tcp=80,443 ^
+            --wf-udp=443 \
+            --dpi-desync=hostfakesplit,disorder
+            :: keep youtube domains only
+            --hostlist="googlevideo.com,*.youtube.com"
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            cfg.filter_tcp,
+            vec![PortRange::new(80, 80), PortRange::new(443, 443)]
+        );
+        assert_eq!(cfg.filter_udp, vec![PortRange::new(443, 443)]);
+        assert_eq!(
+            cfg.dpi_desync_actions,
+            vec![RuleAction::Split, RuleAction::Fake, RuleAction::Disorder]
+        );
+        assert_eq!(cfg.hostlist.len(), 2);
+    }
+
+    #[test]
+    fn test_parse_quoted_long_option_value() {
+        let cfg = DpiConfig::parse(r#"--hostlist="googlevideo.com,*.youtube.com""#).unwrap();
+        assert_eq!(cfg.hostlist.len(), 2);
+    }
+
+    #[test]
+    fn test_parse_unterminated_quote() {
+        let err = DpiConfig::parse(r#"--hostlist="googlevideo.com"#).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("Unterminated quoted value in config string"));
     }
 
     #[test]
@@ -1143,6 +1424,23 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_wf_tcp_udp_aliases() {
+        let cfg = DpiConfig::parse("--wf-tcp=80,443,1024-65535 --wf-udp 443,50000-50010").unwrap();
+        assert_eq!(
+            cfg.filter_tcp,
+            vec![
+                PortRange::new(80, 80),
+                PortRange::new(443, 443),
+                PortRange::new(1024, 65535)
+            ]
+        );
+        assert_eq!(
+            cfg.filter_udp,
+            vec![PortRange::new(443, 443), PortRange::new(50000, 50010)]
+        );
+    }
+
+    #[test]
     fn test_parse_filter_l7() {
         let cfg = DpiConfig::parse("--filter-l7=discord,stun").unwrap();
         assert_eq!(cfg.filter_l7, vec![L7Filter::Discord, L7Filter::Stun]);
@@ -1270,6 +1568,234 @@ mod tests {
         let _ = std::fs::remove_file(quic_path);
         let _ = std::fs::remove_file(discord_path);
         let _ = std::fs::remove_file(stun_path);
+    }
+
+    #[test]
+    fn test_parse_dpi_desync_fake_profile_aliases() {
+        let tmp = std::env::temp_dir();
+        let pid = std::process::id();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+
+        let quic_path = tmp.join(format!("gdb-desync-fake-quic-{pid}-{nanos}.bin"));
+        let discord_path = tmp.join(format!("gdb-desync-fake-discord-{pid}-{nanos}.bin"));
+        let stun_path = tmp.join(format!("gdb-desync-fake-stun-{pid}-{nanos}.bin"));
+
+        std::fs::write(&quic_path, [0xaa, 0xbb, 0xcc]).unwrap();
+        std::fs::write(&discord_path, b"discord-desync").unwrap();
+        std::fs::write(&stun_path, [0x21, 0x12, 0xA4, 0x42]).unwrap();
+
+        let cfg = DpiConfig::parse(&format!(
+            "--dpi-desync-fake-quic={} --dpi-desync-fake-discord={} --dpi-desync-fake-stun={}",
+            quic_path.display(),
+            discord_path.display(),
+            stun_path.display()
+        ))
+        .unwrap();
+
+        assert_eq!(
+            cfg.fake_profiles.quic.as_deref(),
+            Some(&[0xaa, 0xbb, 0xcc][..])
+        );
+        assert_eq!(
+            cfg.fake_profiles.discord.as_deref(),
+            Some(&b"discord-desync"[..])
+        );
+        assert_eq!(
+            cfg.fake_profiles.stun.as_deref(),
+            Some(&[0x21, 0x12, 0xA4, 0x42][..])
+        );
+
+        let _ = std::fs::remove_file(quic_path);
+        let _ = std::fs::remove_file(discord_path);
+        let _ = std::fs::remove_file(stun_path);
+    }
+
+    #[test]
+    fn test_parse_dpi_desync_fake_unknown_udp_alias() {
+        let tmp = std::env::temp_dir();
+        let pid = std::process::id();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+
+        let unknown_path = tmp.join(format!("gdb-desync-fake-unknown-{pid}-{nanos}.bin"));
+        std::fs::write(&unknown_path, [0xde, 0xad, 0xbe, 0xef]).unwrap();
+
+        let cfg = DpiConfig::parse(&format!(
+            "--dpi-desync-fake-unknown-udp={}",
+            unknown_path.display()
+        ))
+        .unwrap();
+
+        assert_eq!(
+            cfg.fake_profiles.unknown_udp.as_deref(),
+            Some(&[0xde, 0xad, 0xbe, 0xef][..])
+        );
+
+        let _ = std::fs::remove_file(unknown_path);
+    }
+
+    #[test]
+    fn test_parse_dpi_desync_hostfakesplit_mod_host() {
+        let cfg = DpiConfig::parse("--dpi-desync-hostfakesplit-mod=host=www.google.com").unwrap();
+        let payload = cfg.fake_profiles.hostfakesplit.as_deref().unwrap();
+        let text = std::str::from_utf8(payload).unwrap();
+        assert!(text.contains("Host: www.google.com\r\n"));
+        assert!(text.starts_with("GET / HTTP/1.1\r\n"));
+    }
+
+    #[test]
+    fn test_parse_dpi_desync_hostfakesplit_mod_invalid() {
+        let err = DpiConfig::parse("--dpi-desync-hostfakesplit-mod=bad=value").unwrap_err();
+        assert!(err.to_string().contains("Supported format: host=<domain>"));
+    }
+
+    #[test]
+    fn test_parse_ip_id_zero() {
+        let cfg = DpiConfig::parse("--ip-id=zero").unwrap();
+        assert!(cfg.ip_id_zero);
+    }
+
+    #[test]
+    fn test_parse_dpi_desync_autottl() {
+        let cfg = DpiConfig::parse("--dpi-desync-autottl=2").unwrap();
+        assert_eq!(cfg.dpi_desync_autottl, Some(2));
+    }
+
+    #[test]
+    fn test_parse_dpi_desync_cutoff() {
+        let cfg = DpiConfig::parse("--dpi-desync-cutoff=n2").unwrap();
+        assert_eq!(cfg.dpi_desync_cutoff, Some(2));
+    }
+
+    #[test]
+    fn test_parse_dpi_desync_any_protocol() {
+        let cfg = DpiConfig::parse("--dpi-desync-any-protocol=1").unwrap();
+        assert!(cfg.dpi_desync_any_protocol);
+    }
+
+    #[test]
+    fn test_parse_zapret_like_composite_profile_regression() {
+        let quic_path = write_temp_payload("gdb-zapret-quic", &[0xc3, 0xff, 0x00, 0x01]);
+        let discord_path = write_temp_payload("gdb-zapret-discord", b"discord-zapret");
+        let stun_path = write_temp_payload("gdb-zapret-stun", &[0x21, 0x12, 0xA4, 0x42]);
+        let unknown_udp_path =
+            write_temp_payload("gdb-zapret-unknown-udp", &[0xde, 0xad, 0xfa, 0xce]);
+
+        let cfg = DpiConfig::parse(&format!(
+            "--wf-tcp=80,443,50000-50100 \
+             --wf-udp=443,50000-50010 \
+             --filter-l7=discord,stun \
+             --hostlist=googlevideo.com \
+             --hostlist-domains=*.youtube.com \
+             --hostlist-exclude=blocked.youtube.com \
+             --ipset=1.1.1.1,10.0.0.0/8 \
+             --ipset-exclude=10.10.10.10,2001:db8::/32 \
+             --dpi-desync=hostfakesplit,disorder \
+             --dpi-desync-repeats=6 \
+             --dpi-desync-fake-quic={} \
+             --dpi-desync-fake-discord={} \
+             --dpi-desync-fake-stun={} \
+             --dpi-desync-hostfakesplit-mod=host=video.google.com \
+             --dpi-desync-fooling=ts,md5sig \
+             --ip-id=zero \
+             --dpi-desync-autottl=2 \
+             --dpi-desync-any-protocol=1 \
+             --dpi-desync-fake-unknown-udp={} \
+             --dpi-desync-cutoff=n2 \
+             --new --proto=tcp --ports=443 --action=split --repeats=2 \
+             --new --proto=udp --ports=443,50000-50010 --action=frag --repeats=4",
+            quic_path.display(),
+            discord_path.display(),
+            stun_path.display(),
+            unknown_udp_path.display()
+        ))
+        .unwrap();
+
+        assert_eq!(
+            cfg.filter_tcp,
+            vec![
+                PortRange::new(80, 80),
+                PortRange::new(443, 443),
+                PortRange::new(50000, 50100)
+            ]
+        );
+        assert_eq!(
+            cfg.filter_udp,
+            vec![PortRange::new(443, 443), PortRange::new(50000, 50010)]
+        );
+        assert_eq!(cfg.filter_l7, vec![L7Filter::Discord, L7Filter::Stun]);
+        assert_eq!(cfg.hostlist.len(), 2);
+        assert_eq!(cfg.hostlist_exclude.len(), 1);
+        assert_eq!(cfg.ipset.len(), 2);
+        assert_eq!(cfg.ipset_exclude.len(), 2);
+
+        assert_eq!(cfg.split_pos, Some(1));
+        assert_eq!(cfg.fake_offset, Some(-1));
+        assert!(cfg.use_disorder);
+        assert_eq!(
+            cfg.dpi_desync_actions,
+            vec![RuleAction::Split, RuleAction::Fake, RuleAction::Disorder]
+        );
+        assert_eq!(cfg.dpi_desync_repeats, Some(6));
+        assert_eq!(
+            cfg.dpi_desync_fooling,
+            vec![DpiDesyncFooling::Ts, DpiDesyncFooling::Md5Sig]
+        );
+        assert!(cfg.ip_id_zero);
+        assert_eq!(cfg.dpi_desync_autottl, Some(2));
+        assert_eq!(cfg.dpi_desync_cutoff, Some(2));
+        assert!(cfg.dpi_desync_any_protocol);
+
+        assert_eq!(
+            cfg.fake_profiles.quic.as_deref(),
+            Some(&[0xc3, 0xff, 0x00, 0x01][..])
+        );
+        assert_eq!(
+            cfg.fake_profiles.discord.as_deref(),
+            Some(&b"discord-zapret"[..])
+        );
+        assert_eq!(
+            cfg.fake_profiles.stun.as_deref(),
+            Some(&[0x21, 0x12, 0xA4, 0x42][..])
+        );
+        assert_eq!(
+            cfg.fake_profiles.unknown_udp.as_deref(),
+            Some(&[0xde, 0xad, 0xfa, 0xce][..])
+        );
+
+        let hostfakesplit_payload =
+            std::str::from_utf8(cfg.fake_profiles.hostfakesplit.as_deref().unwrap()).unwrap();
+        assert!(hostfakesplit_payload.contains("Host: video.google.com\r\n"));
+
+        assert_eq!(cfg.rules.len(), 2);
+        assert_eq!(
+            cfg.rules[0],
+            RuleConfig {
+                proto: RuleProtocol::Tcp,
+                ports: vec![PortRange::new(443, 443)],
+                action: RuleAction::Split,
+                repeats: 2,
+            }
+        );
+        assert_eq!(
+            cfg.rules[1],
+            RuleConfig {
+                proto: RuleProtocol::Udp,
+                ports: vec![PortRange::new(443, 443), PortRange::new(50000, 50010)],
+                action: RuleAction::Frag,
+                repeats: 4,
+            }
+        );
+
+        let _ = std::fs::remove_file(quic_path);
+        let _ = std::fs::remove_file(discord_path);
+        let _ = std::fs::remove_file(stun_path);
+        let _ = std::fs::remove_file(unknown_udp_path);
     }
 
     #[test]
