@@ -467,7 +467,7 @@ fn run_ring_buffer_poll(
         match ringbuf.poll(Duration::from_millis(RING_BUFFER_TIMEOUT_MS as u64)) {
             Ok(_) => {
                 poll_count += 1;
-                if poll_count % 100 == 0 {
+                if poll_count.is_multiple_of(100) {
                     info!("[RINGBUF] Poll #{} completed", poll_count);
                 }
             }

@@ -16,8 +16,7 @@ fn main() {
     // Check if tools are available
     let make_check = Command::new("which").arg("make").output();
     let has_make = make_check.is_ok_and(|o| o.status.success());
-    let bpftool_check = Command::new("which").arg("bpftool").output();
-    let has_bpftool = bpftool_check.is_ok_and(|o| o.status.success());
+    let has_bpftool = command_available("bpftool");
 
     let src_file = bpf_dir.join("goodbyedpi.bpf.c");
     let mut obj_compiled = false;
@@ -104,4 +103,11 @@ fn main() {
 fn copy_stub(skel_out: &PathBuf) {
     let stub = include_str!("stub.skel.rs");
     std::fs::write(skel_out, stub).expect("Failed to write stub skeleton");
+}
+
+fn command_available(command: &str) -> bool {
+    Command::new(command)
+        .arg("--version")
+        .output()
+        .is_ok_and(|o| o.status.success())
 }
