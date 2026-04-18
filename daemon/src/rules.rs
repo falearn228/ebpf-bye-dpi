@@ -1,7 +1,7 @@
 use anyhow::{anyhow, Context, Result};
 use goodbyedpi_proto::{Event, MAX_PAYLOAD_SIZE};
 use std::net::IpAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HostPattern {
@@ -135,9 +135,9 @@ fn parse_list_source(raw: &str) -> Result<Vec<String>> {
         return Ok(Vec::new());
     }
 
-    if Path::new(value).exists() {
-        let content = std::fs::read_to_string(value)
-            .with_context(|| format!("Failed to read list file '{}'", value))?;
+    if let Some(path) = resolve_compat_path(value, "lists") {
+        let content = std::fs::read_to_string(&path)
+            .with_context(|| format!("Failed to read list file '{}'", path.display()))?;
         let mut out = Vec::new();
         for line in content.lines() {
             let line = line.split('#').next().unwrap_or("").trim();
@@ -148,12 +148,50 @@ fn parse_list_source(raw: &str) -> Result<Vec<String>> {
         return Ok(out);
     }
 
+    if is_windows_zapret_path(value) && value.to_ascii_lowercase().contains("-user.") {
+        return Ok(Vec::new());
+    }
+
     Ok(value
         .split(',')
         .map(str::trim)
         .filter(|v| !v.is_empty())
         .map(std::string::ToString::to_string)
         .collect())
+}
+
+pub fn resolve_compat_path(raw: &str, local_dir: &str) -> Option<PathBuf> {
+    let direct = Path::new(raw);
+    if direct.exists() {
+        return Some(direct.to_path_buf());
+    }
+
+    if !is_windows_zapret_path(raw) {
+        return None;
+    }
+
+    let basename = raw
+        .rsplit_once('\\')
+        .map(|(_, tail)| tail)
+        .or_else(|| raw.rsplit_once('/').map(|(_, tail)| tail))
+        .unwrap_or(raw);
+    for prefix in ["", ".."] {
+        let local = if prefix.is_empty() {
+            Path::new(local_dir).join(basename)
+        } else {
+            Path::new(prefix).join(local_dir).join(basename)
+        };
+        if local.exists() {
+            return Some(local);
+        }
+    }
+    None
+}
+
+fn is_windows_zapret_path(raw: &str) -> bool {
+    let lower = raw.to_ascii_lowercase();
+    lower.contains("zapret.")
+        || (lower.len() > 2 && lower.as_bytes()[1] == b':' && lower.contains('\\'))
 }
 
 pub fn parse_hostlist(raw: &str) -> Result<Vec<HostPattern>> {

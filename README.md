@@ -171,6 +171,8 @@ sudo ./target/release/goodbyedpi-daemon -i eth0 -c "s1 -o1" --no-metrics
 - `--config-file <path>` загружает профиль из файла и затем дополняет его аргументами из `-c` при наличии.
 - Парсер понимает многострочный ввод, quoted values, а также line continuation через `^` и `\`.
 - Строки-комментарии с префиксами `#`, `;`, `//`, `::`, `rem` игнорируются.
+- Zapret-style sections `--filter-* ... --dpi-desync ... --new` применяются per-section.
+- Windows paths вида `C:\Games\zapret.*\lists\<file>` и `C:\Games\zapret.*\bin\<file>` маппятся на локальные `lists/<file>` и `bin/<file>`.
 
 ### Метрики
 
@@ -232,6 +234,7 @@ eBPF программы отправляют события через ring buff
 - **REDIRECT_DETECTED** - HTTP 301/302 (auto-logic)
 - **SSL_ERROR_DETECTED** - SSL alert (auto-logic)
 - **DISORDER_TRIGGERED** - Packet disorder
+- **SUCCESS_DETECTED** - успешный HTTP/TLS ответ для auto-logic статистики
 
 Userspace получает события через `tokio::sync::mpsc` канал и обрабатывает в async контексте.
 

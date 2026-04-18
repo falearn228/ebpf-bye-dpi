@@ -6,7 +6,10 @@ use goodbyedpi_proto::{Event, MAX_PAYLOAD_SIZE};
 use std::fmt;
 
 use crate::l7::{detect_l7, L7Protocol};
-use crate::rules::{parse_hostlist, parse_ipset, target_lists_allow_event, HostPattern, IpNetwork};
+use crate::rules::{
+    parse_hostlist, parse_ipset, resolve_compat_path, target_lists_allow_event, HostPattern,
+    IpNetwork,
+};
 
 #[derive(Clone, Default, PartialEq, Eq)]
 pub struct FakeProfiles {
@@ -38,6 +41,47 @@ struct RuleDraft {
     ports: Vec<PortRange>,
     action: Option<RuleAction>,
     repeats: Option<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DpiRuleSection {
+    pub proto: RuleProtocol,
+    pub ports: Vec<PortRange>,
+    pub filter_l7: Vec<L7Filter>,
+    pub hostlist: Vec<HostPattern>,
+    pub hostlist_exclude: Vec<HostPattern>,
+    pub ipset: Vec<IpNetwork>,
+    pub ipset_exclude: Vec<IpNetwork>,
+    pub fake_profiles: FakeProfiles,
+    pub actions: Vec<RuleAction>,
+    pub repeats: Option<u8>,
+    pub fooling: Vec<DpiDesyncFooling>,
+    pub ip_id_zero: bool,
+    pub autottl: Option<u8>,
+    pub cutoff: Option<u8>,
+    pub any_protocol: bool,
+}
+
+impl Default for DpiRuleSection {
+    fn default() -> Self {
+        Self {
+            proto: RuleProtocol::Tcp,
+            ports: Vec::new(),
+            filter_l7: Vec::new(),
+            hostlist: Vec::new(),
+            hostlist_exclude: Vec::new(),
+            ipset: Vec::new(),
+            ipset_exclude: Vec::new(),
+            fake_profiles: FakeProfiles::default(),
+            actions: Vec::new(),
+            repeats: None,
+            fooling: Vec::new(),
+            ip_id_zero: false,
+            autottl: None,
+            cutoff: None,
+            any_protocol: false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -135,6 +179,7 @@ pub struct DpiConfig {
     pub dpi_desync_cutoff: Option<u8>,
     pub dpi_desync_any_protocol: bool,
     pub rules: Vec<RuleConfig>,
+    pub sections: Vec<DpiRuleSection>,
 }
 
 impl DpiConfig {
@@ -168,10 +213,14 @@ impl DpiConfig {
             dpi_desync_cutoff: None,
             dpi_desync_any_protocol: false,
             rules: Vec::new(),
+            sections: Vec::new(),
         };
 
         let mut tokens = tokens.iter().map(String::as_str).peekable();
         let mut current_rule: Option<RuleDraft> = None;
+        let mut current_section: Option<DpiRuleSection> = None;
+        let mut saw_new = false;
+        let mut saw_wf_filter = false;
         let mut legacy_overrides = LegacyOverrides::default();
 
         while let Some(token) = tokens.next() {
@@ -181,10 +230,37 @@ impl DpiConfig {
 
             if token == "--new" {
                 if let Some(draft) = current_rule.take() {
-                    config.rules.push(finalize_rule(draft)?);
+                    if !rule_draft_is_empty(&draft) {
+                        config.rules.push(finalize_rule(draft)?);
+                    }
                 }
+                if let Some(section) = current_section.take() {
+                    finalize_section(&mut config, section, saw_new)?;
+                }
+                saw_new = true;
                 current_rule = Some(RuleDraft::default());
+                current_section = Some(DpiRuleSection::default());
                 continue;
+            }
+
+            if token == "--wf-tcp"
+                || token.starts_with("--wf-tcp=")
+                || token == "--wf-udp"
+                || token.starts_with("--wf-udp=")
+            {
+                saw_wf_filter = true;
+            }
+
+            if let Some(ref mut section) = current_section {
+                if parse_section_token(token, &mut tokens, section, &legacy_overrides)? {
+                    continue;
+                }
+            } else if saw_wf_filter && is_section_start_token(token) {
+                let mut section = DpiRuleSection::default();
+                if parse_section_token(token, &mut tokens, &mut section, &legacy_overrides)? {
+                    current_section = Some(section);
+                    continue;
+                }
             }
 
             if let Some(consumed) =
@@ -205,7 +281,12 @@ impl DpiConfig {
         }
 
         if let Some(draft) = current_rule.take() {
-            config.rules.push(finalize_rule(draft)?);
+            if !rule_draft_is_empty(&draft) {
+                config.rules.push(finalize_rule(draft)?);
+            }
+        }
+        if let Some(section) = current_section.take() {
+            finalize_section(&mut config, section, saw_new)?;
         }
 
         Ok(config)
@@ -273,6 +354,40 @@ impl DpiConfig {
     /// Returns true when host/ip list targeting allows this event.
     /// If all include-lists are empty, event is allowed by default.
     pub fn target_allowed(&self, event: &Event) -> bool {
+        target_lists_allow_event(
+            event,
+            &self.hostlist,
+            &self.hostlist_exclude,
+            &self.ipset,
+            &self.ipset_exclude,
+        )
+    }
+
+    pub fn matching_section(&self, event: &Event, action: RuleAction) -> Option<&DpiRuleSection> {
+        self.sections
+            .iter()
+            .find(|section| section.matches_event(event, action))
+    }
+}
+
+impl DpiRuleSection {
+    pub fn matches_event(&self, event: &Event, action: RuleAction) -> bool {
+        if !self.actions.contains(&action) {
+            return false;
+        }
+        if self.proto != action.default_protocol() {
+            return false;
+        }
+        if !port_allowed(&self.ports, event.dst_port) {
+            return false;
+        }
+        if !self.filter_l7.is_empty() {
+            let payload_len = (event.payload_len as usize).min(MAX_PAYLOAD_SIZE);
+            let detected = detect_l7(&event.payload[..payload_len]);
+            if !self.filter_l7.iter().copied().any(|f| f.matches(detected)) {
+                return false;
+            }
+        }
         target_lists_allow_event(
             event,
             &self.hostlist,
@@ -382,19 +497,7 @@ where
     }
     if let Some(value) = parse_long_option_value("--dpi-desync-repeats", token, tokens) {
         let value = value?;
-        let repeats: u8 = value.parse().with_context(|| {
-            format!(
-                "Invalid --dpi-desync-repeats '{}'. Expected integer in 1..=255",
-                value
-            )
-        })?;
-        if repeats == 0 {
-            return Err(anyhow!(
-                "Invalid --dpi-desync-repeats '{}'. Value must be >= 1",
-                value
-            ));
-        }
-        config.dpi_desync_repeats = Some(repeats);
+        config.dpi_desync_repeats = Some(parse_repeats_value(&value, "--dpi-desync-repeats")?);
         return Ok(Some(true));
     }
     if let Some(value) = parse_long_option_value("--dpi-desync-fooling", token, tokens) {
@@ -417,19 +520,7 @@ where
     }
     if let Some(value) = parse_long_option_value("--dpi-desync-autottl", token, tokens) {
         let value = value?;
-        let autottl: u8 = value.parse().with_context(|| {
-            format!(
-                "Invalid --dpi-desync-autottl '{}'. Expected integer in 1..=255",
-                value
-            )
-        })?;
-        if autottl == 0 {
-            return Err(anyhow!(
-                "Invalid --dpi-desync-autottl '{}'. Value must be >= 1",
-                value
-            ));
-        }
-        config.dpi_desync_autottl = Some(autottl);
+        config.dpi_desync_autottl = Some(parse_autottl_value(&value)?);
         return Ok(Some(true));
     }
     if let Some(value) = parse_long_option_value("--dpi-desync-cutoff", token, tokens) {
@@ -444,6 +535,142 @@ where
         return Ok(Some(true));
     }
     Ok(None)
+}
+
+fn is_section_start_token(token: &str) -> bool {
+    token == "--filter-tcp"
+        || token.starts_with("--filter-tcp=")
+        || token == "--filter-udp"
+        || token.starts_with("--filter-udp=")
+}
+
+fn parse_section_token<'a, I>(
+    token: &str,
+    tokens: &mut std::iter::Peekable<I>,
+    section: &mut DpiRuleSection,
+    legacy_overrides: &LegacyOverrides,
+) -> Result<bool>
+where
+    I: Iterator<Item = &'a str>,
+{
+    if let Some(value) = parse_long_option_value("--filter-tcp", token, tokens) {
+        section.proto = RuleProtocol::Tcp;
+        section.ports = parse_ports(&value?)?;
+        return Ok(true);
+    }
+    if let Some(value) = parse_long_option_value("--filter-udp", token, tokens) {
+        section.proto = RuleProtocol::Udp;
+        section.ports = parse_ports(&value?)?;
+        return Ok(true);
+    }
+    if let Some(value) = parse_long_option_value("--filter-l7", token, tokens) {
+        section.filter_l7 = parse_l7_filters(&value?)?;
+        return Ok(true);
+    }
+    if let Some(value) = parse_long_option_value("--hostlist", token, tokens)
+        .or_else(|| parse_long_option_value("--hostlist-domains", token, tokens))
+    {
+        section.hostlist.extend(parse_hostlist(&value?)?);
+        return Ok(true);
+    }
+    if let Some(value) = parse_long_option_value("--hostlist-exclude", token, tokens) {
+        section.hostlist_exclude.extend(parse_hostlist(&value?)?);
+        return Ok(true);
+    }
+    if let Some(value) = parse_long_option_value("--ipset", token, tokens) {
+        section.ipset.extend(parse_ipset(&value?)?);
+        return Ok(true);
+    }
+    if let Some(value) = parse_long_option_value("--ipset-exclude", token, tokens) {
+        section.ipset_exclude.extend(parse_ipset(&value?)?);
+        return Ok(true);
+    }
+    if let Some(value) = parse_long_option_value("--dpi-desync", token, tokens) {
+        let modes = parse_dpi_desync_modes(&value?)?;
+        apply_dpi_desync_modes_to_actions(&mut section.actions, &modes);
+        return Ok(true);
+    }
+    if let Some(value) = parse_long_option_value("--dpi-desync-repeats", token, tokens) {
+        section.repeats = Some(parse_repeats_value(&value?, "--dpi-desync-repeats")?);
+        return Ok(true);
+    }
+    if let Some(value) = parse_long_option_value("--dpi-desync-fooling", token, tokens) {
+        section.fooling = parse_dpi_desync_fooling(&value?)?;
+        return Ok(true);
+    }
+    if let Some(value) = parse_long_option_value("--ip-id", token, tokens) {
+        match value?.trim().to_ascii_lowercase().as_str() {
+            "zero" => section.ip_id_zero = true,
+            other => {
+                return Err(anyhow!(
+                    "unsupported value '{}' for --ip-id, supported: zero",
+                    other
+                ))
+            }
+        }
+        return Ok(true);
+    }
+    if let Some(value) = parse_long_option_value("--dpi-desync-autottl", token, tokens) {
+        section.autottl = Some(parse_autottl_value(&value?)?);
+        return Ok(true);
+    }
+    if let Some(value) = parse_long_option_value("--dpi-desync-cutoff", token, tokens) {
+        section.cutoff = Some(parse_cutoff_value(&value?)?);
+        return Ok(true);
+    }
+    if let Some(value) = parse_long_option_value("--dpi-desync-any-protocol", token, tokens) {
+        section.any_protocol = parse_bool_flag(&value?, "--dpi-desync-any-protocol")?;
+        return Ok(true);
+    }
+    if let Some(value) = parse_long_option_value("--fake-quic", token, tokens)
+        .or_else(|| parse_long_option_value("--dpi-desync-fake-quic", token, tokens))
+    {
+        section.fake_profiles.quic = Some(load_fake_payload(&value?)?);
+        return Ok(true);
+    }
+    if let Some(value) = parse_long_option_value("--fake-discord", token, tokens)
+        .or_else(|| parse_long_option_value("--dpi-desync-fake-discord", token, tokens))
+    {
+        section.fake_profiles.discord = Some(load_fake_payload(&value?)?);
+        return Ok(true);
+    }
+    if let Some(value) = parse_long_option_value("--fake-stun", token, tokens)
+        .or_else(|| parse_long_option_value("--dpi-desync-fake-stun", token, tokens))
+    {
+        section.fake_profiles.stun = Some(load_fake_payload(&value?)?);
+        return Ok(true);
+    }
+    if let Some(value) = parse_long_option_value("--dpi-desync-fake-unknown-udp", token, tokens) {
+        section.fake_profiles.unknown_udp = Some(load_fake_payload(&value?)?);
+        return Ok(true);
+    }
+    if let Some(value) = parse_long_option_value("--dpi-desync-hostfakesplit-mod", token, tokens) {
+        section.fake_profiles.hostfakesplit = Some(parse_hostfakesplit_mod(&value?)?);
+        return Ok(true);
+    }
+    if let Some(value) = parse_long_option_value("--action", token, tokens) {
+        let action = RuleAction::from_cli(&value?).ok_or_else(|| {
+            anyhow!("Invalid --action. Expected one of: split,oob,fake,tlsrec,disorder,frag")
+        })?;
+        ensure_desync_action(&mut section.actions, action);
+        return Ok(true);
+    }
+    if let Some(value) = parse_long_option_value("--proto", token, tokens) {
+        section.proto = RuleProtocol::from_cli(&value?)
+            .ok_or_else(|| anyhow!("Invalid --proto. Expected 'tcp' or 'udp'"))?;
+        return Ok(true);
+    }
+    if let Some(value) = parse_long_option_value("--ports", token, tokens) {
+        section.ports = parse_ports(&value?)?;
+        return Ok(true);
+    }
+    if let Some(value) = parse_long_option_value("--repeats", token, tokens) {
+        section.repeats = Some(parse_repeats_value(&value?, "--repeats")?);
+        return Ok(true);
+    }
+
+    let _ = legacy_overrides;
+    Ok(false)
 }
 
 fn parse_csv_or_plus_values(raw: &str) -> impl Iterator<Item = &str> {
@@ -508,6 +735,20 @@ fn ensure_desync_action(actions: &mut Vec<RuleAction>, action: RuleAction) {
     }
 }
 
+fn apply_dpi_desync_modes_to_actions(actions: &mut Vec<RuleAction>, modes: &[DpiDesyncMode]) {
+    for mode in modes {
+        match mode {
+            DpiDesyncMode::Fake => ensure_desync_action(actions, RuleAction::Fake),
+            DpiDesyncMode::Disorder => ensure_desync_action(actions, RuleAction::Disorder),
+            DpiDesyncMode::Split => ensure_desync_action(actions, RuleAction::Split),
+            DpiDesyncMode::HostFakeSplit => {
+                ensure_desync_action(actions, RuleAction::Split);
+                ensure_desync_action(actions, RuleAction::Fake);
+            }
+        }
+    }
+}
+
 fn apply_dpi_desync_modes(
     config: &mut DpiConfig,
     legacy_overrides: &LegacyOverrides,
@@ -550,8 +791,10 @@ fn apply_dpi_desync_modes(
 fn load_fake_payload(path: &str) -> Result<Vec<u8>> {
     const MAX_FAKE_PROFILE_SIZE: usize = 64 * 1024;
 
-    let bytes = std::fs::read(path)
-        .with_context(|| format!("Failed to read fake payload file '{}'", path))?;
+    let resolved = resolve_compat_path(path, "bin")
+        .ok_or_else(|| anyhow!("Fake payload file '{}' does not exist", path))?;
+    let bytes = std::fs::read(&resolved)
+        .with_context(|| format!("Failed to read fake payload file '{}'", resolved.display()))?;
     if bytes.is_empty() {
         return Err(anyhow!("Fake payload file '{}' is empty", path));
     }
@@ -610,6 +853,32 @@ fn parse_l7_filters(raw: &str) -> Result<Vec<L7Filter>> {
         out.push(filter);
     }
     Ok(out)
+}
+
+fn parse_repeats_value(raw: &str, option: &str) -> Result<u8> {
+    let repeats: u8 = raw
+        .parse()
+        .with_context(|| format!("Invalid {} '{}'. Expected integer in 1..=255", option, raw))?;
+    if repeats == 0 {
+        return Err(anyhow!("Invalid {} '{}'. Value must be >= 1", option, raw));
+    }
+    Ok(repeats)
+}
+
+fn parse_autottl_value(raw: &str) -> Result<u8> {
+    let autottl: u8 = raw.parse().with_context(|| {
+        format!(
+            "Invalid --dpi-desync-autottl '{}'. Expected integer in 1..=255",
+            raw
+        )
+    })?;
+    if autottl == 0 {
+        return Err(anyhow!(
+            "Invalid --dpi-desync-autottl '{}'. Value must be >= 1",
+            raw
+        ));
+    }
+    Ok(autottl)
 }
 
 fn parse_cutoff_value(raw: &str) -> Result<u8> {
@@ -833,6 +1102,69 @@ fn finalize_rule(draft: RuleDraft) -> Result<RuleConfig> {
         action,
         repeats,
     })
+}
+
+fn rule_draft_is_empty(draft: &RuleDraft) -> bool {
+    draft.proto.is_none()
+        && draft.ports.is_empty()
+        && draft.action.is_none()
+        && draft.repeats.is_none()
+}
+
+fn finalize_section(config: &mut DpiConfig, section: DpiRuleSection, strict: bool) -> Result<()> {
+    let mut section = section;
+    if section.actions.is_empty() {
+        if strict {
+            return Err(anyhow!(
+                "Rule after --new must include --action or --dpi-desync"
+            ));
+        }
+        return Ok(());
+    }
+
+    if section.ports.is_empty() && section.actions.len() == 1 {
+        section.proto = section.actions[0].default_protocol();
+    }
+
+    if section.actions.contains(&RuleAction::Frag) {
+        config.ip_fragment = true;
+        if config.frag_size == 0 {
+            config.frag_size = 8;
+        }
+    }
+    if section.actions.contains(&RuleAction::Split) && config.split_pos.is_none() {
+        config.split_pos = Some(1);
+    }
+    if section.actions.contains(&RuleAction::Fake) && config.fake_offset.is_none() {
+        config.fake_offset = Some(-1);
+    }
+    if section.actions.contains(&RuleAction::Disorder) {
+        config.use_disorder = true;
+    }
+    if section.ip_id_zero {
+        config.ip_id_zero = true;
+    }
+    if section.any_protocol {
+        config.dpi_desync_any_protocol = true;
+    }
+    if let Some(cutoff) = section.cutoff {
+        config.dpi_desync_cutoff = Some(cutoff);
+    }
+    if let Some(autottl) = section.autottl {
+        config.dpi_desync_autottl = Some(autottl);
+    }
+
+    for action in &section.actions {
+        config.rules.push(RuleConfig {
+            proto: section.proto,
+            ports: section.ports.clone(),
+            action: *action,
+            repeats: section.repeats.unwrap_or(1),
+        });
+    }
+
+    config.sections.push(section);
+    Ok(())
 }
 
 fn parse_ports(raw: &str) -> Result<Vec<PortRange>> {
@@ -1796,6 +2128,41 @@ mod tests {
         let _ = std::fs::remove_file(discord_path);
         let _ = std::fs::remove_file(stun_path);
         let _ = std::fs::remove_file(unknown_udp_path);
+    }
+
+    #[test]
+    fn test_parse_user_zapret_final_args_sections() {
+        let profile = r#"--wf-tcp 80,443,2053,2083,2087,2096,8443,12 --wf-udp 443,19294-19344,50000-50100,12  --filter-udp 443 --hostlist "C:\Games\zapret.1.6.2\lists\list-general.txt" --hostlist "C:\Games\zapret.1.6.2\lists\list-general-user.txt" --hostlist-exclude "C:\Games\zapret.1.6.2\lists\list-exclude.txt" --hostlist-exclude "C:\Games\zapret.1.6.2\lists\list-exclude-user.txt" --ipset-exclude "C:\Games\zapret.1.6.2\lists\ipset-exclude.txt" --ipset-exclude "C:\Games\zapret.1.6.2\lists\ipset-exclude-user.txt" --dpi-desync fake --dpi-desync-repeats 6 --dpi-desync-fake-quic "C:\Games\zapret.1.6.2\bin\quic_initial_www_google_com.bin" --new  --filter-udp 19294-19344,50000-50100 --filter-l7 discord,stun --dpi-desync fake --dpi-desync-repeats 6 --new  --filter-tcp 2053,2083,2087,2096,8443 --hostlist-domains discord.media --dpi-desync hostfakesplit --dpi-desync-repeats 4 --dpi-desync-fooling ts --dpi-desync-hostfakesplit-mod host=www.google.com --new  --filter-tcp 443 --hostlist "C:\Games\zapret.1.6.2\lists\list-google.txt" --ip-id zero --dpi-desync hostfakesplit --dpi-desync-repeats 4 --dpi-desync-fooling ts --dpi-desync-hostfakesplit-mod host=www.google.com --new  --filter-tcp 80,443 --hostlist "C:\Games\zapret.1.6.2\lists\list-general.txt" --hostlist "C:\Games\zapret.1.6.2\lists\list-general-user.txt" --hostlist-exclude "C:\Games\zapret.1.6.2\lists\list-exclude.txt" --hostlist-exclude "C:\Games\zapret.1.6.2\lists\list-exclude-user.txt" --ipset-exclude "C:\Games\zapret.1.6.2\lists\ipset-exclude.txt" --ipset-exclude "C:\Games\zapret.1.6.2\lists\ipset-exclude-user.txt" --dpi-desync hostfakesplit --dpi-desync-repeats 4 --dpi-desync-fooling ts,md5sig --dpi-desync-hostfakesplit-mod host=ozon.ru --new  --filter-udp 443 --ipset "C:\Games\zapret.1.6.2\lists\ipset-all.txt" --hostlist-exclude "C:\Games\zapret.1.6.2\lists\list-exclude.txt" --hostlist-exclude "C:\Games\zapret.1.6.2\lists\list-exclude-user.txt" --ipset-exclude "C:\Games\zapret.1.6.2\lists\ipset-exclude.txt" --ipset-exclude "C:\Games\zapret.1.6.2\lists\ipset-exclude-user.txt" --dpi-desync fake --dpi-desync-repeats 6 --dpi-desync-fake-quic "C:\Games\zapret.1.6.2\bin\quic_initial_www_google_com.bin" --new  --filter-tcp 80,443,8443 --ipset "C:\Games\zapret.1.6.2\lists\ipset-all.txt" --hostlist-exclude "C:\Games\zapret.1.6.2\lists\list-exclude.txt" --hostlist-exclude "C:\Games\zapret.1.6.2\lists\list-exclude-user.txt" --ipset-exclude "C:\Games\zapret.1.6.2\lists\ipset-exclude.txt" --ipset-exclude "C:\Games\zapret.1.6.2\lists\ipset-exclude-user.txt" --dpi-desync hostfakesplit --dpi-desync-repeats 4 --dpi-desync-fooling ts --dpi-desync-hostfakesplit-mod host=ozon.ru --new  --filter-tcp 12 --ipset "C:\Games\zapret.1.6.2\lists\ipset-all.txt" --ipset-exclude "C:\Games\zapret.1.6.2\lists\ipset-exclude.txt" --ipset-exclude "C:\Games\zapret.1.6.2\lists\ipset-exclude-user.txt" --dpi-desync hostfakesplit --dpi-desync-repeats 4 --dpi-desync-any-protocol 1 --dpi-desync-cutoff n3 --dpi-desync-fooling ts --dpi-desync-hostfakesplit-mod host=ozon.ru --new  --filter-udp 12 --ipset "C:\Games\zapret.1.6.2\lists\ipset-all.txt" --ipset-exclude "C:\Games\zapret.1.6.2\lists\ipset-exclude.txt" --ipset-exclude "C:\Games\zapret.1.6.2\lists\ipset-exclude-user.txt" --dpi-desync fake --dpi-desync-repeats 12 --dpi-desync-any-protocol 1 --dpi-desync-fake-unknown-udp "C:\Games\zapret.1.6.2\bin\quic_initial_www_google_com.bin" --dpi-desync-cutoff n2"#;
+
+        let cfg = DpiConfig::parse(profile).unwrap();
+
+        assert_eq!(cfg.sections.len(), 9);
+        assert_eq!(cfg.sections[0].proto, RuleProtocol::Udp);
+        assert_eq!(cfg.sections[0].ports, vec![PortRange::new(443, 443)]);
+        assert_eq!(cfg.sections[0].actions, vec![RuleAction::Fake]);
+        assert_eq!(cfg.sections[0].repeats, Some(6));
+        assert_eq!(
+            cfg.sections[1].ports,
+            vec![PortRange::new(19294, 19344), PortRange::new(50000, 50100)]
+        );
+        assert_eq!(
+            cfg.sections[1].filter_l7,
+            vec![L7Filter::Discord, L7Filter::Stun]
+        );
+        assert_eq!(
+            cfg.sections[2].actions,
+            vec![RuleAction::Split, RuleAction::Fake]
+        );
+        assert_eq!(cfg.sections[2].hostlist.len(), 1);
+        assert_eq!(cfg.sections[3].ports, vec![PortRange::new(443, 443)]);
+        assert!(cfg.sections[3].ip_id_zero);
+        assert_eq!(cfg.sections[7].ports, vec![PortRange::new(12, 12)]);
+        assert_eq!(cfg.sections[7].cutoff, Some(3));
+        assert!(cfg.sections[7].any_protocol);
+        assert_eq!(cfg.sections[8].proto, RuleProtocol::Udp);
+        assert_eq!(cfg.sections[8].repeats, Some(12));
+        assert_eq!(cfg.sections[8].cutoff, Some(2));
+        assert!(cfg.sections[8].fake_profiles.unknown_udp.is_some());
     }
 
     #[test]

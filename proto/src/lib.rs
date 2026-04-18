@@ -195,9 +195,9 @@ pub struct Stats {
 /// Connection key - supports both IPv4 and IPv6
 /// Packed to 40 bytes with explicit zeroed padding
 #[repr(C)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub struct ConnKey {
-    /// IPv4: only [0] is used, rest are 0
+    /// IPv4: only index 0 is used, rest are 0
     /// IPv6: all 4 u32 values (16 bytes total)
     pub src_ip: [u32; 4],
     pub dst_ip: [u32; 4],
@@ -209,20 +209,6 @@ pub struct ConnKey {
     pub proto: u8,
     /// Explicit padding - MUST be zeroed for consistent hashing
     pub _pad: [u8; 2],
-}
-
-impl Default for ConnKey {
-    fn default() -> Self {
-        Self {
-            src_ip: [0; 4],
-            dst_ip: [0; 4],
-            src_port: 0,
-            dst_port: 0,
-            is_ipv6: 0,
-            proto: 0,
-            _pad: [0; 2], // Explicitly zeroed padding
-        }
-    }
 }
 
 /// Event types sent from BPF to userspace via ring buffer
@@ -248,6 +234,8 @@ pub mod event_types {
     pub const QUIC_FRAGMENT_TRIGGERED: u32 = 8;
     /// OOB (Out-of-Band) triggered - URG flag injection
     pub const OOB_TRIGGERED: u32 = 9;
+    /// Positive server response detected for auto-logic success tracking
+    pub const SUCCESS_DETECTED: u32 = 10;
 }
 
 /// Connection processing stages
@@ -426,7 +414,7 @@ impl Event {
 /// Layout matches eBPF: timestamp(8) + last_seq(4) + last_ack(4) + stage(1) + flags(1) + reserved(6)
 /// Total size: 24 bytes (aligned to 8 bytes due to u64)
 #[repr(C)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct ConnState {
     /// Timestamp of last activity (nanoseconds since boot)
     pub timestamp: u64,
@@ -447,19 +435,6 @@ pub struct ConnState {
     pub flags: u8,
     /// Reserved padding - must be zeroed for consistency (6 bytes to align to 24)
     pub _reserved: [u8; 6],
-}
-
-impl Default for ConnState {
-    fn default() -> Self {
-        Self {
-            timestamp: 0,
-            last_seq: 0,
-            last_ack: 0,
-            stage: 0,
-            flags: 0,
-            _reserved: [0; 6],
-        }
-    }
 }
 
 // Legacy constants - prefer using `stages::*` module
@@ -685,5 +660,10 @@ mod size_tests {
         assert_eq!(event.dst_ip_v6(), Ipv6Addr::from(dst));
         assert_eq!(event.format_ips().0, "[fd00:1::1]");
         assert_eq!(event.format_ips().1, "[fd00:1::2]");
+    }
+
+    #[test]
+    fn test_success_detected_event_type_is_stable() {
+        assert_eq!(event_types::SUCCESS_DETECTED, 10);
     }
 }

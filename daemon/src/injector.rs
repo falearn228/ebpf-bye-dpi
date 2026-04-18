@@ -1,3 +1,5 @@
+#![allow(clippy::too_many_arguments)]
+
 use anyhow::{anyhow, Context, Result};
 use log::{debug, info, warn};
 use nix::sys::socket::{socket, AddressFamily, SockFlag, SockType};
@@ -9,6 +11,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
 /* IP header flags */
 const IP_MF: u16 = 0x2000; // More Fragments flag
 const IP_DF: u16 = 0x4000; // Don't Fragment flag
+#[cfg(test)]
 const IP_OFFSET_MASK: u16 = 0x1FFF; // Fragment offset mask
 
 /* Socket options */
@@ -779,7 +782,7 @@ impl RawInjector {
                 seq.wrapping_sub(payload.len() as u32)
             } else {
                 // Use absolute value of offset as subtraction
-                seq.wrapping_sub(fake_offset.abs() as u32)
+                seq.wrapping_sub(fake_offset.unsigned_abs())
             };
 
             debug!(
@@ -830,7 +833,7 @@ impl RawInjector {
             let rst_seq = if fake_offset == -1 {
                 seq.wrapping_sub(payload.len() as u32)
             } else {
-                seq.wrapping_sub(fake_offset.abs() as u32)
+                seq.wrapping_sub(fake_offset.unsigned_abs())
             };
 
             self.inject_fake_packet_v6(
@@ -868,6 +871,7 @@ impl RawInjector {
     ///
     /// # Errors
     /// Returns an error if packet construction or sending fails
+    #[allow(dead_code)]
     pub fn inject_tls_fake(
         &self,
         src_ip: Ipv4Addr,
@@ -1296,6 +1300,7 @@ impl RawInjector {
     ///
     /// # Safety
     /// The caller must ensure proper handling of the raw FD to avoid resource leaks
+    #[allow(dead_code)]
     pub fn raw_fd_v4(&self) -> RawFd {
         self.sock_v4
     }
@@ -1304,6 +1309,7 @@ impl RawInjector {
     ///
     /// # Safety
     /// The caller must ensure proper handling of the raw FD to avoid resource leaks
+    #[allow(dead_code)]
     pub fn raw_fd_v6(&self) -> RawFd {
         self.sock_v6
     }
@@ -2242,13 +2248,13 @@ mod tests {
         let rst_seq = if fake_offset == -1 {
             seq.wrapping_sub(payload_len as u32)
         } else {
-            seq.wrapping_sub(fake_offset.abs() as u32)
+            seq.wrapping_sub(fake_offset.unsigned_abs())
         };
         assert_eq!(rst_seq, 900); // 1000 - 100 = 900
 
         // Test with other negative offset
         let fake_offset: i32 = -50;
-        let rst_seq = seq.wrapping_sub(fake_offset.abs() as u32);
+        let rst_seq = seq.wrapping_sub(fake_offset.unsigned_abs());
         assert_eq!(rst_seq, 950); // 1000 - 50 = 950
     }
 
@@ -2279,7 +2285,7 @@ mod tests {
         let rst_seq = if fake_offset == -1 {
             seq.wrapping_sub(payload_len as u32)
         } else {
-            seq.wrapping_sub(fake_offset.abs() as u32)
+            seq.wrapping_sub(fake_offset.unsigned_abs())
         };
         // 10 - 100 should wrap around
         assert_eq!(rst_seq, u32::MAX - 89); // 10 - 100 = -90 = MAX - 89 (wrapping)
@@ -2299,7 +2305,7 @@ mod tests {
         ];
 
         // Verify the fake TLS packet structure
-        let mut fake_tls = vec![
+        let fake_tls = vec![
             0x16, // Content type: Handshake
             0x03, 0x01, // TLS 1.0
             0x00, 0x05, // Record length (5 bytes - minimal)
@@ -2311,6 +2317,7 @@ mod tests {
         assert_eq!(fake_tls[0], 0x16); // Handshake
         assert_eq!(fake_tls[5], 0x01); // Client Hello
         assert_eq!(fake_tls.len(), 10); // Minimal fake
+        assert_eq!(original_payload[0], 0x16); // Original is also TLS handshake
     }
 
     #[test]

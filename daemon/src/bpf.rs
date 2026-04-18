@@ -13,8 +13,6 @@ use goodbyedpi_proto::Event;
 
 /// Buffer size for event channel
 const EVENT_CHANNEL_SIZE: usize = 1024;
-/// Buffer size for config update channel
-const CONFIG_CHANNEL_SIZE: usize = 16;
 /// Ring buffer poll timeout (milliseconds)
 const RING_BUFFER_TIMEOUT_MS: i32 = 100;
 
@@ -32,8 +30,6 @@ pub struct BpfManager {
     config_tx: std::sync::mpsc::Sender<Vec<u8>>,
     /// Stats receiver channel (latest BPF stats snapshot)
     stats_rx: Option<watch::Receiver<Stats>>,
-    /// Reference to the config for updates
-    config: Arc<RwLock<DpiConfig>>,
 }
 
 impl BpfManager {
@@ -88,49 +84,7 @@ impl BpfManager {
             shutdown_tx,
             config_tx,
             stats_rx: Some(stats_rx),
-            config,
         })
-    }
-
-    /// Update BPF configuration at runtime
-    ///
-    /// This method serializes the current config and sends it to the BPF thread,
-    /// which updates the BPF map. This allows runtime configuration changes
-    /// without reloading the entire BPF program.
-    pub async fn update_config(&self) -> Result<()> {
-        info!("Updating BPF configuration...");
-
-        // Read current config and serialize
-        let config_guard = self.config.read().await;
-        let config_bytes = config_guard
-            .to_bytes()
-            .context("Failed to serialize configuration for eBPF map")?;
-        drop(config_guard);
-
-        // Send to BPF thread (non-blocking, uses sync channel)
-        self.config_tx
-            .send(config_bytes)
-            .context("Failed to send config update to BPF thread (thread may have exited)")?;
-
-        info!("Configuration update sent to BPF thread");
-        Ok(())
-    }
-
-    /// Update BPF configuration with a new config value
-    ///
-    /// This method takes a new config, updates the stored config reference,
-    /// and sends the update to the BPF thread.
-    pub async fn set_config(&self, new_config: DpiConfig) -> Result<()> {
-        info!("Setting new BPF configuration...");
-
-        // Update the stored config
-        {
-            let mut config_guard = self.config.write().await;
-            *config_guard = new_config;
-        }
-
-        // Send update to BPF thread
-        self.update_config().await
     }
 
     /// Take event receiver (can only be called once)
@@ -218,7 +172,7 @@ fn bpf_thread_main(
     let mut skel_builder = libbpf_rs::ObjectBuilder::default();
     let bpf_obj_path = concat!(env!("OUT_DIR"), "/goodbyedpi.bpf.o");
 
-    let mut obj = skel_builder
+    let obj = skel_builder
         .open_file(bpf_obj_path)
         .context("Failed to open BPF object file")?;
 
@@ -254,7 +208,7 @@ fn bpf_thread_main(
             .ifindex(ifidx as i32);
 
         // Create the qdisc first
-        let mut create_hook = hook.clone();
+        let mut create_hook = hook;
         if let Err(e) = create_hook.create() {
             warn!("TC qdisc create warning (may already exist): {}", e);
         }

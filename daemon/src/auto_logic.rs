@@ -18,7 +18,6 @@
 use dashmap::DashMap;
 use goodbyedpi_proto::{strategy_types, AutoLogicState, ConnKey};
 use log::{debug, info};
-use std::net::Ipv4Addr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -58,6 +57,7 @@ impl Strategy {
     }
 
     /// Get the split position if applicable
+    #[allow(dead_code)]
     pub fn split_position(&self) -> Option<usize> {
         match self {
             Strategy::TcpSplit(pos) => Some(*pos),
@@ -67,11 +67,13 @@ impl Strategy {
     }
 
     /// Check if this strategy uses fake packets
+    #[allow(dead_code)]
     pub fn uses_fake(&self) -> bool {
         matches!(self, Strategy::FakeWithSplit { .. })
     }
 
     /// Check if this strategy uses disorder
+    #[allow(dead_code)]
     pub fn uses_disorder(&self) -> bool {
         matches!(self, Strategy::Disorder)
     }
@@ -102,6 +104,7 @@ pub struct AutoConnectionState {
     /// Current strategy
     pub strategy: Strategy,
     /// When this state was created
+    #[allow(dead_code)]
     pub created_at: Instant,
     /// Last activity timestamp
     pub last_activity: Instant,
@@ -200,6 +203,7 @@ impl AutoConnectionState {
     }
 
     /// Mark connection as successful
+    #[allow(dead_code)]
     pub fn mark_success(&mut self) {
         self.success = true;
         self.last_activity = Instant::now();
@@ -211,6 +215,7 @@ impl AutoConnectionState {
     }
 
     /// Get configuration recommendations based on current strategy
+    #[allow(dead_code)]
     pub fn get_config_recommendations(&self) -> ConfigRecommendations {
         ConfigRecommendations::from(&self.strategy)
     }
@@ -302,14 +307,13 @@ impl AutoLogic {
     }
 
     /// Get or create connection state
+    #[allow(dead_code)]
     pub async fn get_or_create(&self, key: &ConnKey) -> AutoConnectionState {
-        self.states
-            .entry(*key)
-            .or_insert_with(AutoConnectionState::new)
-            .clone()
+        self.states.entry(*key).or_default().clone()
     }
 
     /// Get connection state if exists
+    #[allow(dead_code)]
     pub async fn get(&self, key: &ConnKey) -> Option<AutoConnectionState> {
         self.states.get(key).map(|state| state.clone())
     }
@@ -318,8 +322,8 @@ impl AutoLogic {
     pub async fn handle_rst(
         &self,
         key: &ConnKey,
-        src_ip: Ipv4Addr,
-        dst_ip: Ipv4Addr,
+        src_ip: &str,
+        dst_ip: &str,
         src_port: u16,
         dst_port: u16,
     ) -> Option<Strategy> {
@@ -328,7 +332,7 @@ impl AutoLogic {
         }
 
         let entry = self.states.entry(*key);
-        let mut state = entry.or_insert_with(AutoConnectionState::new);
+        let mut state = entry.or_default();
 
         debug!(
             "[AUTO-RST] {}:{} -> {}:{}",
@@ -343,8 +347,8 @@ impl AutoLogic {
     pub async fn handle_redirect(
         &self,
         key: &ConnKey,
-        src_ip: Ipv4Addr,
-        dst_ip: Ipv4Addr,
+        src_ip: &str,
+        dst_ip: &str,
         src_port: u16,
         dst_port: u16,
     ) -> Option<Strategy> {
@@ -353,7 +357,7 @@ impl AutoLogic {
         }
 
         let entry = self.states.entry(*key);
-        let mut state = entry.or_insert_with(AutoConnectionState::new);
+        let mut state = entry.or_default();
 
         debug!(
             "[AUTO-REDIRECT] {}:{} -> {}:{}",
@@ -368,8 +372,8 @@ impl AutoLogic {
     pub async fn handle_ssl_error(
         &self,
         key: &ConnKey,
-        src_ip: Ipv4Addr,
-        dst_ip: Ipv4Addr,
+        src_ip: &str,
+        dst_ip: &str,
         src_port: u16,
         dst_port: u16,
     ) -> Option<Strategy> {
@@ -378,7 +382,7 @@ impl AutoLogic {
         }
 
         let entry = self.states.entry(*key);
-        let mut state = entry.or_insert_with(AutoConnectionState::new);
+        let mut state = entry.or_default();
 
         debug!(
             "[AUTO-SSL] {}:{} -> {}:{}",
@@ -390,6 +394,7 @@ impl AutoLogic {
     }
 
     /// Mark connection as successful
+    #[allow(dead_code)]
     pub async fn mark_success(&self, key: &ConnKey) {
         if let Some(mut state) = self.states.get_mut(key) {
             state.mark_success();
@@ -398,6 +403,7 @@ impl AutoLogic {
     }
 
     /// Remove connection state
+    #[allow(dead_code)]
     pub async fn remove(&self, key: &ConnKey) {
         self.states.remove(key);
     }
@@ -442,16 +448,19 @@ impl AutoLogic {
     }
 
     /// Check if auto-logic is enabled for RST
+    #[allow(dead_code)]
     pub fn is_rst_enabled(&self) -> bool {
         self.enabled_rst
     }
 
     /// Check if auto-logic is enabled for Redirect
+    #[allow(dead_code)]
     pub fn is_redirect_enabled(&self) -> bool {
         self.enabled_redirect
     }
 
     /// Check if auto-logic is enabled for SSL
+    #[allow(dead_code)]
     pub fn is_ssl_enabled(&self) -> bool {
         self.enabled_ssl
     }
@@ -569,18 +578,67 @@ mod tests {
 
         // Test RST handling
         let strategy = auto
-            .handle_rst(
-                &key,
-                Ipv4Addr::new(192, 168, 1, 1),
-                Ipv4Addr::new(10, 0, 0, 1),
-                12345,
-                443,
-            )
+            .handle_rst(&key, "192.168.1.1", "10.0.0.1", 12345, 443)
             .await;
 
         assert!(strategy.is_some());
 
         // Test stats
+        let stats = auto.get_stats().await;
+        assert_eq!(stats.total_connections, 1);
+        assert_eq!(stats.total_rst_events, 1);
+    }
+
+    #[tokio::test]
+    async fn test_mark_success_updates_stats() {
+        let auto = AutoLogic::new(true, true, true);
+        let key = ConnKey {
+            src_ip: [0xC0A80101, 0, 0, 0],
+            dst_ip: [0x0A000001, 0, 0, 0],
+            src_port: 12345,
+            dst_port: 443,
+            is_ipv6: 0,
+            proto: 6,
+            _pad: [0; 2],
+        };
+
+        auto.handle_rst(&key, "192.168.1.1", "10.0.0.1", 12345, 443)
+            .await;
+        auto.mark_success(&key).await;
+
+        let stats = auto.get_stats().await;
+        assert_eq!(stats.total_connections, 1);
+        assert_eq!(stats.successful_connections, 1);
+    }
+
+    #[tokio::test]
+    async fn test_ipv6_flow_uses_same_auto_logic() {
+        let auto = AutoLogic::new(true, true, true);
+        let key = ConnKey {
+            src_ip: [
+                u32::from_ne_bytes([0xfd, 0x00, 0, 1]),
+                0,
+                0,
+                u32::from_ne_bytes([0, 0, 0, 1]),
+            ],
+            dst_ip: [
+                u32::from_ne_bytes([0xfd, 0x00, 0, 1]),
+                0,
+                0,
+                u32::from_ne_bytes([0, 0, 0, 2]),
+            ],
+            src_port: 12345,
+            dst_port: 443,
+            is_ipv6: 1,
+            proto: 6,
+            _pad: [0; 2],
+        };
+
+        let strategy = auto
+            .handle_rst(&key, "[fd00:1::1]", "[fd00:1::2]", 12345, 443)
+            .await;
+
+        assert!(strategy.is_some());
         let stats = auto.get_stats().await;
         assert_eq!(stats.total_connections, 1);
         assert_eq!(stats.total_rst_events, 1);

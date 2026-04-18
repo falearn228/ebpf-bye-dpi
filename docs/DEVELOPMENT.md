@@ -11,6 +11,8 @@ cargo build --release
 cargo test --workspace
 ```
 
+Для WSL2 это только userspace/dev baseline. Проверки загрузки eBPF, TC attach, netns/e2e и runtime fragmentation должны проходить на целевом Linux kernel/BTF.
+
 Запуск демона:
 
 ```bash
@@ -64,7 +66,7 @@ sudo ./scripts/diag-ipv6-quic-frag.sh eth0 30
 
 Скрипт считает количество увиденных IPv6 UDP fragments и выводит `PASS/FAIL`.
 
-Интеграционный runtime-тест в `ip netns` (event -> inject -> no-loop по mark):
+Интеграционный runtime-тест в `ip netns` (event -> inject -> no-loop по mark). На WSL2 с неподходящим kernel этот gate не запускать локально; переносить на целевой Linux host/VM:
 
 ```bash
 # Запускает изолированный стенд: netns + veth + tc clsact + tcpdump
@@ -90,6 +92,14 @@ cargo clippy --all-features -- -D warnings
 cargo test --workspace
 ```
 
+Если менялись публичные API, CLI flags или docs examples:
+
+```bash
+RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
+cargo build --release
+cd ebpf/src && make clean && make all
+```
+
 Минимум вручную:
 
 - убедиться, что `SPLIT/OOB/FAKE/TLSREC/DISORDER/QUIC FRAG` корректно генерируют events
@@ -98,17 +108,26 @@ cargo test --workspace
 
 ## 5. Релиз и откат
 
+Перед выкладкой:
+
+1. Зафиксировать версию, commit/tag, целевой kernel, интерфейс и production config.
+2. Собрать release бинарники и eBPF object на совместимом окружении.
+3. Проверить systemd unit/capabilities: `CAP_BPF`, `CAP_NET_ADMIN`, `CAP_NET_RAW`, доступ к `/sys/fs/bpf`.
+4. Сохранить текущий бинарник, config, service override и вывод `tc filter show dev <iface> egress/ingress`.
+
 Выкат:
 
-1. Собрать release бинарники.
+1. Установить новый бинарник и config.
 2. Перезапустить daemon на целевом интерфейсе.
-3. Проверить `stats_map` и события ring buffer.
+3. Проверить attach TC hooks, `stats_map`, `/metrics` и события ring buffer.
+4. Прогнать короткий manual traffic smoke для включенных техник.
 
 Откат:
 
 1. Остановить daemon.
 2. Выполнить `tc` cleanup (или перезапуск службы).
 3. Вернуть предыдущий бинарник и конфигурацию.
+4. Перезапустить daemon и проверить, что TC filters/maps соответствуют предыдущему состоянию.
 
 ## 6. Известные операционные риски
 
@@ -170,11 +189,13 @@ cargo test --workspace
 - `--dpi-desync-autottl=*` реализован как userspace TTL/hop-limit tuning для инжектируемых пакетов
 - `--dpi-desync-cutoff=*` реализован как per-connection/per-action cutoff в userspace event processor
 - `--dpi-desync-any-protocol=*` реализован как расширение userspace fallback profile selection для unknown L7
+- Zapret-style sections вида `--filter-* ... --dpi-desync ... --new` применяются per-section: ports, L7, host/ip lists, repeats, cutoff, any-protocol, fake profiles и hostfakesplit-mod.
+- Windows paths вида `C:\Games\zapret.*\lists\<file>` и `C:\Games\zapret.*\bin\<file>` автоматически маппятся на локальные `lists/<file>` и `bin/<file>`; отсутствующие `*-user.txt` списки считаются пустыми.
 
 ### Пока не реализовано
 
 - Полный coverage всех winws/zapret action/modifier имён и semantics без оговорок
-- Runtime-совместимость Windows path значений вида `C:\...` на Linux по-прежнему требует замены пути
+- Полная совместимость со всем набором upstream winws/zapret modes всё ещё не заявляется.
 
 ## 8. Целевой профиль совместимости с zapret
 
@@ -243,10 +264,11 @@ cargo test --workspace
 
 ## 9. Совместимость и ограничения
 
-- Текущий daemon запускается на Linux. Пути вида `C:\...` из zapret/winws-профилей не являются runtime-совместимыми как есть и должны быть заменены на Linux paths.
+- Текущий daemon запускается на Linux. Пути вида `C:\Games\zapret.*\lists\<file>` и `C:\Games\zapret.*\bin\<file>` из zapret/winws-профилей автоматически маппятся на локальные `lists/<file>` и `bin/<file>`; прочие Windows paths требуют явной замены.
 - Для list/profile files допустимы как CSV-значения, так и пути к локальным файлам.
 - Для полной zapret-совместимости важна не только поддержка action flags, но и сохранение семантики секций `--new` и порядка применения правил.
 - Для импорта profile strings теперь можно использовать `--config-file <path>`; parser понимает multiline profile text, quoted values, line continuation через `^`/`\` и игнорирует строковые комментарии (`#`, `;`, `//`, `::`, `rem`).
+- Профиль класса zapret 1.6.x Final args покрыт regression-тестом: `wf-tcp/wf-udp`, per-section `filter-tcp/filter-udp`, host/ip lists, `fake`, `hostfakesplit`, `repeats`, `fooling=ts[,md5sig]`, `ip-id=zero`, `any-protocol`, `cutoff`, fake QUIC/unknown UDP payloads.
 
 ## 10. План реализации для zapret-like запуска
 
@@ -296,3 +318,68 @@ cargo test --workspace
 - Без `--dpi-desync-any-protocol=1` `fake-unknown-udp` fallback не расширяется на весь unknown UDP; по умолчанию он остаётся ограниченным QUIC-like path на `dst_port=443`.
 - `cutoff` считается отдельно для каждой `(connection, action)` пары.
 - `autottl` и `ip-id=zero` сейчас применяются на userspace injection path; это не eBPF-side knob.
+
+## 12. Production-stable gates
+
+Статус на 2026-04-17: локальный CI baseline чистый:
+
+```bash
+cargo fmt --all -- --check
+cargo clippy --all-features -- -D warnings
+cargo test --workspace
+```
+
+Перед production-stable релизом считать обязательными следующие gates:
+
+1. Rust/eBPF build:
+
+   - `cargo fmt --all -- --check`
+   - `cargo build --release`
+   - `cargo clippy --all-features -- -D warnings`
+   - `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features`
+   - `cd ebpf/src && make clean && make all`
+
+2. Runtime smoke на целевом kernel/BTF:
+
+   - daemon стартует и корректно делает attach `TC_EGRESS`/`TC_INGRESS`
+   - `tc filter show dev <iface> egress/ingress` показывает фильтры
+   - graceful shutdown чистит `clsact`/filters
+   - `/metrics` отвечает, если endpoint включён
+   - WSL2 kernel считается dev/best-effort окружением; production gate должен проходить на целевом Linux kernel/BTF, потому что verifier и TC/eBPF возможности могут отличаться.
+
+3. Netns/e2e:
+
+   - запускать только на Linux host/VM с рабочими `ip netns`, veth, TC clsact, BTF и raw sockets
+   - `sudo ./scripts/test-netns-integration.sh`
+   - `sudo GBD_RUN_NETNS_TESTS=1 cargo test -p goodbyedpi-daemon --test netns_integration -- --ignored --nocapture`
+   - проверить отсутствие loop по `USERSPACE_MARK`
+   - если окружение WSL2 не поддерживает gate, результат должен быть `skipped: unsupported kernel/env`, а не `passed`
+
+4. Manual traffic matrix:
+
+   - TCP HTTP split/OOB/fake
+   - TLS ClientHello split/TLSREC/fake
+   - disorder
+   - QUIC IPv4 fragmentation
+   - QUIC IPv6 fragmentation или явное documented limitation
+   - target filters: `hostlist`, `hostlist-exclude`, `ipset`, `ipset-exclude`
+   - zapret-like composite profile через `--config-file`
+
+5. Systemd/capabilities:
+
+   - unit запускает правильный binary path и config/profile path
+   - `AmbientCapabilities` и `CapabilityBoundingSet` содержат `CAP_BPF CAP_NET_ADMIN CAP_NET_RAW`
+   - `ReadWritePaths=/sys/fs/bpf` или эквивалентный доступ к pinned maps разрешен
+   - service restart делает cleanup без оставленных TC filters
+   - rollback через предыдущий binary/config/service override проверен на том же iface
+
+6. Release artifacts:
+
+   - `goodbyedpi-daemon`, `goodbyedpi` и eBPF object собраны из одного commit
+   - release notes перечисляют новые flags, known limitations и migration notes
+   - `cargo audit` прогнан в CI/release окружении или documented skipped с причиной
+
+7. Remaining blockers до production-stable:
+
+   - Прогнать runtime gates на целевом Linux kernel/BTF.
+   - Подтвердить IPv6 QUIC fragmentation на production-like сети или зафиксировать documented limitation для конкретного окружения.

@@ -40,7 +40,7 @@ fn looks_like_discord_rtp(payload: &[u8]) -> bool {
     }
     let version_ok = (payload[0] & 0b1100_0000) == 0b1000_0000;
     let pt = payload[1] & 0x7f;
-    version_ok && matches!(pt, 0x78 | 0x79 | 0x7a)
+    version_ok && matches!(pt, 0x78..=0x7a)
 }
 
 fn looks_like_discord_dtls(payload: &[u8]) -> bool {

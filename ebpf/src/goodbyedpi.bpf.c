@@ -119,6 +119,7 @@ enum {
     EVENT_TLSREC_TRIGGERED,    /* TLS record split triggered - split at SNI boundary */
     EVENT_QUIC_FRAGMENT_TRIGGERED, /* QUIC/UDP IP fragmentation triggered */
     EVENT_OOB_TRIGGERED,       /* OOB (Out-of-Band) triggered - URG flag injection */
+    EVENT_SUCCESS_DETECTED,    /* Positive server response detected for auto-logic */
 };
 
 enum {
@@ -285,30 +286,25 @@ static __always_inline void update_stats_error(struct stats *s)
 static __always_inline __u16 copy_payload_to_event_skb(struct __sk_buff *skb, struct event *e,
                                                         __u32 payload_offset, __u32 payload_len)
 {
-    /* Determine how many bytes to copy (min of actual length and MAX_PAYLOAD_SIZE) */
-    __u32 copy_len = payload_len < MAX_PAYLOAD_SIZE ? payload_len : MAX_PAYLOAD_SIZE;
+    if (payload_len == 0) {
+        return 0;
+    }
 
-    bpf_dbg_printk("[GoodByeDPI] copy_payload: ENTER payload_offset=%u, payload_len=%u, copy_len=%u, skb_len=%u\n",
-                   payload_offset, payload_len, copy_len, skb->len);
+    /* Keep helper length in a verifier-visible bounded range. */
+    if (payload_len > MAX_PAYLOAD_SIZE)
+        payload_len = MAX_PAYLOAD_SIZE;
 
-    /* Initialize payload buffer to zero */
-    __builtin_memset(e->payload, 0, MAX_PAYLOAD_SIZE);
-    
+    __u32 copy_len = payload_len;
+    if (copy_len == 0)
+        return 0;
+
     /* Safely copy payload data using bpf_skb_load_bytes
      * Note: bpf_skb_load_bytes can read from paged/frags data (GSO/TSO)
      */
-    if (copy_len > 0) {
-        /* bpf_skb_load_bytes handles GSO/TSO frags automatically */
-        int ret = bpf_skb_load_bytes(skb, payload_offset, e->payload, copy_len);
-        if (ret < 0) {
-            bpf_dbg_printk("[GoodByeDPI] copy_payload FAILED: ret=%d, offset=%u, len=%u\n",
-                           ret, payload_offset, copy_len);
-            return 0;
-        }
-        bpf_dbg_printk("[GoodByeDPI] copy_payload SUCCESS: copied %u bytes, first_byte=0x%02x\n",
-                       copy_len, e->payload[0]);
-    } else {
-        bpf_dbg_printk("[GoodByeDPI] copy_payload: ZERO copy_len (payload_len=%u)\n", payload_len);
+    /* bpf_skb_load_bytes handles GSO/TSO frags automatically */
+    int ret = bpf_skb_load_bytes(skb, payload_offset, e->payload, copy_len);
+    if (ret < 0) {
+        return 0;
     }
     
     return (__u16)copy_len;
@@ -1634,16 +1630,16 @@ int dpi_ingress(struct __sk_buff *skb)
                     if (ev) {
                         ev->type = EVENT_REDIRECT_DETECTED;
                         /* Copy IP addresses - full IPv6 support */
-                        ev->src_ip[0] = key.dst_ip[0];
-                        ev->src_ip[1] = key.dst_ip[1];
-                        ev->src_ip[2] = key.dst_ip[2];
-                        ev->src_ip[3] = key.dst_ip[3];
-                        ev->dst_ip[0] = key.src_ip[0];
-                        ev->dst_ip[1] = key.src_ip[1];
-                        ev->dst_ip[2] = key.src_ip[2];
-                        ev->dst_ip[3] = key.src_ip[3];
-                        ev->src_port = key.dst_port;
-                        ev->dst_port = key.src_port;
+                        ev->src_ip[0] = key.src_ip[0];
+                        ev->src_ip[1] = key.src_ip[1];
+                        ev->src_ip[2] = key.src_ip[2];
+                        ev->src_ip[3] = key.src_ip[3];
+                        ev->dst_ip[0] = key.dst_ip[0];
+                        ev->dst_ip[1] = key.dst_ip[1];
+                        ev->dst_ip[2] = key.dst_ip[2];
+                        ev->dst_ip[3] = key.dst_ip[3];
+                        ev->src_port = key.src_port;
+                        ev->dst_port = key.dst_port;
                         ev->seq = bpf_ntohl(tcp->seq);
                         ev->ack = bpf_ntohl(tcp->ack_seq);
                         ev->flags = 0;
@@ -1674,16 +1670,16 @@ int dpi_ingress(struct __sk_buff *skb)
                 if (ev) {
                     ev->type = EVENT_SSL_ERROR_DETECTED;
                     /* Copy IP addresses - full IPv6 support (swapped for response) */
-                    ev->src_ip[0] = key.dst_ip[0];
-                    ev->src_ip[1] = key.dst_ip[1];
-                    ev->src_ip[2] = key.dst_ip[2];
-                    ev->src_ip[3] = key.dst_ip[3];
-                    ev->dst_ip[0] = key.src_ip[0];
-                    ev->dst_ip[1] = key.src_ip[1];
-                    ev->dst_ip[2] = key.src_ip[2];
-                    ev->dst_ip[3] = key.src_ip[3];
-                    ev->src_port = key.dst_port;
-                    ev->dst_port = key.src_port;
+                    ev->src_ip[0] = key.src_ip[0];
+                    ev->src_ip[1] = key.src_ip[1];
+                    ev->src_ip[2] = key.src_ip[2];
+                    ev->src_ip[3] = key.src_ip[3];
+                    ev->dst_ip[0] = key.dst_ip[0];
+                    ev->dst_ip[1] = key.dst_ip[1];
+                    ev->dst_ip[2] = key.dst_ip[2];
+                    ev->dst_ip[3] = key.dst_ip[3];
+                    ev->src_port = key.src_port;
+                    ev->dst_port = key.dst_port;
                     ev->seq = bpf_ntohl(tcp->seq);
                     ev->ack = bpf_ntohl(tcp->ack_seq);
                     ev->flags = 0;
@@ -1692,6 +1688,55 @@ int dpi_ingress(struct __sk_buff *skb)
                     ev->sni_length = 0;
                     ev->reserved = 0;
                     /* Copy TLS alert payload directly from skb */
+                    __u16 copied = copy_payload_to_event_skb(skb, ev, payload_offset,
+                                                              skb->len > payload_offset ? skb->len - payload_offset : 0);
+                    ev->payload_len = copied;
+                    bpf_ringbuf_submit(ev, 0);
+                }
+            }
+        }
+    }
+
+    /* Detect positive server response for auto-logic success accounting.
+     * Failure signals above keep priority; success is only a state marker.
+     */
+    if (cfg->auto_rst || cfg->auto_redirect || cfg->auto_ssl) {
+        __u8 success_check[12];
+        if (bpf_skb_load_bytes(skb, payload_offset, success_check, sizeof(success_check)) == 0) {
+            int is_success = 0;
+
+            if (success_check[0] == 'H' && success_check[1] == 'T' &&
+                success_check[2] == 'T' && success_check[3] == 'P' &&
+                success_check[9] == '2' && success_check[10] == '0' &&
+                (success_check[11] == '0' || success_check[11] == '4' || success_check[11] == '6')) {
+                is_success = 1;
+            }
+
+            if (success_check[0] == 0x16 || success_check[0] == 0x17) {
+                is_success = 1;
+            }
+
+            if (is_success) {
+                struct event *ev = bpf_ringbuf_reserve(&events, sizeof(*ev), 0);
+                if (ev) {
+                    ev->type = EVENT_SUCCESS_DETECTED;
+                    ev->src_ip[0] = key.src_ip[0];
+                    ev->src_ip[1] = key.src_ip[1];
+                    ev->src_ip[2] = key.src_ip[2];
+                    ev->src_ip[3] = key.src_ip[3];
+                    ev->dst_ip[0] = key.dst_ip[0];
+                    ev->dst_ip[1] = key.dst_ip[1];
+                    ev->dst_ip[2] = key.dst_ip[2];
+                    ev->dst_ip[3] = key.dst_ip[3];
+                    ev->src_port = key.src_port;
+                    ev->dst_port = key.dst_port;
+                    ev->seq = bpf_ntohl(tcp->seq);
+                    ev->ack = bpf_ntohl(tcp->ack_seq);
+                    ev->flags = 0;
+                    ev->is_ipv6 = key.is_ipv6;
+                    ev->sni_offset = 0;
+                    ev->sni_length = 0;
+                    ev->reserved = 0;
                     __u16 copied = copy_payload_to_event_skb(skb, ev, payload_offset,
                                                               skb->len > payload_offset ? skb->len - payload_offset : 0);
                     ev->payload_len = copied;

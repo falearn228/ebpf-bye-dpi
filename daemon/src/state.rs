@@ -22,20 +22,6 @@ impl ConnectionState {
         }
     }
 
-    /// Create with auto-logic enabled
-    pub fn with_auto_logic(auto_logic: AutoLogic) -> Self {
-        Self {
-            states: Arc::new(DashMap::new()),
-            ttl: Duration::from_secs(60),
-            auto_logic: Some(auto_logic),
-        }
-    }
-
-    /// Get auto-logic reference
-    pub fn auto_logic(&self) -> Option<&AutoLogic> {
-        self.auto_logic.as_ref()
-    }
-
     #[allow(dead_code)]
     pub async fn get(&self, key: &ConnKey) -> Option<ConnState> {
         self.states.get(key).map(|entry| entry.value().0)
@@ -59,6 +45,7 @@ impl ConnectionState {
     }
 
     /// Cleanup expired connections and auto-logic states
+    #[allow(dead_code)]
     pub async fn cleanup(&self) -> usize {
         // Cleanup basic states
         let before = self.states.len();
@@ -80,6 +67,3 @@ impl Default for ConnectionState {
         Self::new()
     }
 }
-
-// Re-export auto_logic types for convenience
-pub use crate::auto_logic::{AutoLogicStats, ConfigRecommendations, Strategy};

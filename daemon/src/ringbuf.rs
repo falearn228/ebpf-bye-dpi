@@ -65,6 +65,7 @@ impl EventProcessor {
     }
 
     /// Set the config update channel for BPF updates
+    #[allow(dead_code)]
     pub fn set_config_update_tx(&mut self, tx: std::sync::mpsc::Sender<Vec<u8>>) {
         self.config_update_tx = Some(tx);
     }
@@ -156,7 +157,11 @@ impl EventProcessor {
     }
 
     fn action_cutoff_allows(&self, config: &DpiConfig, event: &Event, action: RuleAction) -> bool {
-        let Some(limit) = config.dpi_desync_cutoff else {
+        let limit = config
+            .matching_section(event, action)
+            .and_then(|section| section.cutoff)
+            .or(config.dpi_desync_cutoff);
+        let Some(limit) = limit else {
             return true;
         };
 
@@ -183,14 +188,23 @@ impl EventProcessor {
         true
     }
 
-    fn configure_injector(&self, config: &DpiConfig) {
-        self.injector
-            .set_tuning(config.ip_id_zero, config.dpi_desync_autottl);
+    fn configure_injector(&self, config: &DpiConfig, event: &Event, action: RuleAction) {
+        let section = config.matching_section(event, action);
+        let ip_id_zero =
+            section.map(|section| section.ip_id_zero).unwrap_or(false) || config.ip_id_zero;
+        let autottl = section
+            .and_then(|section| section.autottl)
+            .or(config.dpi_desync_autottl);
+        self.injector.set_tuning(ip_id_zero, autottl);
     }
 
     /// Resolve repeats from rule engine for specific action and event
     fn repeats_for_action(&self, config: &DpiConfig, event: &Event, action: RuleAction) -> u8 {
         let proto = action.default_protocol();
+
+        if let Some(section) = config.matching_section(event, action) {
+            return section.repeats.unwrap_or(1).max(1);
+        }
 
         let repeats = config
             .rules
@@ -209,6 +223,30 @@ impl EventProcessor {
 
     /// Check global port filter (`--filter-tcp/--filter-udp`) before injection.
     fn port_filter_allows(&self, config: &DpiConfig, event: &Event, action: RuleAction) -> bool {
+        if !config.sections.is_empty() {
+            let (src_ip, dst_ip) = event.format_ips();
+            if let Some(section) = config.matching_section(event, action) {
+                debug!(
+                    "[SECTION] Match action {:?} via {:?} ports={:?} for {}:{} -> {}:{} repeats={:?} cutoff={:?}",
+                    action,
+                    section.proto,
+                    section.ports,
+                    src_ip,
+                    event.src_port,
+                    dst_ip,
+                    event.dst_port,
+                    section.repeats,
+                    section.cutoff
+                );
+                return true;
+            }
+            debug!(
+                "[FILTER] Skip action {:?} for {}:{} -> {}:{} (no matching zapret section)",
+                action, src_ip, event.src_port, dst_ip, event.dst_port
+            );
+            return false;
+        }
+
         let allowed = match action.default_protocol() {
             goodbyedpi_proto::RuleProtocol::Tcp => config.tcp_port_allowed(event.dst_port),
             goodbyedpi_proto::RuleProtocol::Udp => config.udp_port_allowed(event.dst_port),
@@ -225,6 +263,10 @@ impl EventProcessor {
 
     /// Check L7 filter (`--filter-l7`) before injection.
     fn l7_filter_allows(&self, config: &DpiConfig, event: &Event, action: RuleAction) -> bool {
+        if !config.sections.is_empty() {
+            return true;
+        }
+
         let allowed = config.l7_allowed(event);
         if !allowed {
             let payload_len = (event.payload_len as usize).min(MAX_PAYLOAD_SIZE);
@@ -239,6 +281,10 @@ impl EventProcessor {
 
     /// Check host/ip targeting lists before injection.
     fn target_filter_allows(&self, config: &DpiConfig, event: &Event, action: RuleAction) -> bool {
+        if !config.sections.is_empty() {
+            return true;
+        }
+
         let allowed = config.target_allowed(event);
         if !allowed {
             let host = extract_target_host(event).unwrap_or_else(|| "<none>".to_string());
@@ -283,6 +329,9 @@ impl EventProcessor {
                 self.handle_ssl_error_detected(event, config, &src_ip, &dst_ip)
                     .await;
             }
+            event_types::SUCCESS_DETECTED => {
+                self.handle_success_detected(event, &src_ip, &dst_ip).await;
+            }
             event_types::DISORDER_TRIGGERED => {
                 self.handle_disorder_triggered(event, config, &src_ip, &dst_ip)
                     .await;
@@ -324,7 +373,7 @@ impl EventProcessor {
         if !self.action_cutoff_allows(config, event, RuleAction::Split) {
             return;
         }
-        self.configure_injector(config);
+        self.configure_injector(config, event, RuleAction::Split);
 
         info!(
             "[SPLIT] handle_split_triggered called for {}:{} -> {}:{}, event_type={}",
@@ -499,7 +548,7 @@ impl EventProcessor {
                     if !self.action_cutoff_allows(config, event, RuleAction::Fake) {
                         return;
                     }
-                    self.configure_injector(config);
+                    self.configure_injector(config, event, RuleAction::Fake);
                     let repeats = self.repeats_for_action(config, event, RuleAction::Fake);
                     for attempt in 1..=repeats {
                         if let Err(e) = self.inject_fake_packet(event, config).await {
@@ -541,13 +590,7 @@ impl EventProcessor {
 
         // Use auto-logic if available
         if let Some(ref auto_logic) = self.auto_logic {
-            if event.is_ipv6 != 0 {
-                info!("[AUTO-RST] IPv6 flow detected, auto-logic currently applies only to IPv4");
-                return;
-            }
             let key = self.build_conn_key(event);
-            let src_ip = event.src_ip_v4();
-            let dst_ip = event.dst_ip_v4();
 
             if let Some(strategy) = auto_logic
                 .handle_rst(&key, src_ip, dst_ip, event.src_port, event.dst_port)
@@ -589,15 +632,7 @@ impl EventProcessor {
 
         // Use auto-logic if available
         if let Some(ref auto_logic) = self.auto_logic {
-            if event.is_ipv6 != 0 {
-                info!(
-                    "[AUTO-REDIRECT] IPv6 flow detected, auto-logic currently applies only to IPv4"
-                );
-                return;
-            }
             let key = self.build_conn_key(event);
-            let src_ip = event.src_ip_v4();
-            let dst_ip = event.dst_ip_v4();
 
             if let Some(strategy) = auto_logic
                 .handle_redirect(&key, src_ip, dst_ip, event.src_port, event.dst_port)
@@ -643,13 +678,7 @@ impl EventProcessor {
 
         // Use auto-logic if available
         if let Some(ref auto_logic) = self.auto_logic {
-            if event.is_ipv6 != 0 {
-                info!("[AUTO-SSL] IPv6 flow detected, auto-logic currently applies only to IPv4");
-                return;
-            }
             let key = self.build_conn_key(event);
-            let src_ip = event.src_ip_v4();
-            let dst_ip = event.dst_ip_v4();
 
             if let Some(strategy) = auto_logic
                 .handle_ssl_error(&key, src_ip, dst_ip, event.src_port, event.dst_port)
@@ -660,6 +689,20 @@ impl EventProcessor {
             }
         } else {
             info!("[AUTO-SSL] Auto-logic not enabled, SSL error logged but no action taken");
+        }
+    }
+
+    async fn handle_success_detected(&self, event: &Event, src_ip: &str, dst_ip: &str) {
+        info!(
+            "[AUTO-SUCCESS] Positive response detected: {}:{} -> {}:{}, ipv6={}",
+            src_ip, event.src_port, dst_ip, event.dst_port, event.is_ipv6
+        );
+
+        if let Some(ref auto_logic) = self.auto_logic {
+            let key = self.build_conn_key(event);
+            auto_logic.mark_success(&key).await;
+        } else {
+            info!("[AUTO-SUCCESS] Auto-logic not enabled, success logged but no state updated");
         }
     }
 
@@ -723,12 +766,10 @@ impl EventProcessor {
         }
 
         // Update disorder if recommended
-        if recs.use_disorder {
-            if !config.use_disorder {
-                info!("[AUTO] Enabling packet disorder");
-                config.use_disorder = true;
-                config_changed = true;
-            }
+        if recs.use_disorder && !config.use_disorder {
+            info!("[AUTO] Enabling packet disorder");
+            config.use_disorder = true;
+            config_changed = true;
         }
 
         // Log the current configuration state
@@ -738,26 +779,27 @@ impl EventProcessor {
         );
 
         // If the strategy uses fake and we have a fake_offset, inject a fake packet
-        if recs.use_fake && recs.fake_offset.is_some() {
-            if self.port_filter_allows(config, event, RuleAction::Fake) {
-                if !self.l7_filter_allows(config, event, RuleAction::Fake) {
-                    return;
-                }
-                if !self.target_filter_allows(config, event, RuleAction::Fake) {
-                    return;
-                }
-                if !self.action_cutoff_allows(config, event, RuleAction::Fake) {
-                    return;
-                }
-                self.configure_injector(config);
-                let repeats = self.repeats_for_action(config, event, RuleAction::Fake);
-                for attempt in 1..=repeats {
-                    if let Err(e) = self.inject_fake_packet(event, config).await {
-                        warn!(
-                            "[AUTO] Failed to inject fake packet for strategy on attempt {}/{}: {}",
-                            attempt, repeats, e
-                        );
-                    }
+        if recs.use_fake
+            && recs.fake_offset.is_some()
+            && self.port_filter_allows(config, event, RuleAction::Fake)
+        {
+            if !self.l7_filter_allows(config, event, RuleAction::Fake) {
+                return;
+            }
+            if !self.target_filter_allows(config, event, RuleAction::Fake) {
+                return;
+            }
+            if !self.action_cutoff_allows(config, event, RuleAction::Fake) {
+                return;
+            }
+            self.configure_injector(config, event, RuleAction::Fake);
+            let repeats = self.repeats_for_action(config, event, RuleAction::Fake);
+            for attempt in 1..=repeats {
+                if let Err(e) = self.inject_fake_packet(event, config).await {
+                    warn!(
+                        "[AUTO] Failed to inject fake packet for strategy on attempt {}/{}: {}",
+                        attempt, repeats, e
+                    );
                 }
             }
         }
@@ -801,7 +843,7 @@ impl EventProcessor {
         if !self.action_cutoff_allows(config, event, RuleAction::Disorder) {
             return;
         }
-        self.configure_injector(config);
+        self.configure_injector(config, event, RuleAction::Disorder);
 
         // Get payload from event (clamped to MAX_PAYLOAD_SIZE for safety)
         let payload_len = (event.payload_len as usize).min(MAX_PAYLOAD_SIZE);
@@ -931,7 +973,7 @@ impl EventProcessor {
         if !self.action_cutoff_allows(config, event, RuleAction::Oob) {
             return;
         }
-        self.configure_injector(config);
+        self.configure_injector(config, event, RuleAction::Oob);
 
         // Get payload from event
         let payload_len = event.payload_len as usize;
@@ -1042,7 +1084,7 @@ impl EventProcessor {
         if !self.action_cutoff_allows(config, event, RuleAction::Frag) {
             return;
         }
-        self.configure_injector(config);
+        self.configure_injector(config, event, RuleAction::Frag);
 
         info!(
             "[QUIC FRAG] Fragmentation triggered for {}:{} -> {}:{}, payload_len={}",
@@ -1058,7 +1100,7 @@ impl EventProcessor {
 
         // Get fragment size from config
         let frag_size = if config.frag_size > 0 {
-            config.frag_size as u16
+            config.frag_size
         } else {
             8 // Default 8-byte fragments
         };
@@ -1148,7 +1190,7 @@ impl EventProcessor {
         if !self.action_cutoff_allows(config, event, RuleAction::Tlsrec) {
             return;
         }
-        self.configure_injector(config);
+        self.configure_injector(config, event, RuleAction::Tlsrec);
 
         // Get payload from event (clamped to MAX_PAYLOAD_SIZE for safety)
         let payload_len = (event.payload_len as usize).min(MAX_PAYLOAD_SIZE);
@@ -1351,6 +1393,7 @@ impl EventProcessor {
         Ok(())
     }
     /// Get auto-logic reference
+    #[allow(dead_code)]
     pub fn auto_logic(&self) -> Option<&Arc<AutoLogic>> {
         self.auto_logic.as_ref()
     }
@@ -1375,7 +1418,12 @@ fn unknown_udp_fallback_allowed(
     detected_l7: L7Protocol,
 ) -> bool {
     matches!(detected_l7, L7Protocol::Unknown)
-        && (config.dpi_desync_any_protocol || event.dst_port == 443)
+        && (config
+            .matching_section(event, RuleAction::Fake)
+            .map(|section| section.any_protocol)
+            .unwrap_or(false)
+            || config.dpi_desync_any_protocol
+            || event.dst_port == 443)
 }
 
 fn select_fake_profile_payload<'a>(
@@ -1383,13 +1431,23 @@ fn select_fake_profile_payload<'a>(
     event: &Event,
     detected_l7: L7Protocol,
 ) -> Option<(&'a [u8], Option<&'static str>)> {
+    let section_profiles = config
+        .matching_section(event, RuleAction::Fake)
+        .map(|section| &section.fake_profiles);
+
     match detected_l7 {
         L7Protocol::Stun => {
+            if let Some(payload) = section_profiles.and_then(|profiles| profiles.stun.as_ref()) {
+                return Some((payload.as_slice(), Some("section-fake-stun")));
+            }
             if let Some(payload) = config.fake_profiles.stun.as_ref() {
                 return Some((payload.as_slice(), Some("fake-stun")));
             }
         }
         L7Protocol::Discord => {
+            if let Some(payload) = section_profiles.and_then(|profiles| profiles.discord.as_ref()) {
+                return Some((payload.as_slice(), Some("section-fake-discord")));
+            }
             if let Some(payload) = config.fake_profiles.discord.as_ref() {
                 return Some((payload.as_slice(), Some("fake-discord")));
             }
@@ -1400,6 +1458,10 @@ fn select_fake_profile_payload<'a>(
     if config.dpi_desync_actions.contains(&RuleAction::Split)
         && config.dpi_desync_actions.contains(&RuleAction::Fake)
     {
+        if let Some(payload) = section_profiles.and_then(|profiles| profiles.hostfakesplit.as_ref())
+        {
+            return Some((payload.as_slice(), Some("section-hostfakesplit-mod")));
+        }
         if let Some(payload) = config.fake_profiles.hostfakesplit.as_ref() {
             return Some((payload.as_slice(), Some("hostfakesplit-mod")));
         }
@@ -1416,12 +1478,18 @@ fn select_fake_profile_payload<'a>(
     }
 
     if event.dst_port == 443 {
+        if let Some(payload) = section_profiles.and_then(|profiles| profiles.quic.as_ref()) {
+            return Some((payload.as_slice(), Some("section-fake-quic")));
+        }
         if let Some(payload) = config.fake_profiles.quic.as_ref() {
             return Some((payload.as_slice(), Some("fake-quic")));
         }
     }
 
     if unknown_udp_fallback_allowed(config, event, detected_l7) {
+        if let Some(payload) = section_profiles.and_then(|profiles| profiles.unknown_udp.as_ref()) {
+            return Some((payload.as_slice(), Some("section-fake-unknown-udp")));
+        }
         if let Some(payload) = config.fake_profiles.unknown_udp.as_ref() {
             return Some((payload.as_slice(), Some("fake-unknown-udp")));
         }
@@ -1457,25 +1525,6 @@ mod tests {
 
     #[test]
     fn test_build_conn_key() {
-        // Create a mock event
-        let event = Event {
-            event_type: event_types::RST_DETECTED,
-            src_ip: [0xC0A80101, 0, 0, 0], // 192.168.1.1
-            dst_ip: [0x0A000001, 0, 0, 0], // 10.0.0.1
-            src_port: 12345,
-            dst_port: 443,
-            seq: 1000,
-            ack: 500,
-            flags: 0x18,
-            payload_len: 0,
-            is_ipv6: 0,
-            sni_offset: 0,
-            sni_length: 0,
-            reserved: 0,
-            payload: [0u8; MAX_PAYLOAD_SIZE],
-            _pad: [0; 3],
-        };
-
         // We can't create EventProcessor in tests without a raw socket,
         // but we can test the logic independently
         let expected_key = ConnKey {

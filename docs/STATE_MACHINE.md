@@ -32,10 +32,11 @@
 - `TLSREC_TRIGGERED` (7)
 - `QUIC_FRAGMENT_TRIGGERED` (8)
 - `OOB_TRIGGERED` (9)
+- `SUCCESS_DETECTED` (10)
 
 ### 1.3 Userspace auto-logic state
 
-На flow (IPv4) в `AutoLogic` хранится:
+На TCP flow в `AutoLogic` хранится:
 - текущая стратегия: `TCP_SPLIT` / `TLS_RECORD_SPLIT` / `DISORDER` / `FAKE_WITH_SPLIT`
 - `param` (индекс позиции split)
 - `attempts`
@@ -101,6 +102,7 @@ Ingress ищет reverse-key в `conn_map` (тот же TCP flow в обратн
   - state удаляется всегда (RST считается закрытием flow)
 - Если `auto_redirect` и payload похож на `HTTP ... 301/302`: `EVENT_REDIRECT_DETECTED`
 - Если `auto_ssl` и payload похож на TLS fatal alert: `EVENT_SSL_ERROR_DETECTED`
+- Если включен любой auto-mode и payload похож на успешный ответ: `EVENT_SUCCESS_DETECTED`
 
 ## 5. Userspace auto-logic transitions
 
@@ -158,16 +160,19 @@ Auto-logic реагирует на ingress events и обновляет runtime-
 
 ### 7.2 Успех
 
-Явного детектора успеха в текущем runtime нет:
-- поле `success` в `AutoConnectionState` существует
-- метод `mark_success()` реализован
-- но в текущем event pipeline не вызывается
+Успех фиксируется явным ingress event:
 
-Практически это означает, что "успех" сейчас не фиксируется как отдельный event/state transition; состояние живет до TTL или удаления по `RST`.
+- `SUCCESS_DETECTED` отправляется для tracked TCP flow при позитивном server response
+- HTTP success: `HTTP ... 200/204/206`
+- TLS success: TLS handshake (`0x16`) или application data (`0x17`) в ответном направлении
+- userspace вызывает `AutoLogic::mark_success()`
+- `AutoLogicStats.successful_connections` считает flow, где success был отмечен
+
+Success event не меняет стратегию и не отключает активные техники; это accounting/signal для production-наблюдения. RST, redirect и SSL fatal alert остаются fail-сигналами и обрабатываются отдельно.
 
 ## 8. Границы и неочевидные моменты
 
-- Auto-logic в `ringbuf` сейчас применяется только для IPv4 flow (IPv6 логируется и пропускается без авто-переходов).
+- Auto-logic в `ringbuf` применяется для IPv4 и IPv6 flow; ключ хранит `is_ipv6`, а userspace injection paths выбираются по `event.is_ipv6`.
 - `STAGE_OOB` может выставиться даже когда OOB реально не отправлен (если `oob_pos >= payload_len`).
 - `DISORDER` зависит от текущего `stage` (`OOB`/`SPLIT`), поэтому порядок техник важен.
 - `BpfManager::cleanup_connections()` в userspace не чистит `conn_map` напрямую; фактический TTL cleanup делается в eBPF при обработке пакетов.

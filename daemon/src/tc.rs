@@ -3,7 +3,7 @@
 //! This module provides cleanup functions for TC qdiscs and filters.
 //! BPF loading is now handled by libbpf-rs directly in bpf.rs.
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result};
 use log::{info, warn};
 use std::process::Command;
 
