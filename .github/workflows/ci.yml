@@ -95,7 +95,7 @@ jobs:
         run: cargo build -p goodbyedpi-daemon --release
       
       - name: Build CLI
-        run: cargo build -p goodbyedpi --release
+        run: cargo build -p goodbyedpi-cli --release
       
       - name: Build proto library
         run: cargo build -p goodbyedpi-proto --release
