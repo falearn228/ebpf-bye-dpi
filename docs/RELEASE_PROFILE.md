@@ -39,7 +39,7 @@ sudo ./target/release/goodbyedpi-daemon \
 
 ## Runtime smoke
 
-Проверять на целевом Linux kernel/BTF, не на WSL2.
+Проверять на целевом Linux kernel/BTF, не на WSL2 (по крайней мере у меня там не все гладко из-за особенностей eBPF на нём).
 
 1. Собрать release:
 
