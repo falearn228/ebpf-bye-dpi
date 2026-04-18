@@ -118,31 +118,43 @@ jobs:
             zlib1g-dev \
             make \
             linux-headers-generic \
-            linux-tools-common \
-            linux-tools-generic
+            bpftool
       
       - name: Check bpftool availability
         run: |
-          # Try to find bpftool
-          if command -v bpftool &> /dev/null; then
-            echo "bpftool found:"
-            bpftool --version
-          else
-            echo "bpftool not in PATH, checking common locations..."
-            for path in /usr/sbin/bpftool /usr/local/sbin/bpftool /sbin/bpftool; do
-              if [ -f "$path" ]; then
-                echo "Found bpftool at $path"
-                $path --version
-                break
+          resolve_bpftool() {
+            for candidate in bpftool /usr/sbin/bpftool /usr/bin/bpftool /usr/local/sbin/bpftool /sbin/bpftool; do
+              if command -v "$candidate" >/dev/null 2>&1; then
+                path="$(command -v "$candidate")"
+              elif [ -x "$candidate" ]; then
+                path="$candidate"
+              else
+                continue
+              fi
+
+              if "$path" --version >/dev/null 2>&1; then
+                echo "$path"
+                return 0
               fi
             done
+
+            return 1
+          }
+
+          if ! BPFTOOL="$(resolve_bpftool)"; then
+            echo "::error::working bpftool not found"
+            exit 1
           fi
+
+          echo "bpftool found: $BPFTOOL"
+          "$BPFTOOL" --version
+          echo "BPFTOOL=$BPFTOOL" >> "$GITHUB_ENV"
       
       - name: Compile eBPF code
         run: |
           cd ebpf/src
           make clean
-          make all
+          make all BPFTOOL="$BPFTOOL"
       
       - name: Upload eBPF object
         uses: actions/upload-artifact@v4
