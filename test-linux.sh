@@ -25,6 +25,7 @@ DAEMON_BIN="${GBD_DAEMON_BIN:-}"
 TEST_TYPE=""
 SELECT_MODE=""
 NON_INTERACTIVE=0
+IN_CLEANUP=0
 declare -a CONFIG_SPECS=()
 declare -a GLOBAL_ROWS=()
 declare -a STARTED_PIDS=()
@@ -130,13 +131,33 @@ set_ipset_mode() {
     esac
 }
 
+terminate_pid() {
+    local pid="$1"
+    local i
+
+    if ! kill -0 "${pid}" 2>/dev/null; then
+        return
+    fi
+
+    kill "${pid}" 2>/dev/null || true
+    for i in {1..20}; do
+        if ! kill -0 "${pid}" 2>/dev/null; then
+            wait "${pid}" 2>/dev/null || true
+            return
+        fi
+        sleep 0.1
+    done
+
+    kill -KILL "${pid}" 2>/dev/null || true
+    wait "${pid}" 2>/dev/null || true
+}
+
 cleanup() {
+    [[ "${IN_CLEANUP}" -eq 1 ]] && return
+    IN_CLEANUP=1
     set +e
     for pid in "${STARTED_PIDS[@]:-}"; do
-        if kill -0 "${pid}" 2>/dev/null; then
-            kill "${pid}" 2>/dev/null || true
-            wait "${pid}" 2>/dev/null || true
-        fi
+        terminate_pid "${pid}"
     done
 
     if [[ "${ORIGINAL_IPSET_STATUS:-any}" != "any" ]]; then
@@ -144,7 +165,18 @@ cleanup() {
     fi
     rm -f "${IPSET_FLAG_FILE}"
 }
-trap cleanup EXIT INT TERM
+
+handle_interrupt() {
+    local code="$1"
+    trap - EXIT INT TERM
+    printf '\n[WARN] interrupted, stopping daemon and restoring ipset\n' >&2
+    cleanup
+    exit "${code}"
+}
+
+trap cleanup EXIT
+trap 'handle_interrupt 130' INT
+trap 'handle_interrupt 143' TERM
 
 parse_args() {
     while [[ $# -gt 0 ]]; do
@@ -387,10 +419,7 @@ start_daemon() {
 
 stop_daemon() {
     local pid="$1"
-    if kill -0 "${pid}" 2>/dev/null; then
-        kill "${pid}" 2>/dev/null || true
-        wait "${pid}" 2>/dev/null || true
-    fi
+    terminate_pid "${pid}"
 }
 
 curl_status() {
@@ -432,7 +461,7 @@ ping_status() {
 
     avg="$(awk -F'/' '/rtt|round-trip/ { print $5 }' <<<"${output}")"
     if [[ -n "${avg}" ]]; then
-        printf '%.0f ms' "${avg}"
+        LC_NUMERIC=C printf '%.0f ms' "${avg}"
     else
         printf 'OK'
     fi
@@ -539,7 +568,7 @@ dpi_curl_one() {
         status="FAIL"
     fi
 
-    if awk -v kb="${size_kb}" -v min="${DPI_WARN_MIN_KB}" -v max="${DPI_WARN_MAX_KB}" -v exit="${exit_code}" 'BEGIN { exit !((kb >= min) && (kb <= max) && (exit != 0)) }'; then
+    if awk -v kb="${size_kb}" -v min="${DPI_WARN_MIN_KB}" -v max="${DPI_WARN_MAX_KB}" -v curl_exit="${exit_code}" 'BEGIN { exit !((kb >= min) && (kb <= max) && (curl_exit != 0)) }'; then
         status="LIKELY_BLOCKED"
     fi
 

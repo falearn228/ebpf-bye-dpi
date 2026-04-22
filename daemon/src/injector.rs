@@ -99,18 +99,35 @@ impl RawInjector {
             }
         }
 
-        let sock_v6 = socket(
-            AddressFamily::Inet6,
-            SockType::Raw,
-            SockFlag::empty(),
-            Some(nix::sys::socket::SockProtocol::Tcp),
-        )
-        .context(
-            "Failed to create raw TCP IPv6 socket. \
-             Ensure you have CAP_NET_RAW capability or run as root.",
-        )?;
+        let raw_fd_v6 = unsafe { libc::socket(libc::AF_INET6, libc::SOCK_RAW, libc::IPPROTO_RAW) };
+        if raw_fd_v6 < 0 {
+            let err = std::io::Error::last_os_error();
+            return Err(anyhow::anyhow!(
+                "Failed to create raw TCP IPv6 socket: {} (os error {}). \
+                 Ensure you have CAP_NET_RAW capability or run as root.",
+                err,
+                err.raw_os_error().unwrap_or(-1)
+            ));
+        }
 
-        let raw_fd_v6 = sock_v6.into_raw_fd();
+        let hdrincl: i32 = 1;
+        let ret = unsafe {
+            libc::setsockopt(
+                raw_fd_v6,
+                libc::IPPROTO_IPV6,
+                libc::IPV6_HDRINCL,
+                &hdrincl as *const _ as *const libc::c_void,
+                std::mem::size_of::<i32>() as libc::socklen_t,
+            )
+        };
+        if ret < 0 {
+            let err = std::io::Error::last_os_error();
+            return Err(anyhow::anyhow!(
+                "Failed to set IPV6_HDRINCL on TCP raw IPv6 socket: {} (os error {})",
+                err,
+                err.raw_os_error().unwrap_or(-1)
+            ));
+        }
 
         unsafe {
             let mark: i32 = 0xD0F; // USERSPACE_MARK
@@ -303,15 +320,22 @@ impl RawInjector {
             src_ip, src_port, dst_ip, dst_port, seq, ack, flags
         );
 
-        // For AF_INET6 raw socket with IPPROTO_TCP we send TCP header + payload only.
         let mut tcp_packet = build_tcp_header(src_port, dst_port, seq, ack, flags, payload);
         let tcp_checksum = calculate_tcp_checksum_v6(src_ip, dst_ip, &tcp_packet);
         tcp_packet[16] = (tcp_checksum >> 8) as u8;
         tcp_packet[17] = (tcp_checksum & 0xFF) as u8;
+        let ipv6_header = build_ipv6_header(
+            src_ip,
+            dst_ip,
+            tcp_packet.len() as u16,
+            libc::IPPROTO_TCP as u8,
+            self.current_ttl(),
+        );
+        let packet = [&ipv6_header[..], &tcp_packet[..]].concat();
 
         let dst_sockaddr = libc::sockaddr_in6 {
             sin6_family: libc::AF_INET6 as u16,
-            sin6_port: dst_port.to_be(),
+            sin6_port: 0,
             sin6_flowinfo: 0,
             sin6_addr: libc::in6_addr {
                 s6_addr: dst_ip.octets(),
@@ -322,8 +346,8 @@ impl RawInjector {
         let sent = unsafe {
             libc::sendto(
                 self.sock_v6,
-                tcp_packet.as_ptr() as *const libc::c_void,
-                tcp_packet.len(),
+                packet.as_ptr() as *const libc::c_void,
+                packet.len(),
                 0,
                 &dst_sockaddr as *const _ as *const libc::sockaddr,
                 std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t,
@@ -1260,10 +1284,18 @@ impl RawInjector {
         let tcp_checksum = calculate_tcp_checksum_v6(src_ip, dst_ip, &tcp_packet);
         tcp_packet[16] = (tcp_checksum >> 8) as u8;
         tcp_packet[17] = (tcp_checksum & 0xFF) as u8;
+        let ipv6_header = build_ipv6_header(
+            src_ip,
+            dst_ip,
+            tcp_packet.len() as u16,
+            libc::IPPROTO_TCP as u8,
+            self.current_ttl(),
+        );
+        let packet = [&ipv6_header[..], &tcp_packet[..]].concat();
 
         let dst_sockaddr = libc::sockaddr_in6 {
             sin6_family: libc::AF_INET6 as u16,
-            sin6_port: dst_port.to_be(),
+            sin6_port: 0,
             sin6_flowinfo: 0,
             sin6_addr: libc::in6_addr {
                 s6_addr: dst_ip.octets(),
@@ -1274,8 +1306,8 @@ impl RawInjector {
         let sent = unsafe {
             libc::sendto(
                 self.sock_v6,
-                tcp_packet.as_ptr() as *const libc::c_void,
-                tcp_packet.len(),
+                packet.as_ptr() as *const libc::c_void,
+                packet.len(),
                 0,
                 &dst_sockaddr as *const _ as *const libc::sockaddr,
                 std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t,

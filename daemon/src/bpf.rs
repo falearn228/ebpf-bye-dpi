@@ -51,11 +51,13 @@ impl BpfManager {
 
         // Create sync channel for config updates (used from async context to sync BPF thread)
         let (config_tx, config_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+        let (init_tx, init_rx) = std::sync::mpsc::channel::<Result<(), String>>();
 
         // Clone for the BPF thread
         let interface_clone = interface.to_string();
 
         // Spawn dedicated thread for BPF lifecycle
+        let error_init_tx = init_tx.clone();
         let bpf_thread = thread::spawn(move || {
             if let Err(e) = bpf_thread_main(
                 &interface_clone,
@@ -64,13 +66,30 @@ impl BpfManager {
                 shutdown_rx,
                 config_rx,
                 stats_tx,
+                init_tx,
             ) {
-                error!("BPF thread error: {}", e);
+                let error_msg = format!("{:#}", e);
+                let _ = error_init_tx.send(Err(error_msg.clone()));
+                error!("BPF thread error: {}", error_msg);
             }
         });
 
-        // Give BPF thread time to initialize
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        let init_result = tokio::task::spawn_blocking(move || {
+            init_rx.recv_timeout(Duration::from_secs(10))
+        })
+        .await
+        .context("Failed to wait for BPF thread initialization")?;
+
+        match init_result {
+            Ok(Ok(())) => {}
+            Ok(Err(error_msg)) => return Err(anyhow::anyhow!(error_msg)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                return Err(anyhow::anyhow!("Timed out waiting for BPF thread initialization"));
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(anyhow::anyhow!("BPF thread exited before initialization completed"));
+            }
+        }
 
         let state = ConnectionState::new();
 
@@ -165,6 +184,7 @@ fn bpf_thread_main(
     mut shutdown_rx: watch::Receiver<bool>,
     config_rx: std::sync::mpsc::Receiver<Vec<u8>>,
     stats_tx: watch::Sender<Stats>,
+    init_tx: std::sync::mpsc::Sender<Result<(), String>>,
 ) -> Result<()> {
     info!("BPF thread started");
 
@@ -245,6 +265,8 @@ fn bpf_thread_main(
     if let Err(e) = publish_stats(stats_map, &stats_tx) {
         warn!("Failed to publish initial stats: {}", e);
     }
+
+    let _ = init_tx.send(Ok(()));
 
     // Setup ring buffer
     if let Some(events_map) = obj.map("events") {

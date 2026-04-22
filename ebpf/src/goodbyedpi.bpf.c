@@ -4,6 +4,10 @@
 #include <bpf/bpf_endian.h>
 #include <bpf/bpf_tracing.h>
 
+#ifndef barrier_var
+#define barrier_var(var) asm volatile("" : "+r"(var))
+#endif
+
 #define ETH_P_IP 0x0800
 #define ETH_P_IPV6 0x86DD
 #define IPPROTO_TCP 6
@@ -286,17 +290,16 @@ static __always_inline void update_stats_error(struct stats *s)
 static __always_inline __u16 copy_payload_to_event_skb(struct __sk_buff *skb, struct event *e,
                                                         __u32 payload_offset, __u32 payload_len)
 {
-    if (payload_len == 0) {
-        return 0;
-    }
-
-    /* Keep helper length in a verifier-visible bounded range. */
-    if (payload_len > MAX_PAYLOAD_SIZE)
-        payload_len = MAX_PAYLOAD_SIZE;
-
     __u32 copy_len = payload_len;
+
+    barrier_var(copy_len);
     if (copy_len == 0)
         return 0;
+
+    /* Держим длину helper-вызова в диапазоне, видимом verifier. */
+    if (copy_len > MAX_PAYLOAD_SIZE)
+        copy_len = MAX_PAYLOAD_SIZE;
+    barrier_var(copy_len);
 
     /* Safely copy payload data using bpf_skb_load_bytes
      * Note: bpf_skb_load_bytes can read from paged/frags data (GSO/TSO)
