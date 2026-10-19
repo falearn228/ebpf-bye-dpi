@@ -46,6 +46,7 @@ install:
 	install -m0644 profiles/*.txt $(DESTDIR)$(DATADIR)/profiles/
 	install -Dm0644 README.md $(DESTDIR)$(DOCDIR)/README.md
 	install -m0644 docs/*.md $(DESTDIR)$(DOCDIR)/
+	install -Dm0644 docs/images/tui-overview.png $(DESTDIR)$(DOCDIR)/images/tui-overview.png
 
 uninstall:
 	rm -f $(DESTDIR)$(BINDIR)/goodbyedpi-daemon $(DESTDIR)$(BINDIR)/goodbyedpi

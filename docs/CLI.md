@@ -91,6 +91,8 @@ $ goodbyedpi validate -f bad.txt
 
 ## TUI
 
+![Overview](images/tui-overview.png)
+
 `goodbyedpi tui` (опционально `-i`/`-c`/`-f`, чтобы можно было стартовать демон из панели).
 
 - **Overview** — интерфейсы и состояние хуков egress/ingress, итог последнего reload,

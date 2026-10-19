@@ -2,6 +2,8 @@
 
 Реализация DPI (Deep Packet Inspection) обхода через eBPF с управлением на Rust.
 
+![goodbyedpi tui: живой статус обхода, хуки на интерфейсах, счётчики трафика](docs/images/tui-overview.png)
+
 ## Архитектура
 
 ```
@@ -190,6 +192,9 @@ sudo ./target/release/goodbyedpi-daemon -i eth0 -c "s1 -o1" --no-metrics
 - `goodbyedpi_packets_modified`
 
 ### CLI / TUI
+
+`goodbyedpi tui` — живая панель: вердикт «работает ли обход», состояние TC-хуков,
+счётчики трафика, doctor и активный профиль (скриншот вверху).
 
 ```bash
 # Почему не стартует? kernel, BTF, capabilities, verifier, TC-конфликты, BPF maps
