@@ -206,3 +206,74 @@ jobs:
       
       - name: Run audit
         run: cargo audit
+
+  # Build distribution packages (Debian, Fedora, Arch) via the shared Makefile
+  packages:
+    name: Package (${{ matrix.distro }})
+    runs-on: ubuntu-latest
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - distro: debian
+            image: debian:trixie
+            kind: deb
+          - distro: fedora
+            image: fedora:latest
+            kind: rpm
+          - distro: arch
+            image: archlinux:latest
+            kind: arch
+    container: ${{ matrix.image }}
+    steps:
+      - name: Install toolchain (Debian)
+        if: matrix.kind == 'deb'
+        run: |
+          apt-get update
+          apt-get install -y build-essential debhelper clang llvm libbpf-dev libelf-dev zlib1g-dev make pkg-config curl git ca-certificates
+          curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Install toolchain (Fedora)
+        if: matrix.kind == 'rpm'
+        run: dnf install -y rpm-build cargo rust clang llvm libbpf-devel elfutils-libelf-devel zlib-devel make systemd-rpm-macros git tar gzip findutils
+
+      - name: Install toolchain (Arch)
+        if: matrix.kind == 'arch'
+        run: |
+          pacman -Syu --noconfirm --needed base-devel rust clang llvm libbpf git
+          useradd -m builder
+
+      - uses: actions/checkout@v4
+
+      - name: Build package
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          if [ "${{ matrix.kind }}" = arch ]; then
+            chown -R builder "$GITHUB_WORKSPACE"
+            su builder -c "./scripts/build-packages.sh arch"
+          else
+            ./scripts/build-packages.sh ${{ matrix.kind }}
+          fi
+
+      - name: Smoke test installed package
+        run: |
+          case "${{ matrix.kind }}" in
+            deb) apt-get install -y ./dist/*.deb ;;
+            rpm) dnf install -y ./dist/*.rpm ;;
+            arch) pacman -U --noconfirm dist/*.pkg.tar.zst ;;
+          esac
+          goodbyedpi --version
+          goodbyedpi validate --strict -f /etc/goodbyedpi/profile.txt
+          goodbyedpi-daemon --dry-run -i lo --config-file /etc/goodbyedpi/profile.txt
+
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: package-${{ matrix.distro }}
+          path: |
+            dist/*.deb
+            dist/*.rpm
+            dist/*.pkg.tar.zst
+          if-no-files-found: error

@@ -69,6 +69,13 @@ fn main() {
         );
     }
 
+    // Объект встраивается через include_bytes!, поэтому файл обязан существовать.
+    // Пустой файл = сборка без clang; демон и `goodbyedpi doctor` сообщат об этом в runtime.
+    if !obj_compiled && !bpf_obj_out.exists() {
+        println!("cargo:warning=eBPF object not built, embedding empty placeholder");
+        std::fs::write(&bpf_obj_out, []).expect("Failed to write BPF object placeholder");
+    }
+
     // Generate skeleton if bpftool is available
     if obj_compiled && has_bpftool {
         println!("cargo:warning=Generating BPF skeleton with bpftool...");

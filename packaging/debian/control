@@ -1,0 +1,28 @@
+Source: goodbyedpi-ebpf
+Section: net
+Priority: optional
+Maintainer: falearn228 <restsan2003@gmail.com>
+# rustc >= 1.87 обычно ставится через rustup, поэтому cargo/rustc здесь не перечислены
+Build-Depends: debhelper-compat (= 13),
+               clang,
+               llvm,
+               libbpf-dev,
+               libelf-dev,
+               zlib1g-dev,
+               make,
+               pkg-config
+Standards-Version: 4.6.2
+Homepage: https://github.com/falearn228/ebpf-bye-dpi
+Rules-Requires-Root: no
+
+Package: goodbyedpi-ebpf
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}, iproute2
+Suggests: bpftool
+Description: DPI bypass on Linux TC eBPF with a Rust daemon
+ GoodByeDPI eBPF bypasses DPI using TC egress/ingress eBPF programs and a
+ Rust userspace daemon that injects split, OOB, fake, TLS record split,
+ disorder and IP-fragmented packets.
+ .
+ The goodbyedpi CLI controls the daemon, validates profiles, hot-reloads
+ them and diagnoses startup failures (goodbyedpi doctor).

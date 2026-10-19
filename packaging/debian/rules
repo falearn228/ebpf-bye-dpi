@@ -1,0 +1,31 @@
+#!/usr/bin/make -f
+
+export DH_VERBOSE = 1
+# rustup-окружение сборщика (если cargo не из apt)
+export PATH := $(HOME)/.cargo/bin:$(PATH)
+
+%:
+	dh $@
+
+override_dh_auto_build:
+	$(MAKE) build
+
+override_dh_auto_install:
+	$(MAKE) install DESTDIR=$(CURDIR)/debian/goodbyedpi-ebpf PREFIX=/usr \
+	    UNITDIR=/usr/lib/systemd/system
+
+override_dh_auto_test:
+ifeq (,$(filter nocheck,$(DEB_BUILD_OPTIONS)))
+	cargo test --workspace --release
+endif
+
+# Не дёргаем `cargo clean` в чистом дереве без target/
+override_dh_auto_clean:
+	rm -rf target
+
+# Интерфейс по умолчанию (eth0) почти всегда неверный: не включаем и не стартуем сами
+override_dh_installsystemd:
+	dh_installsystemd --no-enable --no-start
+
+# Rust-бинарники с LTO: dwz на них не нужен
+override_dh_dwz:

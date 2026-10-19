@@ -1,0 +1,9 @@
+# Профиль GoodByeDPI eBPF. Проверка: goodbyedpi validate -f /etc/goodbyedpi/profile.txt
+# Применить без рестарта: goodbyedpi reload
+#
+# s1   — split TCP payload на 1-м байте
+# -o1  — OOB-байт на позиции 1
+# -Ar  — авто-логика при RST от DPI
+#
+# Примеры профилей: /usr/share/goodbyedpi/profiles/
+s1 -o1 -Ar

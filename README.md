@@ -189,18 +189,27 @@ sudo ./target/release/goodbyedpi-daemon -i eth0 -c "s1 -o1" --no-metrics
 - `goodbyedpi_packets_http`
 - `goodbyedpi_packets_modified`
 
-### CLI утилита
+### CLI / TUI
 
 ```bash
-# Запуск через CLI
-goodbyedpi -i eth0 -c "s1 -o1 -Ar" --daemon
+# Почему не стартует? kernel, BTF, capabilities, verifier, TC-конфликты, BPF maps
+sudo goodbyedpi doctor -i eth0
 
-# Проверка статуса
-goodbyedpi --status
+# Проверить профиль (ошибка с файл:строка:колонка) и пробно загрузить eBPF без attach
+goodbyedpi validate -f profile.txt
+sudo goodbyedpi start -i eth0 -f profile.txt --dry-run
 
-# Остановка
-goodbyedpi --stop
+# Управление (несколько интерфейсов: -i eth0,wlan0)
+sudo goodbyedpi start -i eth0 -c "s1 -o1 -Ar"
+goodbyedpi status
+sudo goodbyedpi reload        # безопасный hot reload профиля (SIGHUP)
+sudo goodbyedpi stop
+
+# Интерактивная панель
+sudo goodbyedpi tui
 ```
+
+Подробнее, включая systemd и пакеты Arch/Debian/Fedora: [docs/CLI.md](docs/CLI.md).
 
 ## Как это работает
 

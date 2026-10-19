@@ -1,0 +1,45 @@
+# Maintainer: falearn228 <restsan2003@gmail.com>
+# Локальная сборка из рабочего дерева: ./scripts/build-packages.sh arch
+
+pkgname=goodbyedpi-ebpf
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="DPI bypass on Linux TC eBPF with a Rust daemon, CLI/TUI and diagnostics"
+arch=('x86_64' 'aarch64')
+url="https://github.com/falearn228/ebpf-bye-dpi"
+# В репозитории нет LICENSE; eBPF-объект объявляет GPL. Уточнить перед публикацией в AUR.
+license=('GPL-2.0-only')
+depends=('gcc-libs' 'glibc' 'libelf' 'zlib' 'iproute2')
+makedepends=('cargo' 'clang' 'llvm' 'libbpf' 'make')
+optdepends=('bpftool: low-level BPF debugging')
+backup=('etc/goodbyedpi/goodbyedpi.conf' 'etc/goodbyedpi/profile.txt')
+# Статические C-библиотеки (vendored libbpf) ломаются с makepkg LTO
+options=('!lto')
+source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
+sha256sums=('SKIP')
+
+_srcdir="ebpf-bye-dpi-$pkgver"
+
+prepare() {
+    cd "$_srcdir"
+    export RUSTUP_TOOLCHAIN=stable
+    cargo fetch --target "$(rustc -vV | sed -n 's/host: //p')"
+}
+
+build() {
+    cd "$_srcdir"
+    export RUSTUP_TOOLCHAIN=stable
+    export CARGO_TARGET_DIR=target
+    make build CARGO_FLAGS="--release --frozen"
+}
+
+check() {
+    cd "$_srcdir"
+    export RUSTUP_TOOLCHAIN=stable
+    cargo test --workspace --release --frozen
+}
+
+package() {
+    cd "$_srcdir"
+    make install DESTDIR="$pkgdir" PREFIX=/usr
+}

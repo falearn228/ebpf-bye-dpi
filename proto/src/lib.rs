@@ -192,6 +192,23 @@ pub struct Stats {
     pub errors: u64,
 }
 
+impl Stats {
+    /// Суммирует счётчики другого снимка (нужно для нескольких интерфейсов:
+    /// у каждого свой экземпляр BPF-объекта и свой stats_map).
+    pub fn accumulate(&mut self, other: &Stats) {
+        self.packets_total = self.packets_total.wrapping_add(other.packets_total);
+        self.packets_tcp = self.packets_tcp.wrapping_add(other.packets_tcp);
+        self.packets_udp = self.packets_udp.wrapping_add(other.packets_udp);
+        self.packets_ipv6 = self.packets_ipv6.wrapping_add(other.packets_ipv6);
+        self.packets_http = self.packets_http.wrapping_add(other.packets_http);
+        self.packets_tls = self.packets_tls.wrapping_add(other.packets_tls);
+        self.packets_quic = self.packets_quic.wrapping_add(other.packets_quic);
+        self.packets_modified = self.packets_modified.wrapping_add(other.packets_modified);
+        self.events_sent = self.events_sent.wrapping_add(other.events_sent);
+        self.errors = self.errors.wrapping_add(other.errors);
+    }
+}
+
 /// Connection key - supports both IPv4 and IPv6
 /// Packed to 40 bytes with explicit zeroed padding
 #[repr(C)]

@@ -1,5 +1,6 @@
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use goodbyedpi_proto::Stats;
+use libbpf_rs::AsRawLibbpf;
 use log::{debug, error, info, warn};
 use std::os::fd::AsFd;
 use std::sync::Arc;
@@ -15,6 +16,146 @@ use goodbyedpi_proto::Event;
 const EVENT_CHANNEL_SIZE: usize = 1024;
 /// Ring buffer poll timeout (milliseconds)
 const RING_BUFFER_TIMEOUT_MS: i32 = 100;
+
+/// eBPF-объект, собранный build.rs и встроенный в бинарник.
+/// Встраивание нужно для пакетов: установленный бинарник не должен ссылаться на OUT_DIR сборки.
+pub static BPF_OBJECT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/goodbyedpi.bpf.o"));
+
+/// TC-программы, которые демон обязан найти в объекте.
+pub const REQUIRED_PROGRAMS: &[&str] = &["dpi_egress", "dpi_ingress"];
+
+/// BPF-карты, от которых зависит userspace.
+pub const REQUIRED_MAPS: &[&str] = &["config_map", "conn_map", "events", "sni_cache", "stats_map"];
+
+/// Открывает встроенный eBPF-объект (без загрузки в ядро).
+pub fn open_embedded_object() -> Result<libbpf_rs::OpenObject> {
+    if BPF_OBJECT.is_empty() {
+        return Err(anyhow!(
+            "Embedded eBPF object is empty: binary was built without clang/make. \
+             Install clang + libbpf headers and rebuild"
+        ));
+    }
+    libbpf_rs::ObjectBuilder::default()
+        .open_memory(BPF_OBJECT)
+        .context("Failed to open embedded BPF object")
+}
+
+/// Может ли процесс загружать BPF: CAP_BPF или CAP_SYS_ADMIN в CapEff.
+/// Именно капы, а не euid: root в контейнере обычно без CAP_BPF.
+pub fn has_bpf_privileges() -> bool {
+    const CAP_SYS_ADMIN: u32 = 21;
+    const CAP_BPF: u32 = 39;
+    std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|status| {
+            let line = status.lines().find(|l| l.starts_with("CapEff:"))?;
+            u64::from_str_radix(line.trim_start_matches("CapEff:").trim(), 16).ok()
+        })
+        .is_some_and(|caps| caps & (1 << CAP_BPF | 1 << CAP_SYS_ADMIN) != 0)
+}
+
+/// Результат проверки одной BPF-карты на соответствие ABI userspace.
+#[derive(Debug, Clone)]
+pub struct MapCheck {
+    pub name: &'static str,
+    pub found: bool,
+    pub value_size: Option<u32>,
+    pub expected_value_size: Option<u32>,
+}
+
+impl MapCheck {
+    pub fn ok(&self) -> bool {
+        self.found
+            && match (self.value_size, self.expected_value_size) {
+                (Some(actual), Some(expected)) => actual == expected,
+                _ => true,
+            }
+    }
+}
+
+/// Отчёт preflight-проверки eBPF-объекта для `doctor` и `--dry-run`.
+#[derive(Debug, Clone, Default)]
+pub struct ObjectReport {
+    pub object_size: usize,
+    pub missing_programs: Vec<&'static str>,
+    pub maps: Vec<MapCheck>,
+    /// Была ли попытка загрузки в ядро (требует CAP_BPF/CAP_SYS_ADMIN)
+    pub load_attempted: bool,
+    pub load_error: Option<String>,
+    /// Вывод libbpf во время загрузки, включая лог verifier'а при отказе
+    pub libbpf_log: Vec<String>,
+}
+
+impl ObjectReport {
+    pub fn loaded(&self) -> bool {
+        self.load_attempted && self.load_error.is_none()
+    }
+}
+
+static LIBBPF_LOG: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+fn capture_libbpf_print(_level: libbpf_rs::PrintLevel, msg: String) {
+    if let Ok(mut log) = LIBBPF_LOG.lock() {
+        log.extend(msg.lines().map(str::to_string));
+    }
+}
+
+/// Проверяет встроенный объект: наличие программ, размеры значений карт
+/// против `repr(C)` структур proto и (при `load = true`) прохождение verifier'а.
+/// Программы никуда не attach'атся: объект выгружается сразу после проверки.
+pub fn inspect_object(load: bool) -> Result<ObjectReport> {
+    let open = open_embedded_object()?;
+    let mut report = ObjectReport {
+        object_size: BPF_OBJECT.len(),
+        ..ObjectReport::default()
+    };
+
+    let prog_names: Vec<String> = open
+        .progs_iter()
+        .filter_map(|p| p.name().ok().map(str::to_string))
+        .collect();
+    report.missing_programs = REQUIRED_PROGRAMS
+        .iter()
+        .copied()
+        .filter(|name| !prog_names.iter().any(|p| p == name))
+        .collect();
+
+    for name in REQUIRED_MAPS.iter().copied() {
+        let map = open.maps_iter().find(|m| m.name().ok() == Some(name));
+        // SAFETY: указатель валиден, пока жив OpenObject.
+        let value_size =
+            map.map(|m| unsafe { libbpf_sys::bpf_map__value_size(m.as_libbpf_object().as_ptr()) });
+        let expected_value_size = match name {
+            "config_map" => Some(std::mem::size_of::<goodbyedpi_proto::Config>() as u32),
+            "stats_map" => Some(std::mem::size_of::<Stats>() as u32),
+            _ => None,
+        };
+        report.maps.push(MapCheck {
+            name,
+            found: map.is_some(),
+            value_size,
+            expected_value_size,
+        });
+    }
+
+    if load {
+        report.load_attempted = true;
+        if let Ok(mut log) = LIBBPF_LOG.lock() {
+            log.clear();
+        }
+        let prev = libbpf_rs::set_print(Some((libbpf_rs::PrintLevel::Info, capture_libbpf_print)));
+        let result = open.load();
+        libbpf_rs::set_print(prev);
+        if let Err(e) = result {
+            report.load_error = Some(format!("{:#}", e));
+        }
+        if let Ok(mut log) = LIBBPF_LOG.lock() {
+            report.libbpf_log = std::mem::take(&mut *log);
+        }
+    }
+
+    Ok(report)
+}
 
 /// BPF Manager - handles eBPF lifecycle and ring buffer
 pub struct BpfManager {
@@ -74,20 +215,23 @@ impl BpfManager {
             }
         });
 
-        let init_result = tokio::task::spawn_blocking(move || {
-            init_rx.recv_timeout(Duration::from_secs(10))
-        })
-        .await
-        .context("Failed to wait for BPF thread initialization")?;
+        let init_result =
+            tokio::task::spawn_blocking(move || init_rx.recv_timeout(Duration::from_secs(10)))
+                .await
+                .context("Failed to wait for BPF thread initialization")?;
 
         match init_result {
             Ok(Ok(())) => {}
             Ok(Err(error_msg)) => return Err(anyhow::anyhow!(error_msg)),
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                return Err(anyhow::anyhow!("Timed out waiting for BPF thread initialization"));
+                return Err(anyhow::anyhow!(
+                    "Timed out waiting for BPF thread initialization"
+                ));
             }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                return Err(anyhow::anyhow!("BPF thread exited before initialization completed"));
+                return Err(anyhow::anyhow!(
+                    "BPF thread exited before initialization completed"
+                ));
             }
         }
 
@@ -189,12 +333,7 @@ fn bpf_thread_main(
     info!("BPF thread started");
 
     // Load BPF object
-    let mut skel_builder = libbpf_rs::ObjectBuilder::default();
-    let bpf_obj_path = concat!(env!("OUT_DIR"), "/goodbyedpi.bpf.o");
-
-    let obj = skel_builder
-        .open_file(bpf_obj_path)
-        .context("Failed to open BPF object file")?;
+    let obj = open_embedded_object()?;
 
     // Load the BPF object
     let mut obj = obj.load().context("Failed to load BPF object")?;

@@ -1,23 +1,43 @@
-; [Unit]
-; Description=GoodByeDPI eBPF Daemon
-; After=network.target
-;
-; [Service]
-; Type=simple
-; ExecStart=/usr/local/bin/goodbyedpi-daemon -i %I -c "${GDPI_OPTS:-s1 -o1 -Ar}"
-; Restart=on-failure
-; RestartSec=5
-;
-; # Security hardening
-; NoNewPrivileges=true
-; PrivateTmp=true
-; ProtectSystem=strict
-; ProtectHome=true
-; ReadWritePaths=/sys/fs/bpf
-;
-; # Required capabilities for eBPF and raw sockets
-; AmbientCapabilities=CAP_BPF CAP_NET_ADMIN CAP_NET_RAW
-; CapabilityBoundingSet=CAP_BPF CAP_NET_ADMIN CAP_NET_RAW
-;
-; [Install]
-; WantedBy=multi-user.target
+[Unit]
+Description=GoodByeDPI eBPF DPI bypass daemon
+Documentation=https://github.com/falearn228/ebpf-bye-dpi
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Интерфейсы, путь к профилю и доп. флаги — в /etc/goodbyedpi/goodbyedpi.conf
+Environment=GDPI_INTERFACES=eth0
+Environment=GDPI_PROFILE=/etc/goodbyedpi/profile.txt
+Environment=GDPI_OPTS=
+EnvironmentFile=-/etc/goodbyedpi/goodbyedpi.conf
+# Относительные пути hostlist/ipset в профиле резолвятся отсюда (lists/...)
+WorkingDirectory=/usr/share/goodbyedpi
+RuntimeDirectory=goodbyedpi
+
+# Битый профиль ловим до attach к TC: ошибка с номером строки попадёт в journal
+ExecStartPre=/usr/bin/goodbyedpi validate --config-file ${GDPI_PROFILE}
+ExecStart=/usr/bin/goodbyedpi-daemon -i ${GDPI_INTERFACES} --config-file ${GDPI_PROFILE} --run-dir /run/goodbyedpi $GDPI_OPTS
+# Hot reload: демон сам валидирует профиль и при ошибке оставляет старый
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=5
+
+# До 5.11 BPF-карты учитываются в RLIMIT_MEMLOCK
+LimitMEMLOCK=infinity
+
+# Права: eBPF + TC + raw sockets, остальное отрезано
+CapabilityBoundingSet=CAP_BPF CAP_PERFMON CAP_NET_ADMIN CAP_NET_RAW CAP_SYS_RESOURCE
+AmbientCapabilities=CAP_BPF CAP_PERFMON CAP_NET_ADMIN CAP_NET_RAW CAP_SYS_RESOURCE
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectControlGroups=true
+ReadWritePaths=/sys/fs/bpf
+RestrictAddressFamilies=AF_INET AF_INET6 AF_NETLINK AF_UNIX
+LockPersonality=true
+RestrictRealtime=true
+
+[Install]
+WantedBy=multi-user.target

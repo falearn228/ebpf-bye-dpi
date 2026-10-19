@@ -120,6 +120,16 @@ if [[ "${INSTALL_DEPS}" -eq 1 ]]; then
             libelf \
             zlib \
             make
+    elif command -v dnf >/dev/null 2>&1; then
+        echo "==> Installing system dependencies (Fedora)"
+        run_as_root dnf install -y \
+            clang \
+            llvm \
+            libbpf-devel \
+            bpftool \
+            elfutils-libelf-devel \
+            zlib-devel \
+            make
     else
         echo "ERROR: unsupported package manager. Use --no-deps and install dependencies manually."
         exit 1
@@ -130,7 +140,7 @@ echo "==> Building project (release)"
 (cd "${ROOT_DIR}" && cargo build --release)
 
 DAEMON_BIN="${ROOT_DIR}/target/release/goodbyedpi-daemon"
-CLI_BIN="${ROOT_DIR}/target/release/goodbyedpi-cli"
+CLI_BIN="${ROOT_DIR}/target/release/goodbyedpi"
 
 if [[ ! -x "${DAEMON_BIN}" ]]; then
     echo "ERROR: daemon binary not found: ${DAEMON_BIN}"
@@ -151,7 +161,11 @@ echo ""
 echo "Installation completed."
 echo "Run examples:"
 echo "  sudo ${PREFIX}/goodbyedpi-daemon -i eth0 -c \"s1 -o1\""
-echo "  ${PREFIX}/goodbyedpi --status"
+echo "  sudo ${PREFIX}/goodbyedpi doctor -i eth0"
+echo "  ${PREFIX}/goodbyedpi status"
+echo "  sudo ${PREFIX}/goodbyedpi tui"
+echo ""
+echo "systemd unit, конфиги и списки ставит: sudo make install (или пакет, см. packaging/)"
 
 if [[ "${RUN_DAEMON}" -eq 1 ]]; then
     DAEMON_CMD=("${PREFIX}/goodbyedpi-daemon" "-i" "${RUN_IFACE}" "-c" "${RUN_CONFIG}")

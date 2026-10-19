@@ -1,0 +1,9 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: ebpf-bye-dpi
+Source: https://github.com/falearn228/ebpf-bye-dpi
+
+Files: *
+Copyright: falearn228
+# В репозитории нет LICENSE; eBPF-объект объявляет GPL. Уточнить перед публикацией.
+License: GPL-2.0-only
+ On Debian systems the full text is in /usr/share/common-licenses/GPL-2.

@@ -2,11 +2,19 @@
 name = "goodbyedpi-cli"
 version = "0.1.0"
 edition = "2021"
+description = "CLI/TUI for GoodByeDPI eBPF: service control, profile validation, diagnostics"
+
+[[bin]]
+name = "goodbyedpi"
+path = "src/main.rs"
 
 [dependencies]
 goodbyedpi-proto = { path = "../proto" }
+goodbyedpi-daemon = { path = "../daemon" }
 clap = { version = "4.5", features = ["derive"] }
 anyhow = { workspace = true }
-log = { workspace = true }
-env_logger = { workspace = true }
-tokio = { version = "1.41", features = ["full"] }
+libbpf-rs = "0.23"
+libc = "0.2"
+ratatui = "0.29"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"

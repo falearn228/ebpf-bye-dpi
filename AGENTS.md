@@ -13,7 +13,9 @@ GoodByeDPI eBPF bypasses DPI with Linux TC eBPF plus a Rust userspace daemon.
 
 - `ebpf/src/goodbyedpi.bpf.c`: main TC egress/ingress eBPF program.
 - `daemon/src/`: Rust daemon, BPF loading, event processing, raw packet injection, state, config parsing, TC helpers.
-- `cli/src/main.rs`: CLI wrapper.
+- `daemon/src/lib.rs`: daemon as library (used by CLI); `control.rs` pid/state files, `profile.rs` profile summary + lint.
+- `cli/src/`: `goodbyedpi` CLI/TUI: `doctor.rs` diagnostics, `service.rs` start/stop/reload, `profile.rs` validation, `tui.rs` ratatui dashboard. See `docs/CLI.md`.
+- `packaging/`: Arch PKGBUILD, Debian `debian/`, Fedora spec, default `/etc/goodbyedpi` configs; `Makefile` install used by all.
 - `proto/src/lib.rs`: shared Rust/C ABI structs and constants.
 - `systemd/`: service files.
 - `scripts/`: status, run, trace helpers.
@@ -53,7 +55,7 @@ Disorder: userspace sends second TCP payload part first, then first part, preser
 ```bash
 cargo build --release
 cargo build -p goodbyedpi-daemon --release
-cargo build -p goodbyedpi --release
+cargo build -p goodbyedpi-cli --release   # binary: goodbyedpi
 cargo build -p goodbyedpi-proto --release
 cd ebpf/src && make clean && make all
 ```
@@ -78,9 +80,13 @@ sudo ./target/release/goodbyedpi-daemon -i eth0 -c "s1 -o1"
 sudo ./target/release/goodbyedpi-daemon -i eth0 -c "s1 -o1 -g8 -Ar -At -As"
 sudo ./target/release/goodbyedpi-daemon -i eth0 -c "s1 -o1 -d -Ar -At -As"
 sudo ./target/release/goodbyedpi-daemon -i eth0 -c "s1 -o1" --debug
-goodbyedpi -i eth0 -c "s1 -o1 -Ar" --daemon
-goodbyedpi --status
-goodbyedpi --stop
+sudo ./target/release/goodbyedpi-daemon -i eth0,wlan0 -c "s1 -o1"   # multi-interface
+sudo goodbyedpi start -i eth0 -c "s1 -o1 -Ar"
+goodbyedpi status
+sudo goodbyedpi reload    # SIGHUP hot reload, validated first
+sudo goodbyedpi stop
+sudo goodbyedpi doctor -i eth0
+sudo goodbyedpi tui
 ```
 
 ## Debug
@@ -95,7 +101,8 @@ sudo cat /sys/kernel/debug/tracing/trace_pipe
 ./scripts/trace-logs.sh
 ```
 
-Pinned maps live under `/sys/fs/bpf/goodbyedpi/`.
+Maps are not pinned; `goodbyedpi doctor` (root) checks live programs/maps via BPF object iteration.
+Runtime files: `/run/goodbyedpi/{daemon.pid,state.json,daemon.log}`.
 
 ## ABI Notes
 
